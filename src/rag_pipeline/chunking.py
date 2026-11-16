@@ -27,6 +27,11 @@ class Chunk:
     position: int
     text: str
     chunking: str = ""  # label of the settings that produced it
+    context: str | None = None
+
+    @property
+    def index_text(self) -> str:
+        return f"{self.context}\n\n{self.text}" if self.context else self.text
 
 
 def _sentences(text: str) -> list[str]:

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -11,6 +14,11 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException
 
 from rag_pipeline.cache import CACHE_FILE, ResponseCache
+from rag_pipeline.chunk_context import (
+    CONTEXT_OUTPUT_TOKENS,
+    DEFAULT_ARTICLE_TOKENS,
+    ModelContextualiser,
+)
 from rag_pipeline.chunking import ChunkingSettings
 from rag_pipeline.corpus import (
     DATASET_LICENSE,
@@ -29,7 +37,7 @@ from rag_pipeline.evaluation import (
 from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_gate
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
-from rag_pipeline.models import EmbedderSpec, LocalModels
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels
 from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.splits import (
     DEFAULT_SEED,
@@ -79,6 +87,30 @@ def _print_ingest(report: IngestReport) -> None:
         f"{len(report.unchanged)} unchanged, {len(report.deleted)} deleted; "
         f"{report.chunks_written} Chunks written."
     )
+    context = report.context
+    if context is not None:
+        typer.echo(
+            f"  {context.chunks_contextualised} Chunks contextualised "
+            f"({context.empty_contexts} empty), "
+            f"{context.cache_hits} cache hits, {context.generation_seconds:.1f} generation seconds."
+        )
+        typer.echo(
+            f"  {context.input_tokens} input tokens, {context.output_tokens} output tokens, "
+            f"{len(context.truncated_articles)} truncated Articles."
+        )
+        if context.notional_cost_usd is not None:
+            typer.echo(f"  Chunk Context cost (notional USD)  {context.notional_cost_usd:.6g}")
+
+
+def _save_ingest_report(report: IngestReport, collection: str) -> Path:
+    folder = RUNS_DIR / "ingest"
+    folder.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    path = folder / f"{Path(collection).name}-{timestamp}.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(asdict(report), indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+    return path
 
 
 @app.command("ingest")
@@ -93,24 +125,51 @@ def ingest_command(
         str | None, typer.Option(help="Override the name derived from settings and embedder.")
     ] = None,
     qdrant_url: QdrantUrl = "http://localhost:6333",
+    chunk_context: Annotated[
+        str | None, typer.Option(help="Local Ollama model that writes Chunk Context.")
+    ] = None,
+    context_size: Annotated[
+        int, typer.Option(min=1, help="Chunk Context model's context window.")
+    ] = 8192,
+    article_tokens: Annotated[
+        int, typer.Option(min=1, help="Maximum estimated tokens for the Article prefix body.")
+    ] = DEFAULT_ARTICLE_TOKENS,
 ) -> None:
     """Chunk and index the Corpus incrementally (BM25 always; dense vectors with --embedder)."""
     settings = ChunkingSettings(max_words, overlap_sentences)
+    models = LocalModels()
     dense = (
-        LocalModels().embedder_for(
+        models.embedder_for(
             EmbedderSpec.model_validate({"provider": embedder_provider, "model": embedder})
         )
         if embedder
         else None
     )
-    name = collection or index_collection(settings, embedder)
+    name = collection or index_collection(settings, embedder, context_model=chunk_context)
     index = ChunkIndex(QdrantClient(url=qdrant_url), name, dense)
     try:
-        report = ingest(load_articles(RAW_DIR), index, settings)
-    except IndexMismatch as error:
+        writer = None
+        if chunk_context is not None:
+            spec = GeneratorSpec(
+                provider="ollama",
+                model=chunk_context,
+                context_size=context_size,
+                max_output_tokens=CONTEXT_OUTPUT_TOKENS,
+            )
+            writer = ModelContextualiser(
+                spec,
+                models.generator_for,
+                ResponseCache(),
+                article_tokens=article_tokens,
+            )
+        report = ingest(load_articles(RAW_DIR), index, settings, contextualiser=writer)
+    except (IndexMismatch, ValueError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     _print_ingest(report)
+    if report.context is not None:
+        path = _save_ingest_report(report, name)
+        typer.echo(f"Wrote {path}.")
 
 
 @app.command("eval")
