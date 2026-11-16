@@ -19,6 +19,7 @@ from rag_pipeline.corpus import BenchmarkQuery
 from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Generator
+from rag_pipeline.splits import TEST_SPLITS
 from rag_pipeline.tracing import StageTrace
 from rag_pipeline.variants import Answer, VariantConfig
 
@@ -435,24 +436,32 @@ def _fingerprint(
     split: str,
     queries: list[BenchmarkQuery],
     retrieval_only: bool,
+    cache_enabled: bool,
 ) -> str:
-    payload = json.dumps(
-        {
-            "variant": config.model_dump(),
-            "index_version": index_version,
-            "retrieval_only": retrieval_only,
-            "split": split,
-            "queries": [q.id for q in queries],
-        },
-        sort_keys=True,
-    )
+    variant = config.model_dump()
+    generator = variant["generation"]["generator"]
+    if generator["provider"] == "ollama":
+        # Keep the fingerprints of older, uncached Ollama runs with the same options.
+        for name, default in (("seed", 0), ("context_size", 8192), ("reasoning_effort", "low")):
+            if generator[name] == default:
+                del generator[name]
+    identity = {
+        "variant": variant,
+        "index_version": index_version,
+        "retrieval_only": retrieval_only,
+        "split": split,
+        "queries": [q.id for q in queries],
+    }
+    if cache_enabled:
+        identity["cache_enabled"] = True
+    payload = json.dumps(identity, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _guard_test_split(store: RunStore, config: VariantConfig, allow_rescore: bool) -> None:
     if allow_rescore:
         return
-    for meta in store.completed("test"):
+    for meta in (meta for split in TEST_SPLITS for meta in store.completed(split)):
         if meta["variant"]["name"] == config.name:
             raise TestSplitAlreadyScored(
                 f"Pipeline Variant {config.name!r} was already scored on the Test Split "
@@ -476,12 +485,13 @@ def evaluate(
     Split); it is refused on the Test Split, which is scored once with the whole pipeline.
     """
     config = variant.config
-    if retrieval_only and split == "test":
+    if retrieval_only and split in TEST_SPLITS:
         raise ValueError("retrieval-only runs are not allowed on the Test Split (ADR 0005)")
-    if split == "test":
+    if split in TEST_SPLITS:
         _guard_test_split(store, config, allow_rescore)
     index_version = variant.index_version()
-    fingerprint = _fingerprint(config, index_version, split, queries, retrieval_only)
+    cache_enabled = getattr(variant, "cache_enabled", False) is True
+    fingerprint = _fingerprint(config, index_version, split, queries, retrieval_only, cache_enabled)
     run_id = store.find_incomplete(fingerprint)
     if run_id is None:
         started = datetime.now(UTC)
@@ -500,8 +510,9 @@ def evaluate(
                 "generator_version": version() if callable(version) else generator.name,
                 "commit": _git_commit(),
                 "started_at": started.isoformat(),
-                "rescored": allow_rescore and split == "test",
+                "rescored": allow_rescore and split in TEST_SPLITS,
                 "retrieval_only": retrieval_only,
+                "cache_enabled": cache_enabled,
             },
         )
     done = {r.query_id: r for r in store.records_so_far(run_id)}

@@ -11,6 +11,8 @@ from pathlib import Path
 from rag_pipeline.corpus import BenchmarkQuery
 
 SPLIT_NAMES = ("dev", "smoke", "test", "reserve")
+TEST_SPLITS = ("test", "test-400")
+TEST_SUBSET_SIZE = 400
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,29 @@ def _allocate(total: int, group_sizes: dict[str, int]) -> dict[str, int]:
     for g in sorted(exact, key=lambda g: (counts[g] - exact[g], g))[:leftover]:
         counts[g] += 1
     return counts
+
+
+def make_test_subset(queries: list[BenchmarkQuery], splits: Splits) -> tuple[str, ...]:
+    by_id = {q.id: q for q in queries}
+    by_type: dict[str, list[str]] = defaultdict(list)
+    for id_ in sorted(splits.test):
+        by_type[by_id[id_].query_type].append(id_)
+    counts = _allocate(TEST_SUBSET_SIZE, {name: len(ids) for name, ids in by_type.items()})
+    rng = random.Random(DEFAULT_SEED)
+    return tuple(id_ for name in sorted(by_type) for id_ in rng.sample(by_type[name], counts[name]))
+
+
+def load_test_subset(path: Path, splits: Splits) -> tuple[str, ...]:
+    data = json.loads(path.read_text("utf-8"))
+    ids: tuple[str, ...] = tuple(data["test-400"])
+    if (
+        data["seed"] != DEFAULT_SEED
+        or len(ids) != TEST_SUBSET_SIZE
+        or len(set(ids)) != TEST_SUBSET_SIZE
+        or not set(ids).issubset(splits.test)
+    ):
+        raise ValueError("invalid committed 400-query Test Split subset")
+    return ids
 
 
 def make_splits(queries: list[BenchmarkQuery], sizes: SplitSizes, seed: int) -> Splits:

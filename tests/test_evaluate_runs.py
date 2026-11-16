@@ -60,6 +60,27 @@ def test_test_split_rescoring_needs_an_explicit_override(tmp_path: Path):
     assert again.meta["rescored"] is True
 
 
+@pytest.mark.parametrize("first", ["test", "test-400"])
+def test_the_test_subset_shares_the_test_split_score_once_guard(tmp_path: Path, first: str):
+    store = RunStore(tmp_path)
+    evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, first, store)
+
+    for split in ("test", "test-400"):
+        with pytest.raises(TestSplitAlreadyScored):
+            evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, split, store)
+
+
+def test_test_subset_rejects_retrieval_only_evaluation(tmp_path: Path):
+    with pytest.raises(ValueError, match="Test Split"):
+        evaluate(
+            ScriptedVariant("bm25", SCRIPT),
+            QUERIES,
+            "test-400",
+            RunStore(tmp_path),
+            retrieval_only=True,
+        )
+
+
 def test_dev_split_can_be_scored_repeatedly(tmp_path: Path):
     store = RunStore(tmp_path)
     evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, "dev", store)

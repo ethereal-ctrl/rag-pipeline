@@ -10,14 +10,23 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+from pydantic import TypeAdapter
 from qdrant_client import QdrantClient, models
 
 from rag_pipeline import bm25
+from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.chunking import Chunk, ChunkingSettings
 from rag_pipeline.corpus import article_hash
-from rag_pipeline.models import Embedder, EmbedderWithUsage, QueryTokenCounter
+from rag_pipeline.models import (
+    Embedder,
+    EmbedderSpec,
+    EmbedderWithUsage,
+    QueryTokenCounter,
+    model_version,
+)
 
 type TokenCount = int | Callable[[], int | None] | None
+_QUERY_EMBEDDING = TypeAdapter(tuple[list[float], int | None])
 
 BM25_VECTOR = "bm25"
 DENSE_VECTOR = "dense"
@@ -213,6 +222,29 @@ class ChunkIndex:
             )
         return self._embedder.embed_query(query)
 
+    def cached_embedding(
+        self, query: str, spec: EmbedderSpec, cache: ResponseCache
+    ) -> ModelResponse[tuple[list[float], int | None]]:
+        embedder = self._embedder
+        if embedder is None:
+            raise ValueError(f"index {self.collection!r} has no embedder for dense search")
+        key = cache_key(
+            "embed_query", spec.model_dump(), embedder.name, model_version(embedder), query
+        )
+
+        def embed() -> ModelResponse[tuple[list[float], int | None]]:
+            if isinstance(embedder, EmbedderWithUsage):
+                return measure_call(partial(embedder.embed_query_with_usage, query))
+            response = measure_call(lambda: embedder.embed_query(query))
+            tokens = (
+                embedder.count_query_tokens(query)
+                if isinstance(embedder, QueryTokenCounter)
+                else None
+            )
+            return ModelResponse((response.value, tokens), response.seconds)
+
+        return cache.get_or_call(key, _QUERY_EMBEDDING, embed)
+
     def search_hybrid(
         self,
         query: str,
@@ -220,6 +252,7 @@ class ChunkIndex:
         candidates: int,
         *,
         on_input_tokens: Callable[[TokenCount], None] | None = None,
+        embedding: list[float] | None = None,
     ) -> list[RetrievedChunk]:
         """BM25 and dense candidates fused with Reciprocal Rank Fusion inside one Qdrant query."""
         response = self._client.query_points(
@@ -229,7 +262,9 @@ class ChunkIndex:
                     query=bm25.query_vector(query), using=BM25_VECTOR, limit=candidates
                 ),
                 models.Prefetch(
-                    query=self._query_embedding(query, on_input_tokens),
+                    query=embedding
+                    if embedding is not None
+                    else self._query_embedding(query, on_input_tokens),
                     using=DENSE_VECTOR,
                     limit=candidates,
                 ),
@@ -246,10 +281,13 @@ class ChunkIndex:
         limit: int,
         *,
         on_input_tokens: Callable[[TokenCount], None] | None = None,
+        embedding: list[float] | None = None,
     ) -> list[RetrievedChunk]:
         response = self._client.query_points(
             self.collection,
-            query=self._query_embedding(query, on_input_tokens),
+            query=embedding
+            if embedding is not None
+            else self._query_embedding(query, on_input_tokens),
             using=DENSE_VECTOR,
             limit=limit,
             with_payload=True,

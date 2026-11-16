@@ -8,10 +8,13 @@ from typing import Annotated
 
 import typer
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import ResponseHandlingException
 
+from rag_pipeline.cache import CACHE_FILE, ResponseCache
 from rag_pipeline.chunking import ChunkingSettings
 from rag_pipeline.corpus import (
     DATASET_LICENSE,
+    BenchmarkQuery,
     fetch_dataset,
     load_articles,
     load_queries,
@@ -28,12 +31,21 @@ from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.models import EmbedderSpec, LocalModels
 from rag_pipeline.report import metric_label, metric_number, results_table
-from rag_pipeline.splits import DEFAULT_SEED, DEFAULT_SIZES, SPLIT_NAMES, Splits, make_splits
+from rag_pipeline.splits import (
+    DEFAULT_SEED,
+    DEFAULT_SIZES,
+    SPLIT_NAMES,
+    TEST_SPLITS,
+    Splits,
+    load_test_subset,
+    make_splits,
+)
 from rag_pipeline.tracing import cli_tracer
-from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant
+from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant, plan_remote_run
 
 RAW_DIR = Path("data/raw")
 SPLITS_FILE = Path("data/splits.json")
+TEST_SUBSET_FILE = Path("data/test-400.json")
 RUNS_DIR = Path("runs")
 GATE_FILE = Path("configs/gate/gate.yaml")
 
@@ -113,21 +125,39 @@ def eval_command(
     retrieval_only: Annotated[
         bool, typer.Option(help="Score retrieval alone, without generating (not on test).")
     ] = False,
+    no_cache: Annotated[
+        bool, typer.Option(help="Bypass stored model responses for this run.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option(help="Estimate remote calls without running any models.")
+    ] = False,
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
-    tracer = ctx.with_resource(cli_tracer())
-    if split not in SPLIT_NAMES:
-        raise typer.BadParameter(f"split must be one of {SPLIT_NAMES}")
-    if split == "test" and limit is not None:
+    splits = (*SPLIT_NAMES, "test-400")
+    if split not in splits:
+        raise typer.BadParameter(f"split must be one of {splits}")
+    if split in TEST_SPLITS and limit is not None:
         raise typer.BadParameter("--limit is not allowed on the Test Split")
+    if split in TEST_SPLITS and retrieval_only:
+        raise typer.BadParameter("--retrieval-only is not allowed on the Test Split")
     config = VariantConfig.from_yaml(variant_file)
-    queries = _split_queries(split)[:limit]
-    models = LocalModels()
-    variant = build_variant(
-        config, index=_index_for(config, models, qdrant_url), models=models, tracer=tracer
-    )
     try:
+        if dry_run:
+            remote = config.generation.generator.provider == "groq" and not retrieval_only
+            queries = _split_queries(split)[:limit] if remote else []
+            _print_remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
+            return
+        queries = _split_queries(split)[:limit]
+        tracer = ctx.with_resource(cli_tracer())
+        models = LocalModels()
+        variant = build_variant(
+            config,
+            index=_index_for(config, models, qdrant_url),
+            models=models,
+            tracer=tracer,
+            cache=None if no_cache else ResponseCache(),
+        )
         result = evaluate(
             variant,
             queries,
@@ -145,7 +175,36 @@ def eval_command(
 
 def _split_queries(split: str):
     by_id = {q.id: q for q in load_queries(RAW_DIR)}
-    return [by_id[i] for i in Splits.load(SPLITS_FILE).ids(split)]
+    splits = Splits.load(SPLITS_FILE)
+    ids = load_test_subset(TEST_SUBSET_FILE, splits) if split == "test-400" else splits.ids(split)
+    return [by_id[i] for i in ids]
+
+
+def _print_remote_plan(
+    config: VariantConfig,
+    queries: list[BenchmarkQuery],
+    qdrant_url: str,
+    retrieval_only: bool,
+    no_cache: bool,
+) -> None:
+    remote = config.generation.generator.provider == "groq" and not retrieval_only
+    cache = ResponseCache() if remote and not no_cache and CACHE_FILE.exists() else None
+    version = None
+    if cache is not None and config.uses_retrieval and config.index is not None:
+        client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
+        try:
+            version = ChunkIndex(client, config.index.collection).version()
+        except ResponseHandlingException:
+            typer.echo("Index version unavailable. Cached retrieval prompts could not be checked.")
+        finally:
+            client.close()
+    plan = plan_remote_run(
+        config, queries, cache, retrieval_only=retrieval_only, index_version=version
+    )
+    typer.echo(f"Remote calls before cache  {plan.calls}")
+    typer.echo(f"Already cached             {plan.cached}")
+    typer.echo(f"Remote calls needed       {plan.calls - plan.cached}")
+    typer.echo(f"Estimated quota days       {plan.days}")
 
 
 def _index_for(config: VariantConfig, models: LocalModels, qdrant_url: str) -> ChunkIndex | None:
