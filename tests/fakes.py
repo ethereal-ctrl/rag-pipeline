@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Completion, GeneratorSpec
 from rag_pipeline.variants import (
@@ -62,11 +64,12 @@ class ScriptedVariant:
         script: dict[str, tuple[str, list[str]]],
         config_tag: str = "v1",
         crash_after: int | None = None,
+        retrieval_mode: Literal["none", "bm25"] = "bm25",
     ) -> None:
         self.config = VariantConfig(
             name=name,
-            index=IndexConfig(collection=f"scripted-{config_tag}"),
-            retrieval=RetrievalConfig(mode="bm25", top_k=10),
+            index=None if retrieval_mode == "none" else IndexConfig(collection=f"s-{config_tag}"),
+            retrieval=RetrievalConfig(mode=retrieval_mode, top_k=10),
             generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
         )
         self.generator = GroundedFakeGenerator({})
@@ -79,6 +82,8 @@ class ScriptedVariant:
             raise RuntimeError("simulated crash")
         self.asked.append(question)
         text, chunk_texts = self._script[question]
+        if not self.config.uses_retrieval:
+            chunk_texts = []
         retrieved = tuple(
             RetrievedChunk(f"c{i}", "a", "t", "s", "2023-10-01", body, 1.0 / (i + 1))
             for i, body in enumerate(chunk_texts)

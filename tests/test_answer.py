@@ -57,3 +57,36 @@ def test_variant_abstains_when_retrieved_chunks_do_not_support_an_answer(
     answer = variant.answer(NULL_QUERY.question)
 
     assert answer.abstained
+
+
+CLOSED_BOOK_YAML = """
+name: closed-book
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+"""
+
+
+def test_closed_book_variant_answers_without_any_retrieval(tmp_path: Path):
+    path = tmp_path / "closed-book.yaml"
+    path.write_text(CLOSED_BOOK_YAML)
+    generator = GroundedFakeGenerator({"FTX": "Sam Bankman-Fried"})
+    variant = build_variant(VariantConfig.from_yaml(path), index=None, models=FakeModels(generator))
+
+    answer = variant.answer(FTX_QUERY.question)
+
+    assert answer.retrieved == ()
+    assert answer.text == "Sam Bankman-Fried"
+    assert "<chunk" not in generator.prompts[0]
+    assert FTX.body.split(".")[0] not in generator.prompts[0]
+
+
+def test_a_retrieval_variant_without_an_index_is_rejected(tmp_path: Path):
+    path = tmp_path / "bm25.yaml"
+    path.write_text(BM25_YAML.replace("index:\n  collection: fixture\n", ""))
+
+    with pytest.raises(ValueError, match="index"):
+        VariantConfig.from_yaml(path)

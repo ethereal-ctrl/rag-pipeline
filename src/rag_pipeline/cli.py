@@ -81,7 +81,9 @@ def eval_command(
     config = VariantConfig.from_yaml(variant_file)
     by_id = {q.id: q for q in load_queries(RAW_DIR)}
     queries = [by_id[i] for i in Splits.load(SPLITS_FILE).ids(split)][:limit]
-    index = ChunkIndex(QdrantClient(url=qdrant_url), config.index.collection)
+    index = (
+        ChunkIndex(QdrantClient(url=qdrant_url), config.index.collection) if config.index else None
+    )
     variant = build_variant(config, index=index, models=LocalModels())
     try:
         result = evaluate(variant, queries, split, RunStore(RUNS_DIR), allow_rescore=allow_rescore)

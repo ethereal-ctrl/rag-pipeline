@@ -1,0 +1,8 @@
+# Memorisation baseline: the same generator with no retrieval (ADR 0002).
+name: closed-book
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b

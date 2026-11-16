@@ -141,7 +141,8 @@ def _is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
 
 def _score(query: BenchmarkQuery, variant: Evaluable) -> QueryRecord:
     answer = variant.answer(query.question)
-    ranks = None if query.is_null else _rank_scores(query, answer.retrieved)
+    scored = variant.config.uses_retrieval and not query.is_null
+    ranks = _rank_scores(query, answer.retrieved) if scored else None
     return QueryRecord(
         query_id=query.id,
         query_type=query.query_type,
@@ -180,7 +181,8 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     metrics: dict[str, float] = {"queries": len(records)}
     for name, field in _RETRIEVAL_METRICS.items():
         values = [float(v) for r in records if (v := getattr(r, field)) is not None]
-        metrics[name] = _mean(values)
+        if values:  # absent for Closed-Book runs and Null-Query-only samples
+            metrics[name] = _mean(values)
     metrics["accuracy"] = _mean([float(r.correct) for r in records])
     for query_type in sorted({r.query_type for r in records}):
         typed = [float(r.correct) for r in records if r.query_type == query_type]

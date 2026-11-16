@@ -80,3 +80,14 @@ def test_per_query_results_export_as_csv_for_error_analysis(tmp_path: Path):
     assert [r["query_id"] for r in rows] == [q.id for q in QUERIES]
     assert rows[0]["answer"] == "Yes"
     assert rows[0]["correct"] == "True"
+
+
+def test_closed_book_runs_report_accuracy_but_no_retrieval_metrics(tmp_path: Path):
+    variant = ScriptedVariant("closed-book", SCRIPT, retrieval_mode="none")
+
+    result = evaluate(variant, QUERIES, "dev", RunStore(tmp_path))
+
+    assert result.metrics["accuracy"] == 1.0
+    assert not any(name.startswith(("hits", "mrr", "map", "evidence")) for name in result.metrics)
+    assert all(r.hit_at_10 is None for r in result.records)
+    assert "hits@10" not in result.intervals
