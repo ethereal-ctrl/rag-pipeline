@@ -120,7 +120,7 @@ class RateLimiter:
                 "CREATE INDEX IF NOT EXISTS remote_requests_by_model ON remote_requests(model, at)"
             )
 
-    def reserve(self, model: str, estimated_tokens: int) -> int:
+    def reserve(self, model: str, estimated_tokens: int, *, deadline: float | None = None) -> int:
         windows = self.limits.windows()
         horizon = max((seconds for seconds, _, _ in windows), default=DAY)
         # A large estimate takes the entire minute's allowance. Reconcile against usage on success.
@@ -129,6 +129,8 @@ class RateLimiter:
             with closing(sqlite3.connect(self._path)) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 now = self.clock.time()
+                if deadline is not None and now >= deadline:
+                    raise TimeoutError("Remote quota window exceeds the retry budget.")
                 db.execute(
                     "DELETE FROM remote_requests WHERE model = ? AND at <= ?",
                     (model, now - horizon),
@@ -151,6 +153,8 @@ class RateLimiter:
                     ).lastrowid
                     assert request_id is not None
                     return request_id
+            if deadline is not None and now + delay >= deadline:
+                raise TimeoutError("Remote quota window exceeds the retry budget.")
             self.clock.sleep(delay)
 
     def record_usage(self, request_id: int, tokens: int) -> None:

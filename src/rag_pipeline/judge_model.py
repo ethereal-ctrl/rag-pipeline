@@ -82,7 +82,8 @@ class JudgeRequest(_Strict):
         return self.model_dump_json().replace("<", "\\u003c").replace(">", "\\u003e")
 
     def cache_key(self, spec: GeneratorSpec) -> str:
-        return cache_key("judge", spec.model_dump(), _SYSTEM, self.prompt(), _SCHEMA)
+        namespace = "judge-gemini-v2" if spec.provider == "gemini" else "judge"
+        return cache_key(namespace, spec.model_dump(), _SYSTEM, self.prompt(), _SCHEMA)
 
     def estimated_tokens(self, spec: GeneratorSpec) -> int:
         system = remote_instructions(spec, _SYSTEM, _SCHEMA)

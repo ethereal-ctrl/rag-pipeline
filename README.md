@@ -110,6 +110,15 @@ project's current limits and regional availability before running.
 [Project rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) ·
 [Available regions](https://ai.google.dev/gemini-api/docs/available-regions)
 
+Gemma 4 can return reasoning in the answer text. The Gemma configs request
+Google's `minimal` thinking level, which Google documents as off for Gemma 4.
+The shared remote client removes any returned leading thought blocks before
+scoring or parsing JSON. Reasoning tokens count toward output usage, notional cost,
+and the persistent limiter. When a response omits the count, the client estimates
+it from the removed text. Traces record counts and raw content length.
+[Gemma thinking](https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api#thinking) ·
+[OpenAI-compatible thinking settings](https://ai.google.dev/gemini-api/docs/openai#extra-body)
+
 Google may use free-tier prompts and responses to improve its products. Its terms
 provide regional exceptions for the EEA, the UK, and Switzerland. Remote
 benchmarking sends only public benchmark questions and Corpus text, along with
@@ -136,6 +145,8 @@ windows. Gemma generation and judging share the same model quota when they use t
 same cache database. Dry runs estimate hours and whole quota days at a fresh allowance.
 For retrieval variants, the estimate uses the configured number of Chunks and known
 cache hits for the current index version.
+Remote calls retry transient server errors, timeouts, and rate-limit responses
+with backoff. If retries run out, rerun the same evaluation command to resume.
 
 ## Chunk Context
 

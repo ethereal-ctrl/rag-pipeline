@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
+import random
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from functools import cached_property, partial
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, runtime_checkable
 
@@ -29,6 +34,7 @@ if TYPE_CHECKING:
     from rag_pipeline.judge_model import Judge
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
+_LOGGER = logging.getLogger(__name__)
 
 
 def configured_ollama_url() -> str:
@@ -47,11 +53,14 @@ class GeneratorSpec(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] = "low"
     supports_system: bool = True
     structured_output: Literal["json_schema", "prompt"] = "json_schema"
+    thinking: Literal["off"] | None = None
 
     @model_validator(mode="after")
     def _validate_provider_options(self) -> Self:
         if self.provider == "gemini" and "reasoning_effort" in self.model_fields_set:
             raise ValueError("reasoning_effort is a Groq option in GeneratorSpec")
+        if self.thinking is not None and self.provider != "gemini":
+            raise ValueError("thinking is a Gemini option in GeneratorSpec")
         return self
 
     @model_serializer(mode="wrap")
@@ -59,6 +68,8 @@ class GeneratorSpec(BaseModel):
         payload: dict[str, Any] = handler(self)
         if self.provider == "gemini":
             payload.pop("reasoning_effort", None)
+        if self.thinking is None:
+            payload.pop("thinking", None)
         # Keep existing Groq and Ollama cache keys and saved configurations compatible.
         if self.supports_system and "supports_system" not in self.model_fields_set:
             payload.pop("supports_system", None)
@@ -80,6 +91,8 @@ class Completion:
     input_tokens: int
     output_tokens: int
     call_seconds: float | None = None
+    reasoning_tokens: int = 0
+    raw_content_length: int | None = None
 
 
 class EmbedderSpec(BaseModel):
@@ -166,7 +179,9 @@ def model_version(model: Generator | Embedder | Reranker) -> str | None:
 def generation_key(
     spec: GeneratorSpec, name: str, version: str | None, system: str, prompt: str
 ) -> str:
-    return cache_key("generate-v1", spec.model_dump(), name, version, system, prompt)
+    # Older Gemini cache entries may contain unfiltered thoughts and understated usage.
+    namespace = "generate-gemini-v2" if spec.provider == "gemini" else "generate-v1"
+    return cache_key(namespace, spec.model_dump(), name, version, system, prompt)
 
 
 _QUERY_EMBEDDING = TypeAdapter(tuple[list[float], int | None])
@@ -300,6 +315,88 @@ _REMOTE_CHATS = {
     ),
 }
 
+_THOUGHT_BLOCK = re.compile(
+    r"<(thought|think)\s*>(.*?)(?:</\1\s*>|\Z)", flags=re.IGNORECASE | re.DOTALL
+)
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 6
+_RETRY_SECONDS = 300.0
+_REQUEST_TIMEOUT = 60.0
+
+
+def _content_parts(content: str | list[dict[str, Any]] | None) -> tuple[str, str]:
+    if isinstance(content, list):
+        text: list[str] = []
+        thoughts: list[str] = []
+        for chunk in content:
+            if chunk.get("type") == "text":
+                text.append(chunk["text"])
+            elif chunk.get("type") in {"thinking", "reasoning"}:
+                value: Any = chunk.get("text", chunk.get("thinking"))
+                visible, nested_thoughts = _content_parts(value)
+                thoughts.extend((visible, nested_thoughts))
+        return "".join(text), "".join(thoughts)
+    return content or "", ""
+
+
+def _remote_completion(
+    provider: RemoteProvider,
+    body: dict[str, Any],
+    seconds: float,
+    prompted_json: bool,
+) -> Completion:
+    message: dict[str, Any] = body["choices"][0].get("message") or {}
+    content, separate = _content_parts(message.get("content"))
+    text = content.strip()
+    raw_length = len(content) + len(separate)
+    thought_parts = [separate, message.get("reasoning") or message.get("reasoning_content") or ""]
+    while match := _THOUGHT_BLOCK.match(text):
+        thought_parts.append(match[2])
+        text = text[match.end() :].lstrip()
+
+    usage: dict[str, Any] = body["usage"]
+    input_tokens, visible_tokens = usage["prompt_tokens"], usage["completion_tokens"]
+    total_output = (usage.get("total_tokens") or 0) - input_tokens
+    details: dict[str, Any] = usage.get("completion_tokens_details") or {}
+    google: dict[str, Any] = body.get("usageMetadata") or body.get("usage_metadata") or {}
+    # Gemini's total can include thoughts even when completion_tokens only counts the answer.
+    reasoning_tokens = max(
+        details.get("reasoning_tokens") or 0,
+        usage.get("reasoning_tokens") or 0,
+        *(
+            fields.get(key) or 0
+            for fields in (usage, google)
+            for key in ("thoughtsTokenCount", "thoughts_token_count")
+        ),
+        total_output - visible_tokens,
+        0,
+    )
+    if reasoning_tokens == 0 and (thoughts := "".join(thought_parts)):
+        reasoning_tokens = estimate_tokens("", thoughts, 0) - estimate_tokens("", "", 0)
+    # An inclusive Groq completion total can already account for its reasoning detail.
+    inclusive = provider == "groq" and total_output == visible_tokens >= reasoning_tokens
+    output_tokens = visible_tokens if inclusive else visible_tokens + reasoning_tokens
+    return Completion(
+        _first_json_object(text) if prompted_json else text,
+        input_tokens,
+        output_tokens,
+        seconds,
+        reasoning_tokens,
+        raw_length,
+    )
+
+
+def _retry_after(header: str, now: float) -> float:
+    try:
+        delay = float(header)
+    except ValueError:
+        try:
+            date = parsedate_to_datetime(header)
+            delay = (date if date.tzinfo else date.replace(tzinfo=UTC)).timestamp() - now
+        except (ValueError, OverflowError):
+            return 0.0
+    return delay if math.isfinite(delay) and delay > 0 else 0.0
+
 
 def _first_json_object(text: str) -> str:
     start = text.find("{")
@@ -358,6 +455,7 @@ class RemoteChatGenerator:
         provider = spec.remote_provider
         if provider is None:
             raise ValueError("Remote chat requires a remote provider.")
+        self._provider: RemoteProvider = provider
         self._chat = _REMOTE_CHATS[provider]
         key = os.environ.get(self._chat.key_variable, "").strip()
         if not key:
@@ -371,7 +469,7 @@ class RemoteChatGenerator:
         self._http = httpx.Client(
             base_url=self._chat.base_url,
             headers={"Authorization": f"Bearer {key}"},
-            timeout=60,
+            timeout=_REQUEST_TIMEOUT,
             transport=transport,
         )
 
@@ -404,6 +502,14 @@ class RemoteChatGenerator:
                 include_reasoning=False,
                 seed=self._spec.seed,
             )
+        elif self._spec.thinking == "off":
+            # Gemma 4 maps minimal to off: https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api
+            # Chat REST envelope: https://ai.google.dev/gemini-api/docs/openai#extra-body
+            payload["extra_body"] = {
+                "google": {
+                    "thinking_config": {"thinking_level": "minimal", "include_thoughts": False}
+                }
+            }
         prompted_json = schema is not None and self._spec.structured_output == "prompt"
         if schema is not None and not prompted_json:
             payload["response_format"] = {
@@ -411,40 +517,69 @@ class RemoteChatGenerator:
                 "json_schema": {"name": "rag_response", "strict": True, "schema": schema},
             }
         tokens = estimate_tokens(system, prompt, self._spec.max_output_tokens)
-        backoff = 1.0
-        while True:
-            request = self._limiter.reserve(self._spec.model, tokens)
-            started = time.perf_counter()
-            response = self._http.post(self._chat.path, json=payload)
-            seconds = time.perf_counter() - started
-            if response.status_code != 429:
-                response.raise_for_status()
-                body = response.json()
-                usage = body["usage"]
-                self._limiter.record_usage(
-                    request, usage["prompt_tokens"] + usage["completion_tokens"]
-                )
-                content: str | list[dict[str, Any]] | None = body["choices"][0]["message"][
-                    "content"
-                ]
-                if isinstance(content, list):
-                    content = "".join(chunk["text"] for chunk in content if chunk["type"] == "text")
-                text = (content or "").strip()
-                return Completion(
-                    _first_json_object(text) if prompted_json else text,
-                    usage["prompt_tokens"],
-                    usage["completion_tokens"],
-                    seconds,
-                )
-            self._limiter.record_usage(request, 0)
+        return self._complete_with_retries(payload, tokens, prompted_json)
+
+    def _complete_with_retries(
+        self, payload: dict[str, Any], tokens: int, prompted_json: bool
+    ) -> Completion:
+        clock = self._limiter.clock
+        deadline: float | None = None
+        failure = ""
+        last_error: httpx.HTTPError | None = None
+        attempts = 0
+        for _ in range(_MAX_ATTEMPTS):
             try:
-                retry_after = float(response.headers.get("retry-after", "0"))
-            except ValueError:
-                retry_after = 0.0
-            self._limiter.clock.sleep(
-                max(backoff, retry_after) if math.isfinite(retry_after) else backoff
+                request = self._limiter.reserve(self._spec.model, tokens, deadline=deadline)
+            except TimeoutError:
+                failure += ", quota wait exceeds the retry budget"
+                break
+            attempts += 1
+            now = clock.time()
+            if deadline is None:
+                # A fresh call may wait for a quota window before the retry budget starts.
+                deadline = now + _RETRY_SECONDS
+            retry_after = 0.0
+            try:
+                started = time.perf_counter()
+                response = self._http.post(
+                    self._chat.path,
+                    json=payload,
+                    timeout=min(_REQUEST_TIMEOUT, max(0, deadline - now)),
+                )
+                seconds = time.perf_counter() - started
+                response.raise_for_status()
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as error:
+                failure, last_error = type(error).__name__, error
+            except httpx.HTTPStatusError as error:
+                status = error.response.status_code
+                if status not in _RETRYABLE_STATUS:
+                    raise
+                failure, last_error = f"HTTP {status}", error
+                retry_after = _retry_after(
+                    error.response.headers.get("retry-after", ""), clock.time()
+                )
+            else:
+                result = _remote_completion(self._provider, response.json(), seconds, prompted_json)
+                self._limiter.record_usage(request, result.input_tokens + result.output_tokens)
+                return result
+            # Keep the reservation on failure so each retry counts against RPM and TPM.
+            backoff = 2.0**attempts
+            delay = max(random.uniform(backoff / 2, backoff), retry_after)
+            if attempts == _MAX_ATTEMPTS or clock.time() + delay >= deadline:
+                break
+            _LOGGER.warning(
+                "%s %s retry %d after %s (%.1f s)",
+                self._spec.provider.title(),
+                self._spec.model,
+                attempts,
+                failure,
+                delay,
             )
-            backoff = min(backoff * 2, 60)
+            clock.sleep(delay)
+        raise httpx.HTTPError(
+            f"{self._spec.provider.title()} model {self._spec.model!r} exhausted retries after "
+            f"{attempts} attempts ({failure}). Rerun the command to resume."
+        ) from last_error
 
 
 class OllamaEmbedder:

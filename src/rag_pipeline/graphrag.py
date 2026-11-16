@@ -235,8 +235,7 @@ class GraphModelCalls:
             self._count_replay(response, started)
             stage.seconds = response.seconds
             stage.cache_hit = response.cache_hit
-            stage.input_tokens = response.value.input_tokens
-            stage.output_tokens = response.value.output_tokens
+            stage.set_completion(response.value)
             return response.value.text
 
     def _documents(self, texts: list[str]) -> ModelResponse[tuple[list[list[float]], int | None]]:

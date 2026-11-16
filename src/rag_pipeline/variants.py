@@ -732,7 +732,7 @@ class PipelineVariant:
             ):
                 plan_key = _generation_plan_key(self.config, version, question)
                 self._cache.remember_plan(_stage_plan_key(plan_key, stage_name), key)
-        stage.input_tokens, stage.output_tokens = completion.input_tokens, completion.output_tokens
+        stage.set_completion(completion)
         return (
             completion
             if budget is None or budget.debit(completion, budget_system, prompt)
@@ -945,7 +945,7 @@ class PipelineVariant:
                     answer_text, citations, removed = parse_citations(completion.text, shown_ids)
                     stage.malformed = any(item.reason.startswith("malformed_") for item in removed)
                 else:
-                    answer_text, citations, removed = completion.text, (), ()
+                    answer_text, citations, removed = completion.text or ABSTENTION_TEXT, (), ()
             citations, rejected = self._check_citations(question, citations, shown, trace, budget)
             if any(item.reason == "max_tokens" for item in rejected):
                 stop_reason = "max_tokens"

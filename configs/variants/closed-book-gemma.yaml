@@ -14,4 +14,5 @@ generation:
     model: gemma-4-31b-it
     supports_system: true
     structured_output: prompt
+    thinking: "off"
     max_output_tokens: 512

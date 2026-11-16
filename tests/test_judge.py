@@ -95,7 +95,7 @@ def test_judge_grades_only_eligible_answers_and_saves_metrics(
         assert "untrusted" in body["messages"][0]["content"]
         prompt: dict[str, object] = json.loads(body["messages"][1]["content"])
         if prompt["question"] == "Broken?" and not interrupted:
-            return httpx.Response(503)
+            return httpx.Response(400)
         calls.append(prompt)
         assert prompt["statements"] == [
             {"statement": "First statement", "chunk_ids": ["c0"]},
