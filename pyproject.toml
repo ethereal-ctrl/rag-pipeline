@@ -24,6 +24,9 @@ dependencies = [
 [project.scripts]
 rag = "rag_pipeline.cli:app"
 
+[project.optional-dependencies]
+graphrag = ["lightrag-hku==1.5.7"]
+
 [dependency-groups]
 dev = [
     "pyright>=1.1.400",

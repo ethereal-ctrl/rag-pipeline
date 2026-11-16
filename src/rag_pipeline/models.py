@@ -105,6 +105,13 @@ class EmbedderWithUsage(Protocol):
 
 
 @runtime_checkable
+class DocumentEmbedderWithUsage(Protocol):
+    def embed_documents_with_usage(
+        self, texts: list[str]
+    ) -> tuple[list[list[float]], int | None]: ...
+
+
+@runtime_checkable
 class QueryTokenCounter(Protocol):
     def count_query_tokens(self, text: str) -> int | None: ...
 
@@ -154,6 +161,12 @@ def model_version(model: Generator | Embedder | Reranker) -> str | None:
     get_version = getattr(model, "cache_version", None) or getattr(model, "version", None)
     version = get_version() if callable(get_version) else None
     return version if isinstance(version, str) else None
+
+
+def generation_key(
+    spec: GeneratorSpec, name: str, version: str | None, system: str, prompt: str
+) -> str:
+    return cache_key("generate-v1", spec.model_dump(), name, version, system, prompt)
 
 
 _QUERY_EMBEDDING = TypeAdapter(tuple[list[float], int | None])
@@ -458,7 +471,10 @@ class OllamaEmbedder:
         return body["embeddings"], body.get("prompt_eval_count")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts)[0]
+        return self.embed_documents_with_usage(texts)[0]
+
+    def embed_documents_with_usage(self, texts: list[str]) -> tuple[list[list[float]], int | None]:
+        return self._embed(texts)
 
     def embed_query(self, text: str) -> list[float]:
         return self.embed_query_with_usage(text)[0]

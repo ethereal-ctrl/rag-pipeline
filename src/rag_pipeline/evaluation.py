@@ -49,6 +49,18 @@ class Evaluable(Protocol):
     def index_version(self) -> str | None: ...
 
 
+@dataclass(frozen=True)
+class EvaluationScope:
+    split: str
+    query_types: tuple[str, ...]
+    provenance: dict[str, object]
+
+
+@runtime_checkable
+class _ScopedEvaluation(Protocol):
+    def evaluation_scope(self) -> EvaluationScope: ...
+
+
 @runtime_checkable
 class _RetrievalWithTrace(Protocol):
     def retrieve_answer(self, question: str) -> Answer: ...
@@ -579,6 +591,7 @@ def _fingerprint(
     queries: list[BenchmarkQuery],
     retrieval_only: bool,
     cache_enabled: bool,
+    scope: EvaluationScope | None = None,
 ) -> str:
     variant = config.run_config()
     generator = variant["generation"]["generator"]
@@ -596,6 +609,8 @@ def _fingerprint(
     }
     if cache_enabled:
         identity["cache_enabled"] = True
+    if scope is not None:
+        identity["scope"] = asdict(scope)
     if config.generation.citations.enabled:
         # Resuming a cited run must not mix statement-based and short-answer scores.
         identity["citation_schema_version"] = 2
@@ -630,13 +645,22 @@ def evaluate(
     Split); it is refused on the Test Split, which is scored once with the whole pipeline.
     """
     config = variant.config
+    scope = variant.evaluation_scope() if isinstance(variant, _ScopedEvaluation) else None
+    if scope is not None:
+        if split != scope.split or retrieval_only:
+            raise ValueError(f"{config.name} only supports answer evaluation on the Dev Split.")
+        queries = [query for query in queries if query.query_type in scope.query_types]
+        if not queries:
+            raise ValueError(f"No {scope.split} queries match {', '.join(scope.query_types)}.")
     if retrieval_only and split in TEST_SPLITS:
         raise ValueError("retrieval-only runs are not allowed on the Test Split (ADR 0005)")
     if split in TEST_SPLITS:
         _guard_test_split(store, config, allow_rescore)
     index_version = variant.index_version()
     cache_enabled = getattr(variant, "cache_enabled", False) is True
-    fingerprint = _fingerprint(config, index_version, split, queries, retrieval_only, cache_enabled)
+    fingerprint = _fingerprint(
+        config, index_version, split, queries, retrieval_only, cache_enabled, scope
+    )
     run_id = store.find_incomplete(fingerprint)
     if run_id is None:
         started = datetime.now(UTC)
@@ -659,6 +683,8 @@ def evaluate(
                 "rescored": allow_rescore and split in TEST_SPLITS,
                 "retrieval_only": retrieval_only,
                 "cache_enabled": cache_enabled,
+                **(scope.provenance if scope is not None else {}),
+                **({"query_types": list(scope.query_types)} if scope is not None else {}),
             },
         )
     done = {r.query_id: r for r in store.records_so_far(run_id)}

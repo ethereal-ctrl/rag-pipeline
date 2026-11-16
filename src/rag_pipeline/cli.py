@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import typer
+import yaml
 from httpx import HTTPError
 from opentelemetry.trace import Tracer
 from qdrant_client import QdrantClient
@@ -48,6 +49,19 @@ from rag_pipeline.evaluation import (
     export_records,
 )
 from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_gate
+from rag_pipeline.graphrag import (
+    BUILD_COMPLETE,
+    GRAPH_DIR,
+    BuildReport,
+    GraphConfig,
+    GraphVariant,
+    build_graph,
+    estimate_build,
+    graph_session,
+    load_light_rag,
+    lock_graph,
+    paired_comparison,
+)
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.judge_calibration import calibration_report, export_calibration
@@ -111,6 +125,8 @@ router_app = typer.Typer(no_args_is_help=True)
 app.add_typer(router_app, name="router", help="Train the Router from saved Dev Split runs.")
 ladder_app = typer.Typer(no_args_is_help=True)
 app.add_typer(ladder_app, name="ladder", help="Plan, run and report the Ablation Ladder.")
+graphrag_app = typer.Typer(no_args_is_help=True)
+app.add_typer(graphrag_app, name="graphrag", help="Run the isolated GraphRAG Dev experiment.")
 
 
 class _JudgeGroup(TyperGroup):
@@ -812,6 +828,102 @@ def ladder_report_command(
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"Wrote {path} and its three SVG charts.")
+
+
+@graphrag_app.command("build")
+def graphrag_build(config: Path, dry_run: bool = False) -> None:
+    """Build or resume a local LightRAG graph from the Corpus."""
+    try:
+        settings = GraphConfig.from_yaml(config)
+        if dry_run:
+            estimate = estimate_build(settings, load_articles(RAW_DIR))
+            typer.echo(f"Articles                    {estimate.articles}")
+            typer.echo(f"Estimated chunks            {estimate.chunks}")
+            typer.echo(f"Estimated extraction calls  {estimate.llm_calls}")
+            typer.echo(f"Estimated tokens            {estimate.estimated_tokens}")
+            if estimate.quota_hours is not None:
+                typer.echo(f"Estimated quota hours       {estimate.quota_hours:.2f}")
+                typer.echo(f"Estimated quota days        {estimate.quota_days}")
+            return
+        factory = load_light_rag()
+        articles = load_articles(RAW_DIR)
+        with cli_tracer() as tracer:
+            report = build_graph(
+                settings,
+                articles,
+                GRAPH_DIR,
+                RUNS_DIR / "graphrag",
+                LocalModels(),
+                ResponseCache(CACHE_FILE),
+                tracer,
+                factory,
+            )
+    except (HTTPError, OSError, RuntimeError, ValueError, yaml.YAMLError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Graph {report.build_id} · {report.processed} Articles · {report.seconds:.1f} s")
+    typer.echo(f"Wrote {RUNS_DIR / 'graphrag' / (report.build_id + '.json')}")
+
+
+@graphrag_app.command("eval")
+def graphrag_evaluate(config: Path, split: str = "dev") -> None:
+    """Evaluate the graph against its configured Benchmark Query types on Dev."""
+    try:
+        if split != "dev":
+            raise ValueError("GraphRAG only supports answer evaluation on the Dev Split.")
+        settings = GraphConfig.from_yaml(config)
+        factory = load_light_rag()
+        build_id = settings.build_id(load_articles(RAW_DIR))
+        directory = GRAPH_DIR / build_id
+        build = BuildReport.load(RUNS_DIR / "graphrag", build_id)
+        if build is None or not build.complete or not (directory / BUILD_COMPLETE).is_file():
+            raise ValueError(f"Build graph {build_id} with rag graphrag build {config} first.")
+        with (
+            lock_graph(directory),
+            cli_tracer() as tracer,
+            graph_session(
+                settings,
+                directory,
+                settings.answer,
+                LocalModels(),
+                ResponseCache(CACHE_FILE),
+                tracer,
+                factory,
+            ) as session,
+        ):
+            result = evaluate(
+                GraphVariant(settings, build_id, session),
+                _split_queries(split),
+                split,
+                RunStore(RUNS_DIR),
+            )
+    except (HTTPError, OSError, RuntimeError, ValueError, yaml.YAMLError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Run {result.run_id}")
+    _print_metrics(result.metrics, result.intervals)
+
+
+@graphrag_app.command("compare")
+def graphrag_compare(graphrag_run: str, ladder_run: str) -> None:
+    """Report GraphRAG minus ladder deltas and the one-off graph build cost."""
+    store = RunStore(RUNS_DIR)
+    try:
+        comparison = paired_comparison(store.load(graphrag_run), store.load(ladder_run))
+        build = BuildReport.load(RUNS_DIR / "graphrag", comparison.build_id)
+    except (OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Shared Dev queries  {comparison.shared}")
+    for delta in comparison.deltas:
+        point, low, high = (
+            metric_number(delta.metric, value, signed=True)
+            for value in (delta.delta, delta.low, delta.high)
+        )
+        typer.echo(f"  {metric_label(delta.metric):<32} {point} [{low}, {high}]")
+    cost = build.notional_cost_usd if build is not None and build.complete else None
+    value = "unavailable" if cost is None else f"${cost:.6g}"
+    typer.echo(f"One-off graph build cost (notional USD)  {value}")
 
 
 @app.command("table")
