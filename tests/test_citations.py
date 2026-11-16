@@ -22,7 +22,7 @@ from rag_pipeline.rate_limit import RateLimiter, RateLimits
 from rag_pipeline.variants import VariantConfig, build_variant, plan_remote_run
 
 
-def _config(*, support_check: str = "none", context_chunks: int = 1) -> VariantConfig:
+def cited_config(*, support_check: str = "none", context_chunks: int = 1) -> VariantConfig:
     return VariantConfig.model_validate(
         {
             "name": "cited",
@@ -94,7 +94,7 @@ def test_citations_keep_only_statements_citing_shown_chunks(index: ChunkIndex):
     hidden_id = plain.retrieved[1].chunk_id
     model = CitationGenerator([("Sam Bankman-Fried.", ["shown"]), ("A hidden claim.", [hidden_id])])
 
-    answer = build_variant(_config(), index=index, models=FakeModels(model)).answer(
+    answer = build_variant(cited_config(), index=index, models=FakeModels(model)).answer(
         FTX_QUERY.question
     )
 
@@ -115,7 +115,7 @@ def test_malformed_or_empty_citation_output_leads_to_abstention(index: ChunkInde
     ingest(ARTICLES, index, ChunkingSettings(max_words=20, overlap_sentences=0))
     model = CitationGenerator([], malformed=response)
 
-    answer = build_variant(_config(), index=index, models=FakeModels(model)).answer(
+    answer = build_variant(cited_config(), index=index, models=FakeModels(model)).answer(
         FTX_QUERY.question
     )
 
@@ -141,7 +141,7 @@ def test_evaluation_scores_only_the_short_answer(
 ):
     ingest([FTX], index, ChunkingSettings(max_words=100, overlap_sentences=0))
     model = CitationGenerator([(statement, ["shown"])], short_answer=short_answer)
-    variant = build_variant(_config(), index=index, models=FakeModels(model))
+    variant = build_variant(cited_config(), index=index, models=FakeModels(model))
 
     result = evaluate(variant, [replace(FTX_QUERY, answer=reference)], "smoke", RunStore(tmp_path))
 
@@ -160,7 +160,7 @@ def test_cited_answer_abstains_without_a_usable_short_answer(
         [("The FTX chief stood trial.", ["shown"])], short_answer=short_answer
     )
 
-    answer = build_variant(_config(), index=index, models=FakeModels(model)).answer(
+    answer = build_variant(cited_config(), index=index, models=FakeModels(model)).answer(
         FTX_QUERY.question
     )
 
@@ -181,7 +181,7 @@ def test_support_check_removes_a_statement_and_records_cached_usage(
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     variant = build_variant(
-        _config(support_check="llm", context_chunks=2),
+        cited_config(support_check="llm", context_chunks=2),
         index=index,
         models=FakeModels(model),
         tracer=provider.get_tracer(__name__),
@@ -239,7 +239,7 @@ def test_all_rejected_or_unverified_statements_cause_abstention(index: ChunkInde
     model = SupportGenerator(verdicts)
 
     answer = build_variant(
-        _config(support_check="llm"), index=index, models=FakeModels(model)
+        cited_config(support_check="llm"), index=index, models=FakeModels(model)
     ).answer(FTX_QUERY.question)
 
     assert answer.text == "Insufficient information."
@@ -358,7 +358,7 @@ def test_evaluation_counts_abstentions_and_scores_attempted_citations(
     pixel = replace(PIXEL_QUERY, evidence=(Evidence(FTX.url, "The jury will hear"),))
     rejected = replace(FTX_QUERY, id="q_rejected", question="What happened during the FTX trial?")
     variant = build_variant(
-        _config(), index=index, models=FakeModels(ScriptedCitationGenerator([]))
+        cited_config(), index=index, models=FakeModels(ScriptedCitationGenerator([]))
     )
     store = RunStore(tmp_path)
 
@@ -388,7 +388,7 @@ def test_structured_model_requests_and_cached_remote_plan(
 ):
     monkeypatch.setenv("GROQ_API_KEY", "fixture-key")
     ingest([FTX], index, ChunkingSettings(max_words=100, overlap_sentences=0))
-    config = _config(support_check="llm")
+    config = cited_config(support_check="llm")
     if provider == "groq":
         data = config.model_dump()
         data["generation"]["generator"].update(provider="groq", model="openai/gpt-oss-120b")

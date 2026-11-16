@@ -1,0 +1,28 @@
+name: agentic
+index:
+  collection: chunks-sent-w200-o1-bge-m3
+  embedder:
+    provider: ollama
+    model: bge-m3
+retrieval:
+  mode: hybrid
+  top_k: 10
+  candidates: 50
+  rerank:
+    reranker:
+      provider: sentence-transformers
+      model: BAAI/bge-reranker-v2-m3
+    candidates: 30
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5
+  citations:
+    enabled: true
+    support_check: llm
+agentic:
+  max_steps: 3
+  max_tokens: 16000
+  max_context_chunks: 6
+  chunks_per_step: 2

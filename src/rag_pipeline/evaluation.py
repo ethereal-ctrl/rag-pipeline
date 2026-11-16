@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from rag_pipeline.agentic import StopReason
 from rag_pipeline.citations import Citation, RemovedStatement
 from rag_pipeline.corpus import NULL_QUERY_TYPE, BenchmarkQuery
 from rag_pipeline.cost import load_prices, notional_cost
@@ -87,6 +88,8 @@ class QueryRecord:
     removed_statements: tuple[RemovedStatement, ...] = ()
     shown_chunk_ids: tuple[str, ...] = ()
     citation_counts: CitationCounts | None = None
+    search_steps: int | None = None
+    stop_reason: StopReason | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +235,8 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         citations=answer.citations,
         removed_statements=answer.removed_statements,
         shown_chunk_ids=answer.shown_chunk_ids,
+        search_steps=answer.search_steps,
+        stop_reason=answer.stop_reason,
         citation_counts=(
             _citation_counts(query, answer)
             if not retrieval_only and variant.config.generation.citations.enabled
@@ -300,6 +305,13 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
             metrics["citation_evidence_precision"] = sum(
                 c.with_evidence or 0 for c in evidence
             ) / sum(c.attempted for c in evidence)
+    steps = [float(r.search_steps) for r in judged if r.search_steps is not None]
+    if steps:
+        metrics["search_steps"] = _mean(steps)
+    reasons = [r.stop_reason for r in judged if r.stop_reason is not None]
+    if reasons:
+        for reason in ("sufficient", "max_steps", "max_tokens"):
+            metrics[f"stop_reason[{reason}]"] = reasons.count(reason) / len(reasons)
     seconds = sorted(r.seconds for r in records)
     if seconds:
         metrics["latency_p50"] = _percentile(seconds, 0.50)

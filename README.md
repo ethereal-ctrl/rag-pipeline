@@ -92,6 +92,28 @@ answerable queries, and both metrics are omitted when their denominator is empty
 uv run rag eval configs/variants/hybrid-rerank-cited.yaml --split smoke
 ```
 
+## Agentic Search
+
+Compare [Agentic Search](configs/variants/agentic.yaml) with the
+[cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml).
+Agentic Search plans sub-queries and reuses retrieval and reranking for each search.
+Each step contributes up to `chunks_per_step` new Chunks to the Evidence shown to
+the sufficiency check. Final generation takes the highest-ranked contribution
+from each step, then the next rank from each step, until it reaches
+`max_context_chunks`. It uses the same Citation and support check as the
+comparison variant.
+
+For Hits, MRR, MAP and Evidence Recall, the ranking uses all retrieved Chunks,
+deduplicated in order of first appearance across searches. Evaluation also reports mean
+search steps and the shares that stop on sufficiency, the step limit or the token
+limit, with bootstrap intervals.
+
+The token budget covers planning, decisions, generation and the support check
+across the whole answer. Each call reserves estimated input and the configured
+output allowance before execution, and debits the reported usage afterwards. The
+example uses a separate 8K per-call context limit. A Groq dry run shows the upper
+bound on calls at `max_steps`.
+
 ## Development
 
 ```bash

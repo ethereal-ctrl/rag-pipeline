@@ -184,13 +184,13 @@ class OllamaGenerator:
         return self._digest
 
 
-def estimated_groq_tokens(system: str, prompt: str, max_output_tokens: int) -> int:
-    # Estimate from text length plus chat framing and a full completion allowance.
-    return (
-        math.ceil((len(system.encode("utf-8")) + len(prompt.encode("utf-8"))) / 3)
-        + 32
-        + max_output_tokens
-    )
+def estimate_tokens(
+    system: str, prompt: str, max_output_tokens: int, *, conservative: bool = False
+) -> int:
+    size = len(system.encode("utf-8")) + len(prompt.encode("utf-8"))
+    # Agentic Search reserves one token per byte and extra room for chat framing.
+    input_tokens = size + 128 if conservative else math.ceil(size / 3) + 32
+    return input_tokens + max_output_tokens
 
 
 class GroqGenerator:
@@ -241,7 +241,7 @@ class GroqGenerator:
                 "type": "json_schema",
                 "json_schema": {"name": "rag_response", "strict": True, "schema": schema},
             }
-        tokens = estimated_groq_tokens(system, prompt, self._spec.max_output_tokens)
+        tokens = estimate_tokens(system, prompt, self._spec.max_output_tokens)
         backoff = 1.0
         while True:
             request = self._limiter.reserve(self._spec.model, tokens)
