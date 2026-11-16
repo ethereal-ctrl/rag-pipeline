@@ -289,9 +289,10 @@ final `generate` stage including the prompt framing.
 
 Semantic chunking starts a new Chunk where adjacent sentence cosine distance exceeds
 the Article's 90th percentile or the next sentence exceeds the Chunk's 200-word budget.
-This variant uses zero overlap. A sentence longer than the budget stays whole in its
-own Chunk. Ingestion batches and caches the sentence embeddings and skips unchanged
-Articles on subsequent builds.
+This variant uses the same one-sentence overlap setting as the reference. It carries
+the previous Chunk's last sentence across either type of boundary when it fits. A
+sentence longer than the budget stays whole in its own Chunk. Ingestion batches and
+caches the sentence embeddings and skips unchanged Articles on subsequent builds.
 
 HyDE generates a short hypothetical passage for the dense arm. By default BM25 uses
 the question. Set `retrieval.hyde.bm25: both` to search the combined question and

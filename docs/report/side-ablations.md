@@ -18,12 +18,14 @@ metric uses the final generation stage's input, which includes prompt framing.
 
 ## Semantic chunking
 
-Compare the reference's sentence packing with a 200-word semantic index. The
-semantic index starts a Chunk at adjacent sentence cosine distances strictly above
-the Article's 90th percentile and uses zero overlap. Both strategies keep sentences
-whole, including individual sentences longer than the word budget. The semantic
-policy can change the number of Chunks, the amount of Evidence per Chunk and the
-text available to the generator. Its sentence embedding pass also adds build work.
+Compare the reference's sentence packing with a semantic index. Both variants are
+configured for 200 words and one sentence of overlap. The semantic index starts a
+Chunk at adjacent sentence cosine distances strictly above the Article's 90th
+percentile. It carries the previous Chunk's last sentence across topic boundaries
+and word-limit cuts when it fits. Both strategies keep sentences whole, including
+individual sentences longer than the word budget. The semantic policy can change
+the number of Chunks, the amount of Evidence per Chunk and the text available to
+the generator. Its sentence embedding pass also adds build work.
 
 <!-- table: rag table CHUNK_200_RUN SEMANTIC_RUN -->
 <!-- conclusion: Explain the measured trade-off between retrieval, answering and build work. -->

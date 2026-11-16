@@ -100,7 +100,7 @@ def chunk_article(
         current_words = sum(len(s.split()) for s in current)
         if current and (i in breaks or current_words + sentence_words > settings.max_words):
             groups.append(current)
-            overlap = settings.overlap_sentences if i not in breaks else 0
+            overlap = settings.overlap_sentences
             current = current[-overlap:] if overlap else []
             if settings.strategy == "semantic":
                 # Keep the carried whole sentences only when they fit with the new one.

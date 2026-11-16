@@ -68,6 +68,20 @@ def test_chunk_sizes_coexist_and_the_yaml_variant_selects_its_index():
         assert {
             key for key in reference if key != "name" and configured[key] != reference[key]
         } == {field_group}
+    reference_build = IndexBuild.for_variant(VariantConfig.from_yaml(CONFIGS / "chunk-200.yaml"))
+    semantic_build = IndexBuild.for_variant(VariantConfig.from_yaml(CONFIGS / "semantic.yaml"))
+    assert (
+        replace(
+            semantic_build.settings,
+            strategy=reference_build.settings.strategy,
+            semantic_percentile=reference_build.settings.semantic_percentile,
+        )
+        == reference_build.settings
+    )
+    assert semantic_build.embedder is not None
+    assert semantic_build.collection == index_collection(
+        semantic_build.settings, semantic_build.embedder.model
+    )
 
 
 class TopicEmbedder(ConceptFakeEmbedder):
@@ -81,16 +95,19 @@ class TopicEmbedder(ConceptFakeEmbedder):
         ]
 
 
+TOPIC_SENTENCES = [
+    "Granite forms slowly.",
+    "Basalt cools quickly.",
+    "Markets opened higher.",
+    "The index gained.",
+    "Bond yields fell.",
+    "Investors bought equities.",
+    "Income rose steadily.",
+]
+
+
 def test_semantic_ingest_splits_at_topic_and_cap_and_reuses_sentence_embeddings(tmp_path: Path):
-    sentences = [
-        "Granite forms slowly.",
-        "Basalt cools quickly.",
-        "Markets opened higher.",
-        "The index gained.",
-        "Bond yields fell.",
-        "Investors bought equities.",
-        "Income rose steadily.",
-    ]
+    sentences = TOPIC_SENTENCES
     article = replace(FTX, body=" ".join(sentences))
     long_article = replace(PIXEL, body="Word " * 10 + "sentence.")
     settings = ChunkingSettings(
@@ -134,6 +151,32 @@ def test_semantic_ingest_splits_at_topic_and_cap_and_reuses_sentence_embeddings(
     ingest([article], plain, ChunkingSettings(max_words=9, overlap_sentences=0))
     with pytest.raises(IndexMismatch, match="chunking"):
         ingest([article], plain, settings, cache=cache)
+
+
+@pytest.mark.parametrize("max_words", [9, 5], ids=["overlap-fits", "overlap-exceeds-cap"])
+def test_semantic_ingest_carries_whole_sentences_that_fit_at_both_boundaries(max_words: int):
+    sentences = TOPIC_SENTENCES
+    article = replace(FTX, body=" ".join(sentences))
+    settings = ChunkingSettings(max_words=max_words, overlap_sentences=1, strategy="semantic")
+    collection = index_collection(settings, "concept-fake")
+    index = ChunkIndex(QdrantClient(":memory:"), collection, TopicEmbedder())
+
+    report = ingest([article], index, settings)
+
+    hits = index.search_bm25("granite basalt markets index bond investors income", limit=10)
+    texts = [hit.text for hit in sorted(hits, key=lambda hit: hit.chunk_id)]
+    if max_words == 9:
+        # The first break is the topic shift. The other breaks follow the word cap.
+        assert texts == [
+            " ".join(sentences[:2]),
+            " ".join(sentences[1:4]),
+            " ".join(sentences[3:6]),
+            " ".join(sentences[5:]),
+        ]
+    else:
+        assert texts == sentences
+    assert all(len(text.split()) <= max_words for text in texts)
+    assert report.index_version.startswith(f"chunks-sem-p90-w{max_words}-o1-concept-fake@")
 
 
 PASSAGE = "HYPOTHETICAL description of a fraud trial outside Manhattan."

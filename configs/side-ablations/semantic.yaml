@@ -1,6 +1,6 @@
 name: side-semantic
 index:
-  collection: chunks-sem-p90-w200-qwen3-embedding-0.6b
+  collection: chunks-sem-p90-w200-o1-qwen3-embedding-0.6b
   embedder:
     provider: ollama
     model: qwen3-embedding:0.6b
@@ -8,7 +8,7 @@ index:
   chunking:
     strategy: semantic
     max_words: 200
-    overlap_sentences: 0
+    overlap_sentences: 1
     semantic_percentile: 90
 retrieval:
   mode: hybrid
