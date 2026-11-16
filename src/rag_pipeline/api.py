@@ -136,7 +136,7 @@ class _Runtime:
 
         candidates = answer_variants(config)
         if (
-            any(candidate.generation.generator.provider == "groq" for candidate in candidates)
+            any(candidate.uses_groq() for candidate in candidates)
             and not os.environ.get("GROQ_API_KEY", "").strip()
         ):
             raise HTTPException(503, "Set GROQ_API_KEY to use this Groq variant.")

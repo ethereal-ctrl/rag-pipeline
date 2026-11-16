@@ -11,10 +11,11 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+from pydantic import TypeAdapter
 from qdrant_client import QdrantClient, models
 
 from rag_pipeline import bm25
-from rag_pipeline.cache import ModelResponse, ResponseCache
+from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.chunk_context import ContextBuild
 from rag_pipeline.chunking import Chunk, ChunkingSettings
 from rag_pipeline.corpus import article_hash
@@ -23,6 +24,7 @@ from rag_pipeline.models import (
     EmbedderSpec,
     EmbedderWithUsage,
     QueryTokenCounter,
+    model_version,
     query_embedding,
 )
 
@@ -33,6 +35,7 @@ DENSE_VECTOR = "dense"
 EMBED_BATCH = 64
 _POINT_NAMESPACE = uuid.UUID("6f1c4a52-1b7e-4f3e-9a51-3f4e2b7c9d10")
 _NO_EMBEDDER = "none"
+_DOCUMENT_EMBEDDINGS = TypeAdapter(list[list[float]])
 
 
 class IndexMismatch(Exception):
@@ -112,6 +115,27 @@ class ChunkIndex:
             vectors += self._embedder.embed_documents([c.index_text for c in batch])
         return vectors
 
+    def embed_sentences(
+        self, sentences: list[str], cache: ResponseCache | None
+    ) -> list[list[float]]:
+        embedder = self._embedder
+        if embedder is None:
+            raise ValueError("Semantic chunking requires the index embedder.")
+        revision = model_version(embedder) if cache is not None else None
+        vectors: list[list[float]] = []
+        for start in range(0, len(sentences), EMBED_BATCH):
+            batch = sentences[start : start + EMBED_BATCH]
+            embed = partial(embedder.embed_documents, batch)
+            if cache is None:
+                vectors.extend(embed())
+            else:
+                key = cache_key("embed_sentences", embedder.name, revision, batch)
+                response = cache.get_or_call(
+                    key, _DOCUMENT_EMBEDDINGS, partial(measure_call, embed)
+                )
+                vectors.extend(response.value)
+        return vectors
+
     @property
     def _embedder_name(self) -> str:
         return self._embedder.name if self._embedder else _NO_EMBEDDER
@@ -161,10 +185,13 @@ class ChunkIndex:
 
     def check_build(self, chunking: str, context: ContextBuild | None = None) -> None:
         """Refuse to mix incompatible chunking, Chunk Context or embedding settings."""
+        semantic = chunking.startswith("sem-")
+        if semantic and self._embedder is None:
+            raise IndexMismatch("Semantic chunking requires the index embedder.")
         for payload in self._stored_payloads():
             for key, expected in (("chunking", chunking), ("embedder", self._embedder_name)):
                 stored = payload.get(key)
-                if stored is not None and stored != expected:
+                if (stored is not None or (semantic and key == "chunking")) and stored != expected:
                     raise IndexMismatch(
                         f"{self.collection!r} holds Chunks with {key} {stored!r}, not "
                         f"{expected!r}; ingest into its own collection instead"
@@ -205,7 +232,9 @@ class ChunkIndex:
         if any((chunk.context is None) != (context is None) for chunk in chunks):
             raise IndexMismatch("Chunk Context payloads require matching build metadata")
         dense = self._dense_vectors(chunks)
-        counts = Counter(chunk.article.id for chunk in chunks) if context else Counter[str]()
+        counts = Counter(
+            chunk.article.id for chunk in chunks if context or chunk.chunking.startswith("sem-")
+        )
         self._ensure_collection(len(dense[0]) if dense else None)
         points = [
             models.PointStruct(
@@ -226,11 +255,15 @@ class ChunkIndex:
                     "chunking": chunk.chunking,
                     "embedder": self._embedder_name,
                     **(
+                        {"article_chunk_count": counts[chunk.article.id]}
+                        if chunk.article.id in counts
+                        else {}
+                    ),
+                    **(
                         {
                             "context": chunk.context,
                             "context_model": context.model,
                             "context_build": context.key,
-                            "article_chunk_count": counts[chunk.article.id],
                         }
                         if context
                         else {}
@@ -292,6 +325,7 @@ class ChunkIndex:
         *,
         on_input_tokens: Callable[[TokenCount], None] | None = None,
         embedding: list[float] | None = None,
+        dense_query: str | None = None,
     ) -> list[RetrievedChunk]:
         """BM25 and dense candidates fused with Reciprocal Rank Fusion inside one Qdrant query."""
         response = self._client.query_points(
@@ -303,7 +337,9 @@ class ChunkIndex:
                 models.Prefetch(
                     query=embedding
                     if embedding is not None
-                    else self._query_embedding(query, on_input_tokens),
+                    else self._query_embedding(
+                        dense_query if dense_query is not None else query, on_input_tokens
+                    ),
                     using=DENSE_VECTOR,
                     limit=candidates,
                 ),
