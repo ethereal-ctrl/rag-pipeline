@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import BaseModel, ConfigDict, PositiveInt
@@ -91,6 +91,13 @@ class Generator(Protocol):
     def complete(self, system: str, prompt: str) -> Completion: ...
 
 
+@runtime_checkable
+class StructuredGenerator(Protocol):
+    def complete_structured(
+        self, system: str, prompt: str, schema: dict[str, Any]
+    ) -> Completion: ...
+
+
 class ModelProvider(Protocol):
     def generator_for(self, spec: GeneratorSpec) -> Generator: ...
 
@@ -114,33 +121,44 @@ def _ollama_digest(client: httpx.Client, name: str) -> str | None:
 
 
 class OllamaGenerator:
-    def __init__(self, spec: GeneratorSpec, base_url: str = "http://localhost:11434") -> None:
+    def __init__(
+        self,
+        spec: GeneratorSpec,
+        base_url: str = "http://localhost:11434",
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self._spec = spec
-        self._http = httpx.Client(base_url=base_url, timeout=600)
+        self._http = httpx.Client(base_url=base_url, timeout=600, transport=transport)
 
     @property
     def name(self) -> str:
         return f"ollama:{self._spec.model}"
 
-    def complete(self, system: str, prompt: str) -> Completion:
-        response = self._http.post(
-            "/api/chat",
-            json={
-                "model": self._spec.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": prompt},
-                ],
-                "stream": False,
-                "think": False,
-                "options": {
-                    "temperature": self._spec.temperature,
-                    "seed": self._spec.seed,
-                    "num_predict": self._spec.max_output_tokens,
-                    "num_ctx": self._spec.context_size,
-                },
+    def complete_structured(self, system: str, prompt: str, schema: dict[str, Any]) -> Completion:
+        return self.complete(system, prompt, schema=schema)
+
+    def complete(
+        self, system: str, prompt: str, *, schema: dict[str, Any] | None = None
+    ) -> Completion:
+        payload: dict[str, Any] = {
+            "model": self._spec.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {
+                "temperature": self._spec.temperature,
+                "seed": self._spec.seed,
+                "num_predict": self._spec.max_output_tokens,
+                "num_ctx": self._spec.context_size,
             },
-        )
+        }
+        if schema is not None:
+            payload["format"] = schema
+        response = self._http.post("/api/chat", json=payload)
         response.raise_for_status()
         body = response.json()
         return Completion(
@@ -200,8 +218,13 @@ class GroqGenerator:
     def name(self) -> str:
         return f"groq:{self._spec.model}"
 
-    def complete(self, system: str, prompt: str) -> Completion:
-        payload = {
+    def complete_structured(self, system: str, prompt: str, schema: dict[str, Any]) -> Completion:
+        return self.complete(system, prompt, schema=schema)
+
+    def complete(
+        self, system: str, prompt: str, *, schema: dict[str, Any] | None = None
+    ) -> Completion:
+        payload: dict[str, Any] = {
             "model": self._spec.model,
             "messages": [
                 {"role": "system", "content": system},
@@ -213,6 +236,11 @@ class GroqGenerator:
             "include_reasoning": False,
             "seed": self._spec.seed,
         }
+        if schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "rag_response", "strict": True, "schema": schema},
+            }
         tokens = estimated_groq_tokens(system, prompt, self._spec.max_output_tokens)
         backoff = 1.0
         while True:
@@ -369,10 +397,12 @@ class LocalModels:
         self,
         ollama_url: str = "http://localhost:11434",
         *,
+        ollama_transport: httpx.BaseTransport | None = None,
         groq_transport: httpx.BaseTransport | None = None,
         groq_limiter: RateLimiter | None = None,
     ) -> None:
         self._ollama_url = ollama_url
+        self._ollama_transport = ollama_transport
         self._groq_transport = groq_transport
         self._groq_limiter = groq_limiter
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
@@ -386,7 +416,7 @@ class LocalModels:
     def generator_for(self, spec: GeneratorSpec) -> Generator:
         if spec.provider == "groq":
             return GroqGenerator(spec, transport=self._groq_transport, limiter=self._groq_limiter)
-        return OllamaGenerator(spec, self._ollama_url)
+        return OllamaGenerator(spec, self._ollama_url, transport=self._ollama_transport)
 
     def embedder_for(self, spec: EmbedderSpec) -> Embedder:
         if spec not in self._embedders:

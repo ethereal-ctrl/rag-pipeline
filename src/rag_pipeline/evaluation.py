@@ -15,7 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from rag_pipeline.corpus import BenchmarkQuery
+from rag_pipeline.citations import Citation, RemovedStatement
+from rag_pipeline.corpus import NULL_QUERY_TYPE, BenchmarkQuery
 from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Generator
@@ -55,6 +56,13 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
 @dataclass(frozen=True)
+class CitationCounts:
+    attempted: int
+    shown: int
+    with_evidence: int | None
+
+
+@dataclass(frozen=True)
 class QueryRecord:
     query_id: str
     query_type: str
@@ -75,6 +83,10 @@ class QueryRecord:
     stage_seconds: dict[str, float] = field(default_factory=dict[str, float])
     trace: tuple[StageTrace, ...] = ()
     notional_cost_usd: float | None = None
+    citations: tuple[Citation, ...] = ()
+    removed_statements: tuple[RemovedStatement, ...] = ()
+    shown_chunk_ids: tuple[str, ...] = ()
+    citation_counts: CitationCounts | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,11 @@ def _squash(text: str) -> str:
     return text.replace(" ", "").replace("\n", "")
 
 
+def _matching_facts(chunk: RetrievedChunk, facts: list[str]) -> list[str]:
+    text = _squash(chunk.text)
+    return [fact for fact in facts if fact in text]
+
+
 @dataclass(frozen=True)
 class _RankScores:
     hit_at_4: bool
@@ -128,8 +145,7 @@ def _rank_scores(query: BenchmarkQuery, retrieved: tuple[RetrievedChunk, ...]) -
     first_rank: int | None = None
     precision_sum = 0.0
     for rank, chunk in enumerate(retrieved[:RANK_CUTOFF], start=1):
-        text = _squash(chunk.text)
-        in_chunk = [f for f in facts if f in text]
+        in_chunk = _matching_facts(chunk, facts)
         if not in_chunk:
             continue
         first_rank = first_rank or rank
@@ -166,6 +182,27 @@ def _retrieve_only(variant: Evaluable, question: str) -> Answer:
     return Answer("", False, retrieved, 0, 0, time.perf_counter() - started, stages)
 
 
+def _citation_counts(query: BenchmarkQuery, answer: Answer) -> CitationCounts | None:
+    ids = [
+        id_
+        for statement in (*answer.citations, *answer.removed_statements)
+        for id_ in statement.chunk_ids
+    ]
+    if not ids:
+        return None
+    shown = set(answer.shown_chunk_ids)
+    evidence_count = None
+    if not query.is_null:
+        facts = [_squash(e.fact) for e in query.evidence]
+        evidence_ids = {
+            chunk.chunk_id
+            for chunk in answer.retrieved
+            if chunk.chunk_id in shown and _matching_facts(chunk, facts)
+        }
+        evidence_count = sum(id_ in evidence_ids for id_ in ids)
+    return CitationCounts(len(ids), sum(id_ in shown for id_ in ids), evidence_count)
+
+
 def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> QueryRecord:
     if retrieval_only:
         answer = _retrieve_only(variant, query.question)
@@ -192,6 +229,14 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         seconds=answer.seconds,
         stage_seconds=answer.stage_seconds,
         trace=answer.trace,
+        citations=answer.citations,
+        removed_statements=answer.removed_statements,
+        shown_chunk_ids=answer.shown_chunk_ids,
+        citation_counts=(
+            _citation_counts(query, answer)
+            if not retrieval_only and variant.config.generation.citations.enabled
+            else None
+        ),
     )
 
 
@@ -239,6 +284,22 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
         for query_type in sorted({r.query_type for r in judged}):
             typed = [float(bool(r.correct)) for r in judged if r.query_type == query_type]
             metrics[f"accuracy[{query_type}]"] = _mean(typed)
+        null = [float(r.abstained) for r in judged if r.query_type == NULL_QUERY_TYPE]
+        answerable = [float(r.abstained) for r in judged if r.query_type != NULL_QUERY_TYPE]
+        if null:
+            metrics["abstention_rate[null]"] = _mean(null)
+        if answerable:
+            metrics["false_abstention_rate"] = _mean(answerable)
+    citations = [r.citation_counts for r in judged if r.citation_counts is not None]
+    if citations:
+        metrics["citation_validity"] = sum(c.shown for c in citations) / sum(
+            c.attempted for c in citations
+        )
+        evidence = [c for c in citations if c.with_evidence is not None]
+        if evidence:
+            metrics["citation_evidence_precision"] = sum(
+                c.with_evidence or 0 for c in evidence
+            ) / sum(c.attempted for c in evidence)
     seconds = sorted(r.seconds for r in records)
     if seconds:
         metrics["latency_p50"] = _percentile(seconds, 0.50)
@@ -343,6 +404,16 @@ class TestSplitAlreadyScored(Exception):
 def _record_from_row(row: dict[str, Any]) -> QueryRecord:
     row["retrieved_chunk_ids"] = tuple(row["retrieved_chunk_ids"])
     row["trace"] = tuple(StageTrace(**stage) for stage in row.get("trace", ()))
+    row["shown_chunk_ids"] = tuple(row.get("shown_chunk_ids", ()))
+    row["citations"] = tuple(
+        Citation(cite["statement"], tuple(cite["chunk_ids"])) for cite in row.get("citations", ())
+    )
+    row["removed_statements"] = tuple(
+        RemovedStatement(item["statement"], tuple(item["chunk_ids"]), item["reason"])
+        for item in row.get("removed_statements", ())
+    )
+    if row.get("citation_counts") is not None:
+        row["citation_counts"] = CitationCounts(**row["citation_counts"])
     return QueryRecord(**row)
 
 
@@ -438,14 +509,14 @@ def _fingerprint(
     retrieval_only: bool,
     cache_enabled: bool,
 ) -> str:
-    variant = config.model_dump()
+    variant = config.run_config()
     generator = variant["generation"]["generator"]
     if generator["provider"] == "ollama":
         # Keep the fingerprints of older, uncached Ollama runs with the same options.
         for name, default in (("seed", 0), ("context_size", 8192), ("reasoning_effort", "low")):
             if generator[name] == default:
                 del generator[name]
-    identity = {
+    identity: dict[str, object] = {
         "variant": variant,
         "index_version": index_version,
         "retrieval_only": retrieval_only,
@@ -454,6 +525,9 @@ def _fingerprint(
     }
     if cache_enabled:
         identity["cache_enabled"] = True
+    if config.generation.citations.enabled:
+        # Resuming a cited run must not mix statement-based and short-answer scores.
+        identity["citation_schema_version"] = 2
     payload = json.dumps(identity, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -502,7 +576,7 @@ def evaluate(
         store.begin(
             run_id,
             {
-                "variant": config.model_dump(),
+                "variant": config.run_config(),
                 "split": split,
                 "index_version": index_version,
                 "fingerprint": fingerprint,
@@ -554,6 +628,8 @@ def export_records(result: RunResult, path: Path) -> Path:
         row["retrieved_chunk_ids"] = " ".join(row["retrieved_chunk_ids"])
         row["stage_seconds"] = json.dumps(row["stage_seconds"])
         row["trace"] = json.dumps(row["trace"])
+        for name in ("citations", "removed_statements", "shown_chunk_ids", "citation_counts"):
+            row[name] = json.dumps(row[name])
     with path.open("w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=list(rows[0]) if rows else ["query_id"])
         writer.writeheader()

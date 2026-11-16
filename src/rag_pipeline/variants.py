@@ -7,13 +7,22 @@ import time
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from pathlib import Path
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 import yaml
 from opentelemetry.trace import NoOpTracer, Tracer
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
+from rag_pipeline.citations import (
+    CITATION_SCHEMA,
+    CITATION_SYSTEM_PROMPT,
+    Citation,
+    LLMSupportChecker,
+    RemovedStatement,
+    SupportChecker,
+    parse_citations,
+)
 from rag_pipeline.corpus import BenchmarkQuery
 from rag_pipeline.index import ChunkIndex, RetrievedChunk
 from rag_pipeline.models import (
@@ -23,6 +32,7 @@ from rag_pipeline.models import (
     ModelProvider,
     RerankerSpec,
     RerankTokenCounter,
+    StructuredGenerator,
     estimated_groq_tokens,
     model_version,
 )
@@ -68,9 +78,19 @@ class RetrievalConfig(_Frozen):
     rerank: RerankConfig | None = None
 
 
+class CitationConfig(_Frozen):
+    enabled: bool = False
+    support_check: Literal["none", "llm"] = "none"
+
+    @property
+    def checks_support(self) -> bool:
+        return self.enabled and self.support_check == "llm"
+
+
 class GenerationConfig(_Frozen):
     generator: GeneratorSpec
     context_chunks: int = 5
+    citations: CitationConfig = Field(default_factory=CitationConfig)
 
 
 class VariantConfig(_Frozen):
@@ -87,11 +107,18 @@ class VariantConfig(_Frozen):
             self.index is None or self.index.embedder is None
         ):
             raise ValueError(f"retrieval mode {self.retrieval.mode!r} needs an index embedder")
+        if self.generation.citations.enabled and not self.uses_retrieval:
+            raise ValueError("Citations require retrieval")
         return self
 
     @property
     def uses_retrieval(self) -> bool:
         return self.retrieval.mode != "none"
+
+    def run_config(self) -> dict[str, Any]:
+        if self.generation.citations.enabled:
+            return self.model_dump()
+        return self.model_dump(exclude={"generation": {"citations"}})
 
     @classmethod
     def from_yaml(cls, path: Path) -> VariantConfig:
@@ -108,6 +135,9 @@ class Answer:
     seconds: float
     stage_seconds: dict[str, float] = field(default_factory=dict[str, float])
     trace: tuple[StageTrace, ...] = ()
+    citations: tuple[Citation, ...] = ()
+    removed_statements: tuple[RemovedStatement, ...] = ()
+    shown_chunk_ids: tuple[str, ...] = ()
 
 
 def is_abstention(text: str) -> bool:
@@ -115,9 +145,18 @@ def is_abstention(text: str) -> bool:
 
 
 def _format_context(chunks: tuple[RetrievedChunk, ...]) -> str:
+    def delimiters(value: str) -> str:
+        return value.replace("<", "&lt;").replace(">", "&gt;")
+
+    def attribute(value: str) -> str:
+        return (
+            delimiters(value).replace('"', "&quot;").replace("\r", "&#13;").replace("\n", "&#10;")
+        )
+
     blocks = [
-        f'<chunk id="{c.chunk_id}" title="{c.title}" source="{c.source}" '
-        f'published="{c.published_at[:10]}">\n{c.text}\n</chunk>'
+        f'<chunk id="{attribute(c.chunk_id)}" title="{attribute(c.title)}" '
+        f'source="{attribute(c.source)}" published="{attribute(c.published_at[:10])}">\n'
+        f"{delimiters(c.text)}\n</chunk>"
         for c in chunks
     ]
     return "\n".join(blocks)
@@ -130,7 +169,8 @@ def _generation_key(
 
 
 def _generation_plan_key(config: VariantConfig, index_version: str, question: str) -> str:
-    return cache_key("generation-plan-v1", config.model_dump(), index_version, question)
+    # Older plans can refer to prompts with different escaping or a different output schema.
+    return cache_key("generation-plan-v3", config.run_config(), index_version, question)
 
 
 @dataclass(frozen=True)
@@ -154,25 +194,31 @@ def plan_remote_run(
         return RemoteRunPlan(0, 0, 0)
     limits = groq_limits(spec.model)
     assert limits.tokens_per_day is not None
+    checking = config.generation.citations.checks_support
+    calls_per_query = 2 if checking else 1
+    calls = len(queries) * calls_per_query
     cached = tokens = 0
     system = SYSTEM_PROMPT if config.uses_retrieval else CLOSED_BOOK_SYSTEM_PROMPT
+    if config.generation.citations.enabled:
+        system = CITATION_SYSTEM_PROMPT
     for query in queries:
         prompt = f"Question: {query.question}"
+        cached_calls = 0
         if cache is not None:
             if not config.uses_retrieval:
                 key = _generation_key(spec, f"groq:{spec.model}", None, system, prompt)
-                hit = cache.contains(key)
-            else:
-                hit = index_version is not None and cache.contains_plan(
-                    _generation_plan_key(config, index_version, query.question)
-                )
-            if hit:
-                cached += 1
-                continue
-        tokens += estimated_groq_tokens(system, prompt, spec.max_output_tokens)
+                cached_calls += cache.contains(key)
+            elif index_version is not None:
+                plan_key = _generation_plan_key(config, index_version, query.question)
+                cached_calls += cache.contains_plan(plan_key)
+                if checking:
+                    cached_calls += cache.contains_plan(cache_key("check", plan_key))
+        cached += cached_calls
+        call_tokens = estimated_groq_tokens(system, prompt, spec.max_output_tokens)
         if config.uses_retrieval:
-            tokens += ESTIMATED_TOKENS_PER_CHUNK * config.generation.context_chunks
-    remaining = len(queries) - cached
+            call_tokens += ESTIMATED_TOKENS_PER_CHUNK * config.generation.context_chunks
+        tokens += call_tokens * (calls_per_query - cached_calls)
+    remaining = calls - cached
     minutes_per_day = DAY // MINUTE
     days = math.ceil(
         max(
@@ -182,7 +228,7 @@ def plan_remote_run(
             tokens / (limits.tokens_per_minute * minutes_per_day),
         )
     )
-    return RemoteRunPlan(len(queries), cached, days)
+    return RemoteRunPlan(calls, cached, days)
 
 
 class PipelineVariant:
@@ -201,6 +247,13 @@ class PipelineVariant:
         self._tracer = tracer if tracer is not None else NoOpTracer()
         self._cache = cache
         self.generator = models.generator_for(config.generation.generator)
+        if config.generation.citations.enabled and not isinstance(
+            self.generator, StructuredGenerator
+        ):
+            raise ValueError("Citations require a generator that supports structured output")
+        self._support_checker: SupportChecker | None = (
+            LLMSupportChecker() if config.generation.citations.checks_support else None
+        )
         rerank = config.retrieval.rerank
         self.reranker = models.reranker_for(rerank.reranker) if rerank else None
 
@@ -344,10 +397,25 @@ class PipelineVariant:
             trace=tuple(trace.stages),
         )
 
-    def _complete(self, question: str, system: str, prompt: str, stage: StageUsage) -> Completion:
+    def _complete(
+        self,
+        question: str,
+        system: str,
+        prompt: str,
+        stage: StageUsage,
+        *,
+        schema: dict[str, Any] | None = None,
+        checking: bool = False,
+    ) -> Completion:
+        generator = self.generator
+        if schema is None:
+            call = partial(generator.complete, system, prompt)
+        else:
+            assert isinstance(generator, StructuredGenerator)
+            call = partial(generator.complete_structured, system, prompt, schema)
         if self._cache is None:
             started = time.perf_counter()
-            completion = self.generator.complete(system, prompt)
+            completion = call()
             if completion.call_seconds is not None:
                 stage.timing_adjustment = completion.call_seconds - (time.perf_counter() - started)
             return completion
@@ -356,9 +424,11 @@ class PipelineVariant:
         key = _generation_key(
             spec, self.generator.name, model_version(self.generator), system, prompt
         )
+        if schema is not None:
+            key = cache_key(key, schema)
 
         def generate() -> ModelResponse[Completion]:
-            result = measure_call(partial(self.generator.complete, system, prompt))
+            result = measure_call(call)
             seconds = result.value.call_seconds
             return result if seconds is None else ModelResponse(result.value, seconds)
 
@@ -370,8 +440,48 @@ class PipelineVariant:
             and self.config.uses_retrieval
             and (version := self._plan_index_version) is not None
         ):
-            self._cache.remember_plan(_generation_plan_key(self.config, version, question), key)
+            plan_key = _generation_plan_key(self.config, version, question)
+            self._cache.remember_plan(cache_key("check", plan_key) if checking else plan_key, key)
         return response.value
+
+    def _check_citations(
+        self,
+        question: str,
+        citations: tuple[Citation, ...],
+        shown: tuple[RetrievedChunk, ...],
+        trace: AnswerTrace,
+    ) -> tuple[tuple[Citation, ...], tuple[RemovedStatement, ...]]:
+        checker = self._support_checker
+        if checker is None or not citations:
+            return citations, ()
+        cited_ids = {id_ for citation in citations for id_ in citation.chunk_ids}
+        with trace.stage(
+            "check", "LLM", model=self.config.generation.generator.model, operation="chat"
+        ) as stage:
+            stage.chunks = tuple(chunk for chunk in shown if chunk.chunk_id in cited_ids)
+
+            def complete(system: str, prompt: str, schema: dict[str, Any]) -> str:
+                result = self._complete(
+                    question, system, prompt, stage, schema=schema, checking=True
+                )
+                stage.input_tokens = result.input_tokens
+                stage.output_tokens = result.output_tokens
+                return result.text
+
+            verdicts = checker.check(citations, stage.chunks, complete)
+        if verdicts is None:
+            return (), tuple(
+                RemovedStatement(cite.statement, cite.chunk_ids, "invalid_support_verdict")
+                for cite in citations
+            )
+        supported: list[Citation] = []
+        removed: list[RemovedStatement] = []
+        for cite, passed in zip(citations, verdicts, strict=True):
+            if passed:
+                supported.append(cite)
+            else:
+                removed.append(RemovedStatement(cite.statement, cite.chunk_ids, "unsupported"))
+        return tuple(supported), tuple(removed)
 
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()
@@ -380,23 +490,43 @@ class PipelineVariant:
             retrieved = self._retrieve(question, trace)
             set_chunk_ids(root, retrieved)
             spec = self.config.generation.generator
+            cited = self.config.generation.citations.enabled
+            shown: tuple[RetrievedChunk, ...] = ()
             with trace.stage("generate", "LLM", model=spec.model, operation="chat") as stage:
                 if self.config.uses_retrieval:
-                    stage.chunks = retrieved[: self.config.generation.context_chunks]
-                    context = _format_context(stage.chunks)
-                    system = SYSTEM_PROMPT
+                    shown = stage.chunks = retrieved[: self.config.generation.context_chunks]
+                    context = _format_context(shown)
+                    system = CITATION_SYSTEM_PROMPT if cited else SYSTEM_PROMPT
                     prompt = f"<context>\n{context}\n</context>\n\nQuestion: {question}"
                 else:
                     system, prompt = CLOSED_BOOK_SYSTEM_PROMPT, f"Question: {question}"
-                completion = self._complete(question, system, prompt, stage)
+                completion = self._complete(
+                    question, system, prompt, stage, schema=CITATION_SCHEMA if cited else None
+                )
                 stage.input_tokens = completion.input_tokens
                 stage.output_tokens = completion.output_tokens
+            shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited else ()
+            answer_text, citations, removed = (
+                parse_citations(completion.text, shown_ids) if cited else (completion.text, (), ())
+            )
+            citations, rejected = self._check_citations(question, citations, shown, trace)
+            abstained = is_abstention(answer_text) or (cited and (not answer_text or not citations))
+            if cited and abstained:
+                answer_text = ABSTENTION_TEXT
             return Answer(
-                text=completion.text,
-                abstained=is_abstention(completion.text),
+                text=answer_text,
+                abstained=abstained,
                 retrieved=retrieved,
-                input_tokens=completion.input_tokens,
-                output_tokens=completion.output_tokens,
+                input_tokens=sum(
+                    stage.input_tokens or 0
+                    for stage in trace.stages
+                    if stage.name in ("generate", "check")
+                ),
+                output_tokens=sum(
+                    stage.output_tokens
+                    for stage in trace.stages
+                    if stage.name in ("generate", "check")
+                ),
                 seconds=(
                     sum(stage.seconds for stage in trace.stages)
                     if self._cache is not None or spec.provider == "groq"
@@ -404,6 +534,9 @@ class PipelineVariant:
                 ),
                 stage_seconds={stage.name: stage.seconds for stage in trace.stages},
                 trace=tuple(trace.stages),
+                citations=citations,
+                removed_statements=removed + rejected,
+                shown_chunk_ids=shown_ids,
             )
 
 
