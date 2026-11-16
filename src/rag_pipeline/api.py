@@ -37,6 +37,7 @@ from rag_pipeline.models import (
     LocalModels,
     ModelProvider,
     configured_ollama_url,
+    missing_remote_keys,
 )
 from rag_pipeline.tracing import DEFAULT_ENDPOINT, StageTrace, collector_available, exporting_tracer
 from rag_pipeline.variants import Answer, PipelineVariant, VariantConfig, build_variant
@@ -135,11 +136,11 @@ class _Runtime:
             raise HTTPException(404, f"Unknown variant {request.variant!r}. See GET /variants.")
 
         candidates = answer_variants(config)
-        if (
-            any(candidate.uses_groq() for candidate in candidates)
-            and not os.environ.get("GROQ_API_KEY", "").strip()
-        ):
-            raise HTTPException(503, "Set GROQ_API_KEY to use this Groq variant.")
+        keys = missing_remote_keys(
+            spec for candidate in candidates for spec in candidate.remote_generators()
+        )
+        if keys:
+            raise HTTPException(503, f"Set {', '.join(keys)} to use this remote variant.")
 
         with self.lock:
             for candidate in candidates:

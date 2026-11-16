@@ -338,6 +338,7 @@ def test_malformed_plan_falls_back_and_malformed_decision_ends_search(index: Chu
     assert answer.stop_reason == "sufficient"
     assert [chunk.article_id for chunk in answer.retrieved] == [FIRST.id]
     assert model.calls == ["plan", "decide", "generate", "check"]
+    assert [stage.name for stage in answer.trace if stage.malformed] == ["plan", "decide.1"]
 
 
 @pytest.mark.parametrize(

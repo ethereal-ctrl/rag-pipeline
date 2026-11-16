@@ -1,8 +1,24 @@
-# Groq Free Plan limits.
+# Remote provider limits and sources.
 openai/gpt-oss-120b:
   requests_per_minute: 30
   requests_per_day: 1000
   tokens_per_minute: 8000
   tokens_per_day: 200000
   source: https://console.groq.com/docs/rate-limits
+  looked_up: "2026-11-16"
+
+gemma-4-31b-it:
+  provider: gemini
+  requests_per_minute: 30
+  tokens_per_minute: 16000
+  requests_per_day: 14400
+  source: Google AI Studio project rate-limit page, read by the author
+  looked_up: "2026-11-16"
+
+gemma-4-26b-a4b-it:
+  provider: gemini
+  requests_per_minute: 30
+  tokens_per_minute: 16000
+  requests_per_day: 14400
+  source: Google AI Studio project rate-limit page, read by the author
   looked_up: "2026-11-16"

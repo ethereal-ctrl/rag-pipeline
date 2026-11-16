@@ -8,13 +8,15 @@ import time
 from contextlib import closing
 from importlib.resources import files
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import yaml
 from pydantic import BaseModel, PositiveInt, TypeAdapter
 
 MINUTE = 60
 DAY = 86400
+MONTH = 31 * DAY  # Conservative rolling window across calendar months.
+type RemoteProvider = Literal["groq", "gemini"]
 
 
 class Clock(Protocol):
@@ -24,35 +26,58 @@ class Clock(Protocol):
 
 
 class RateLimits(BaseModel):
-    requests_per_minute: PositiveInt
-    tokens_per_minute: PositiveInt
-    requests_per_day: PositiveInt
+    requests_per_second: PositiveInt | None = None
+    requests_per_minute: PositiveInt | None = None
+    tokens_per_minute: PositiveInt | None = None
+    requests_per_day: PositiveInt | None = None
     tokens_per_day: PositiveInt | None = None
+    requests_per_month: PositiveInt | None = None
+    tokens_per_month: PositiveInt | None = None
+
+    def windows(self) -> list[tuple[int, int | None, int | None]]:
+        return [
+            (seconds, requests, tokens)
+            for seconds, requests, tokens in (
+                (1, self.requests_per_second, None),
+                (MINUTE, self.requests_per_minute, self.tokens_per_minute),
+                (DAY, self.requests_per_day, self.tokens_per_day),
+                (MONTH, self.requests_per_month, self.tokens_per_month),
+            )
+            if requests is not None or tokens is not None
+        ]
 
 
 class _PublishedLimits(RateLimits):
+    provider: RemoteProvider = "groq"
     source: str
     looked_up: str
 
 
-def groq_limits(model: str) -> _PublishedLimits:
+def remote_limits(provider: str, model: str) -> _PublishedLimits:
     data = yaml.safe_load(files("rag_pipeline").joinpath("rate_limits.yaml").read_text("utf-8"))
     limits = TypeAdapter(dict[str, _PublishedLimits]).validate_python(data)
-    if model not in limits or limits[model].tokens_per_day is None:
+    selected = limits.get(model)
+    if selected is None or selected.provider != provider:
+        raise ValueError(f"no verified {provider.title()} limits for {model!r}")
+    if provider == "groq" and selected.tokens_per_day is None:
         raise ValueError(f"no verified Groq Free Plan limits for {model!r}")
-    return limits[model]
+    return selected
 
 
-def quota_days(limits: RateLimits, calls: int, tokens: int) -> int:
-    """Estimate whole quota days for an uncached workload."""
-    minutes_per_day = DAY // MINUTE
-    return math.ceil(
-        max(
-            calls / limits.requests_per_day,
-            calls / (limits.requests_per_minute * minutes_per_day),
-            tokens / (limits.tokens_per_day or math.inf),
-            tokens / (limits.tokens_per_minute * minutes_per_day),
-        )
+def groq_limits(model: str) -> _PublishedLimits:
+    return remote_limits("groq", model)
+
+
+def quota_hours(limits: RateLimits, calls: int, tokens: int) -> float:
+    """Estimate hours of allowance for an uncached workload at sustained throughput."""
+    return max(
+        (
+            seconds
+            / 3600
+            * max(calls / (request_limit or math.inf), tokens / (token_limit or math.inf))
+            for seconds, request_limit, token_limit in limits.windows()
+        ),
+        default=0.0,
     )
 
 
@@ -60,7 +85,7 @@ def _wait(
     events: list[tuple[float, int]],
     now: float,
     window: int,
-    request_limit: int,
+    request_limit: int | None,
     token_limit: int | None,
     tokens: int,
 ) -> float:
@@ -69,7 +94,7 @@ def _wait(
     remaining_requests = len(relevant) + 1
     delay = 0.0
     for at, used_tokens in relevant:
-        if remaining_requests <= request_limit and (
+        if (request_limit is None or remaining_requests <= request_limit) and (
             token_limit is None or remaining_tokens <= token_limit
         ):
             break
@@ -96,32 +121,28 @@ class RateLimiter:
             )
 
     def reserve(self, model: str, estimated_tokens: int) -> int:
-        limits = self.limits
+        windows = self.limits.windows()
+        horizon = max((seconds for seconds, _, _ in windows), default=DAY)
         # A large estimate takes the entire minute's allowance. Reconcile against usage on success.
-        tokens = min(
-            estimated_tokens, limits.tokens_per_minute, limits.tokens_per_day or estimated_tokens
-        )
+        tokens = min([estimated_tokens, *(cap for _, _, cap in windows if cap is not None)])
         while True:
             with closing(sqlite3.connect(self._path)) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 now = self.clock.time()
                 db.execute(
-                    "DELETE FROM remote_requests WHERE model = ? AND at <= ?", (model, now - DAY)
+                    "DELETE FROM remote_requests WHERE model = ? AND at <= ?",
+                    (model, now - horizon),
                 )
                 events: list[tuple[float, int]] = db.execute(
                     "SELECT at, tokens FROM remote_requests WHERE model = ? ORDER BY at",
                     (model,),
                 ).fetchall()
                 delay = max(
-                    _wait(
-                        events,
-                        now,
-                        MINUTE,
-                        limits.requests_per_minute,
-                        limits.tokens_per_minute,
-                        tokens,
+                    (
+                        _wait(events, now, seconds, requests, cap, tokens)
+                        for seconds, requests, cap in windows
                     ),
-                    _wait(events, now, DAY, limits.requests_per_day, limits.tokens_per_day, tokens),
+                    default=0.0,
                 )
                 if delay <= 0:
                     request_id = db.execute(

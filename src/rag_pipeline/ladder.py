@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
 from pathlib import Path
 from typing import Literal
@@ -16,6 +16,7 @@ from rag_pipeline.evaluation import Evaluable, RunResult, RunStore, StoredRun, e
 from rag_pipeline.variants import VariantConfig
 
 type HeldOutSplit = Literal["test", "test-400"]
+type LadderProvider = Literal["groq", "gemma"]
 
 
 class _Definition(BaseModel):
@@ -35,8 +36,12 @@ class _PairDefinition(_Definition):
 
 class _LargeModelDefinition(_Definition):
     split: Literal["test-400"]
+    provider: LadderProvider = "groq"  # Compatibility with older ladder configs.
     reason: str = Field(min_length=1)
     pairs: tuple[_PairDefinition, ...]
+    alternatives: dict[LadderProvider, tuple[_PairDefinition, ...]] = Field(
+        default_factory=dict[LadderProvider, tuple[_PairDefinition, ...]]
+    )
 
 
 class _LadderDefinition(_Definition):
@@ -63,6 +68,10 @@ class Ladder:
     rungs: tuple[LadderRung, ...]
     large_model: tuple[LargeModelPair, ...] = ()
     large_model_reason: str = ""
+    large_model_provider: LadderProvider = "groq"
+    alternatives: dict[LadderProvider, tuple[LargeModelPair, ...]] = field(
+        default_factory=dict[LadderProvider, tuple[LargeModelPair, ...]]
+    )
 
     @classmethod
     def load(cls, path: Path) -> Ladder:
@@ -76,38 +85,75 @@ class Ladder:
         validate_rungs(rungs)
         by_path = {rung.path: rung for rung in rungs}
         used = {rung.config.name for rung in rungs}
-        pairs: list[LargeModelPair] = []
-        for item in data.large_model.pairs:
-            if item.local not in by_path:
-                raise ValueError(
-                    f"Large-model counterpart {item.local} is missing from the ladder."
-                )
-            local = by_path[item.local]
-            config = VariantConfig.from_yaml(item.config)
-            if config.name in used:
-                raise ValueError(f"Duplicate ladder variant name {config.name!r}.")
-            used.add(config.name)
-            spec = config.generation.generator
-            if (
-                local.config.router is not None
-                or spec.provider != "groq"
-                or spec.model != "openai/gpt-oss-120b"
-                or config.model_copy(
-                    update={
-                        "name": local.config.name,
-                        "generation": config.generation.model_copy(
-                            update={"generator": local.config.generation.generator}
-                        ),
-                    }
-                )
-                != local.config
-            ):
-                raise ValueError(f"{item.config} must swap only {item.local}'s generator for Groq.")
-            pairs.append(LargeModelPair(local, LadderRung(local.label, item.config, config)))
-        return cls(rungs, tuple(pairs), data.large_model.reason)
 
-    def for_split(self, split: HeldOutSplit) -> tuple[LadderRung, ...]:
-        return self.rungs if split == "test" else tuple(pair.remote for pair in self.large_model)
+        def load_pairs(
+            items: tuple[_PairDefinition, ...],
+            provider: LadderProvider,
+        ) -> tuple[LargeModelPair, ...]:
+            pairs: list[LargeModelPair] = []
+            for item in items:
+                if item.local not in by_path:
+                    raise ValueError(
+                        f"Large-model counterpart {item.local} is missing from the ladder."
+                    )
+                local = by_path[item.local]
+                config = VariantConfig.from_yaml(item.config)
+                if config.name in used:
+                    raise ValueError(f"Duplicate ladder variant name {config.name!r}.")
+                used.add(config.name)
+                spec = config.generation.generator
+                if (
+                    local.config.router is not None
+                    or spec.provider != ("gemini" if provider == "gemma" else provider)
+                    or spec.model.endswith("-latest")
+                    or config.model_copy(
+                        update={
+                            "name": local.config.name,
+                            "generation": config.generation.model_copy(
+                                update={"generator": local.config.generation.generator}
+                            ),
+                        }
+                    )
+                    != local.config
+                ):
+                    raise ValueError(
+                        f"{item.config} must swap only {item.local}'s generator "
+                        f"for a pinned {provider.title()} model."
+                    )
+                pairs.append(LargeModelPair(local, LadderRung(local.label, item.config, config)))
+            return tuple(pairs)
+
+        large = data.large_model
+        if large.provider in large.alternatives:
+            raise ValueError("The default large-model provider is also listed as an alternative.")
+        return cls(
+            rungs,
+            load_pairs(large.pairs, large.provider),
+            large.reason,
+            large.provider,
+            {
+                provider: load_pairs(items, provider)
+                for provider, items in large.alternatives.items()
+            },
+        )
+
+    def large_pairs(self, provider: LadderProvider | None = None) -> tuple[LargeModelPair, ...]:
+        if provider is None or provider == self.large_model_provider:
+            return self.large_model
+        if provider not in self.alternatives:
+            raise ValueError(f"No large-model rungs configured for {provider.title()}.")
+        return self.alternatives[provider]
+
+    def for_split(
+        self,
+        split: HeldOutSplit,
+        provider: LadderProvider | None = None,
+    ) -> tuple[LadderRung, ...]:
+        return (
+            self.rungs
+            if split == "test"
+            else tuple(pair.remote for pair in self.large_pairs(provider))
+        )
 
 
 def validate_rungs(rungs: tuple[LadderRung, ...]) -> None:

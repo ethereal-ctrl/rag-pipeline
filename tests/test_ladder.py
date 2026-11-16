@@ -58,6 +58,11 @@ def test_committed_ladder_and_bad_two_group_step():
     assert len(ladder.rungs) == 9 and len(ladder.large_model) == 3
     assert ladder.rungs[-1].exception
     assert [item.config.name for item in ladder.for_split("test-400")] == [
+        "closed-book-gemma",
+        "hybrid-rerank-gemma",
+        "agentic-gemma",
+    ]
+    assert [item.config.name for item in ladder.for_split("test-400", "groq")] == [
         "closed-book-groq",
         "hybrid-rerank-groq",
         "agentic-groq",
@@ -195,28 +200,37 @@ def test_report_pairs_steps_marks_pending_and_writes_deterministic_svg(tmp_path:
     first, second, pending, remote = (
         rung(name) for name in ("first", "second", "pending", "remote")
     )
-    ladder = Ladder((first, second, pending), (LargeModelPair(second, remote),))
+    ladder = Ladder(
+        (first, second, pending), (LargeModelPair(second, remote),), large_model_provider="gemma"
+    )
     store = RunStore(tmp_path / "runs")
     baseline = evaluate(scripted(first, QUERIES, "No", seconds=1), QUERIES, "test", store)
     candidate = evaluate(scripted(second, QUERIES, "Yes", seconds=2), QUERIES, "test", store)
     large = evaluate(scripted(remote, QUERIES[:1], "No", seconds=3), QUERIES[:1], "test-400", store)
     dev_queries = [replace(q, id=f"dev-{q.id}") for q in QUERIES]
     dev = evaluate(scripted(first, dev_queries, "No"), dev_queries, "dev", store)
-    args = dict(
-        dev_ids=tuple(q.id for q in dev_queries),
-        test_ids=tuple(q.id for q in QUERIES),
-        subset_ids=(QUERIES[0].id,),
-    )
+
+    def write_report(output: Path) -> Path:
+        return write_ladder_report(
+            ladder,
+            store,
+            "test",
+            output,
+            dev_ids=tuple(q.id for q in dev_queries),
+            test_ids=tuple(q.id for q in QUERIES),
+            subset_ids=(QUERIES[0].id,),
+        )
+
     left = tmp_path / "report-a"
     right = tmp_path / "report-b"
-    report = write_ladder_report(ladder, store, "test", left, **args)
+    report = write_report(left)
     text = report.read_text()
     assert "| pending | pending |" in text
     assert "Accuracy +1.000 [+1.000, +1.000]*" in text
     assert all(value.run_id in text for value in (baseline, candidate, large, dev))
-    assert "Shared n" in text and "Dev majority" in text
+    assert "Shared n" in text and "Dev majority" in text and "Gemma run" in text
     assert "Hits@4" in text and "Evidence Recall@10" in text
-    write_ladder_report(ladder, store, "test", right, **args)
+    write_report(right)
     charts = sorted(left.glob("*.svg"))
     assert len(charts) == 3
     for chart in charts:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, replace
 from functools import cached_property
@@ -16,8 +17,15 @@ from rag_pipeline.chunking import ChunkingSettings, chunk_article
 from rag_pipeline.corpus import NULL_QUERY_TYPE, Article, article_hash, load_articles
 from rag_pipeline.evaluation import QueryRecord, RunResult, RunStore, bootstrap_metric_intervals
 from rag_pipeline.index import corpus_hash
-from rag_pipeline.judge_model import JUDGE_SPEC, CitedStatement, Judge, JudgeRequest, JudgeVerdict
-from rag_pipeline.rate_limit import groq_limits, quota_days
+from rag_pipeline.judge_model import (
+    CitedStatement,
+    Judge,
+    JudgeRequest,
+    JudgeVerdict,
+    check_judge_family,
+)
+from rag_pipeline.models import GeneratorSpec
+from rag_pipeline.rate_limit import RateLimits, quota_hours, remote_limits
 from rag_pipeline.variants import VariantConfig
 
 
@@ -35,6 +43,19 @@ def load_answer_run(store: RunStore, run_id: str, *, dev_only: bool = False) -> 
     ):
         raise ValueError(f"Run {run_id} needs complete scored answers.")
     return result
+
+
+def generator_models(run: RunResult) -> tuple[str, ...]:
+    variant = VariantConfig.model_validate(run.meta["variant"])
+    traced = {
+        stage.model
+        for record in run.records
+        for stage in record.trace
+        if stage.name == "generate" and stage.model is not None
+    }
+    if variant.router is None:
+        traced.add(variant.generation.generator.model)
+    return tuple(sorted(traced))
 
 
 class CitedChunkLookup:
@@ -126,27 +147,37 @@ class JudgePlan:
     cached: int
     estimated_tokens: int
     cached_tokens: int
-    days: int
-    shared_days: int
-    tokens_per_day: int
+    hours: float
+    shared_hours: float
+    tokens_per_day: int | None
+    tokens_per_month: int | None
+
+    @property
+    def days(self) -> int:
+        return math.ceil(self.hours / 24)
+
+    @property
+    def shared_days(self) -> int:
+        return math.ceil(self.shared_hours / 24)
 
 
 def plan_judging(
     cases: list[JudgeCase],
     cache: ResponseCache | None,
+    spec: GeneratorSpec,
     *,
     shared_tokens: int = 0,
     shared_calls: int = 0,
 ) -> JudgePlan:
     requests = {
-        case.request.cache_key(): case.request for case in cases if case.request is not None
+        case.request.cache_key(spec): case.request for case in cases if case.request is not None
     }
-    estimates = {key: request.estimated_tokens() for key, request in requests.items()}
+    estimates = {key: request.estimated_tokens(spec) for key, request in requests.items()}
     hits = [key for key in estimates if cache is not None and cache.contains(key)]
     tokens = sum(estimates.values())
     cached_tokens = sum(estimates[key] for key in hits)
-    limits = groq_limits(JUDGE_SPEC.model)
-    assert limits.tokens_per_day is not None
+    remote = spec.remote_provider
+    limits = remote_limits(remote, spec.model) if remote is not None else RateLimits()
     calls_left, tokens_left = len(requests) - len(hits), tokens - cached_tokens
     return JudgePlan(
         len(cases),
@@ -154,9 +185,10 @@ def plan_judging(
         len(hits),
         tokens,
         cached_tokens,
-        quota_days(limits, calls_left, tokens_left),
-        quota_days(limits, calls_left + shared_calls, tokens_left + shared_tokens),
+        quota_hours(limits, calls_left, tokens_left),
+        quota_hours(limits, calls_left + shared_calls, tokens_left + shared_tokens),
         limits.tokens_per_day,
+        limits.tokens_per_month,
     )
 
 
@@ -179,6 +211,7 @@ class JudgeReport:
     statements: int
     metrics: dict[str, float]
     intervals: dict[str, tuple[float, float]]
+    provider: str = "groq"
 
 
 def _metrics(rows: list[JudgedRecord]) -> dict[str, float]:
@@ -222,6 +255,7 @@ def judge_run(
     chunks: CitedChunkLookup | None = None,
 ) -> JudgeReport:
     run = load_answer_run(store, run_id)
+    check_judge_family(judge.spec, generator_models(run), run_id)
     rows: list[JudgedRecord] = []
     lookup = chunks if chunks is not None else CitedChunkLookup(Path("data/raw"))
     for case in judge_cases(run, sample, lookup):
@@ -238,13 +272,14 @@ def judge_run(
         )
 
     report = JudgeReport(
-        model=JUDGE_SPEC.model,
+        model=judge.spec.model,
         sampled=len(rows),
         requests=sum(row.requested for row in rows),
         malformed=sum(row.malformed for row in rows),
         statements=sum(len(row.supported) for row in rows),
         metrics=_metrics(rows),
         intervals=bootstrap_metric_intervals(rows, _metrics),
+        provider=judge.spec.provider,
     )
     run_dir = store.root / run_id
     write_text(run_dir / "judge.jsonl", "".join(json.dumps(asdict(row)) + "\n" for row in rows))

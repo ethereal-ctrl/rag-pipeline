@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, runtime_checkable
 
 import httpx
-from pydantic import BaseModel, ConfigDict, PositiveInt, TypeAdapter
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    PositiveInt,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    model_serializer,
+    model_validator,
+)
 
 from rag_pipeline.cache import CACHE_FILE, ModelResponse, ResponseCache, cache_key, measure_call
-from rag_pipeline.rate_limit import RateLimiter, groq_limits
+from rag_pipeline.rate_limit import RateLimiter, RemoteProvider, remote_limits
 
 if TYPE_CHECKING:
     from rag_pipeline.judge_model import Judge
@@ -28,13 +38,40 @@ def configured_ollama_url() -> str:
 class GeneratorSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Literal["ollama", "groq"]
+    provider: Literal["ollama", "groq", "gemini"]
     model: str
     temperature: float = 0.0
     max_output_tokens: PositiveInt = 256
     seed: int = 0
     context_size: PositiveInt = 8192
     reasoning_effort: Literal["low", "medium", "high"] = "low"
+    supports_system: bool = True
+    structured_output: Literal["json_schema", "prompt"] = "json_schema"
+
+    @model_validator(mode="after")
+    def _validate_provider_options(self) -> Self:
+        if self.provider == "gemini" and "reasoning_effort" in self.model_fields_set:
+            raise ValueError("reasoning_effort is a Groq option in GeneratorSpec")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        if self.provider == "gemini":
+            payload.pop("reasoning_effort", None)
+        # Keep existing Groq and Ollama cache keys and saved configurations compatible.
+        if self.supports_system and "supports_system" not in self.model_fields_set:
+            payload.pop("supports_system", None)
+        if (
+            self.structured_output == "json_schema"
+            and "structured_output" not in self.model_fields_set
+        ):
+            payload.pop("structured_output", None)
+        return payload
+
+    @property
+    def remote_provider(self) -> RemoteProvider | None:
+        return self.provider if self.provider != "ollama" else None
 
 
 @dataclass(frozen=True)
@@ -226,7 +263,78 @@ def estimate_tokens(
     return input_tokens + max_output_tokens
 
 
-class GroqGenerator:
+@dataclass(frozen=True)
+class _RemoteChat:
+    base_url: str
+    path: str
+    key_variable: str
+    max_tokens: str
+
+
+_REMOTE_CHATS = {
+    "groq": _RemoteChat(
+        "https://api.groq.com",
+        "/openai/v1/chat/completions",
+        "GROQ_API_KEY",
+        "max_completion_tokens",
+    ),
+    # Gemini's OpenAI-compatible endpoint: https://ai.google.dev/gemini-api/docs/openai
+    "gemini": _RemoteChat(
+        "https://generativelanguage.googleapis.com",
+        "/v1beta/openai/chat/completions",
+        "GEMINI_API_KEY",
+        "max_tokens",
+    ),
+}
+
+
+def _first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    quoted = escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return text
+
+
+def remote_instructions(spec: GeneratorSpec, system: str, schema: dict[str, Any] | None) -> str:
+    if schema is not None and spec.structured_output == "prompt":
+        schema_text = json.dumps(schema, separators=(",", ":"))
+        system += f"\n\nReturn only JSON matching this schema:\n{schema_text}"
+    return system
+
+
+def remote_key_variable(provider: RemoteProvider) -> str:
+    return _REMOTE_CHATS[provider].key_variable
+
+
+def missing_remote_keys(specs: Iterable[GeneratorSpec]) -> tuple[str, ...]:
+    variables = {
+        remote_key_variable(provider)
+        for spec in specs
+        if (provider := spec.remote_provider) is not None
+    }
+    return tuple(sorted(variable for variable in variables if not os.getenv(variable, "").strip()))
+
+
+class RemoteChatGenerator:
     def __init__(
         self,
         spec: GeneratorSpec,
@@ -234,14 +342,21 @@ class GroqGenerator:
         transport: httpx.BaseTransport | None = None,
         limiter: RateLimiter | None = None,
     ) -> None:
-        key = os.environ.get("GROQ_API_KEY", "").strip()
+        provider = spec.remote_provider
+        if provider is None:
+            raise ValueError("Remote chat requires a remote provider.")
+        self._chat = _REMOTE_CHATS[provider]
+        key = os.environ.get(self._chat.key_variable, "").strip()
         if not key:
-            raise ValueError("set GROQ_API_KEY to build a Groq Pipeline Variant")
+            raise ValueError(f"set {self._chat.key_variable} to use {provider.title()}")
         self._spec = spec
-        limits = groq_limits(spec.model)
-        self._limiter = limiter if limiter is not None else RateLimiter(CACHE_FILE, limits)
+        self._limiter = (
+            limiter
+            if limiter is not None
+            else RateLimiter(CACHE_FILE, remote_limits(provider, spec.model))
+        )
         self._http = httpx.Client(
-            base_url="https://api.groq.com",
+            base_url=self._chat.base_url,
             headers={"Authorization": f"Bearer {key}"},
             timeout=60,
             transport=transport,
@@ -249,7 +364,7 @@ class GroqGenerator:
 
     @property
     def name(self) -> str:
-        return f"groq:{self._spec.model}"
+        return f"{self._spec.provider}:{self._spec.model}"
 
     def complete_structured(self, system: str, prompt: str, schema: dict[str, Any]) -> Completion:
         return self.complete(system, prompt, schema=schema)
@@ -257,19 +372,27 @@ class GroqGenerator:
     def complete(
         self, system: str, prompt: str, *, schema: dict[str, Any] | None = None
     ) -> Completion:
+        system = remote_instructions(self._spec, system, schema)
+        if not self._spec.supports_system:
+            prompt = f"Instructions:\n{system}\n\n{prompt}"
+            system = ""
+        messages = [{"role": "user", "content": prompt}]
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
         payload: dict[str, Any] = {
             "model": self._spec.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "temperature": self._spec.temperature,
-            "max_completion_tokens": self._spec.max_output_tokens,
-            "reasoning_effort": self._spec.reasoning_effort,
-            "include_reasoning": False,
-            "seed": self._spec.seed,
+            self._chat.max_tokens: self._spec.max_output_tokens,
         }
-        if schema is not None:
+        if self._spec.provider == "groq":
+            payload.update(
+                reasoning_effort=self._spec.reasoning_effort,
+                include_reasoning=False,
+                seed=self._spec.seed,
+            )
+        prompted_json = schema is not None and self._spec.structured_output == "prompt"
+        if schema is not None and not prompted_json:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "rag_response", "strict": True, "schema": schema},
@@ -279,7 +402,7 @@ class GroqGenerator:
         while True:
             request = self._limiter.reserve(self._spec.model, tokens)
             started = time.perf_counter()
-            response = self._http.post("/openai/v1/chat/completions", json=payload)
+            response = self._http.post(self._chat.path, json=payload)
             seconds = time.perf_counter() - started
             if response.status_code != 429:
                 response.raise_for_status()
@@ -288,8 +411,14 @@ class GroqGenerator:
                 self._limiter.record_usage(
                     request, usage["prompt_tokens"] + usage["completion_tokens"]
                 )
+                content: str | list[dict[str, Any]] | None = body["choices"][0]["message"][
+                    "content"
+                ]
+                if isinstance(content, list):
+                    content = "".join(chunk["text"] for chunk in content if chunk["type"] == "text")
+                text = (content or "").strip()
                 return Completion(
-                    (body["choices"][0]["message"]["content"] or "").strip(),
+                    _first_json_object(text) if prompted_json else text,
                     usage["prompt_tokens"],
                     usage["completion_tokens"],
                     seconds,
@@ -430,7 +559,7 @@ def _hf_revision(model: object) -> str | None:
 
 
 class LocalModels:
-    """The runtime model provider for local models and the Groq Free Plan (ADR 0001)."""
+    """The runtime model provider for local and remote models."""
 
     def __init__(
         self,
@@ -439,11 +568,13 @@ class LocalModels:
         ollama_transport: httpx.BaseTransport | None = None,
         groq_transport: httpx.BaseTransport | None = None,
         groq_limiter: RateLimiter | None = None,
+        gemini_transport: httpx.BaseTransport | None = None,
+        gemini_limiter: RateLimiter | None = None,
     ) -> None:
         self._ollama_url = configured_ollama_url() if ollama_url is None else ollama_url
         self._ollama_transport = ollama_transport
-        self._groq_transport = groq_transport
-        self._groq_limiter = groq_limiter
+        self._remote_transports = {"groq": groq_transport, "gemini": gemini_transport}
+        self._remote_limiters = {"groq": groq_limiter, "gemini": gemini_limiter}
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
         self._embedders: dict[EmbedderSpec, Embedder] = {}
 
@@ -452,20 +583,20 @@ class LocalModels:
             self._rerankers[spec] = SentenceTransformersReranker(spec)
         return self._rerankers[spec]
 
-    def generator_for(self, spec: GeneratorSpec) -> Generator:
-        if spec.provider == "groq":
-            return GroqGenerator(spec, transport=self._groq_transport, limiter=self._groq_limiter)
+    def generator_for(self, spec: GeneratorSpec) -> RemoteChatGenerator | OllamaGenerator:
+        if (provider := spec.remote_provider) is not None:
+            return RemoteChatGenerator(
+                spec,
+                transport=self._remote_transports[provider],
+                limiter=self._remote_limiters[provider],
+            )
         return OllamaGenerator(spec, self._ollama_url, transport=self._ollama_transport)
 
-    def judge_for(self, cache: ResponseCache) -> Judge:
-        from rag_pipeline.judge_model import JUDGE_SPEC, GroqJudge
+    def judge_for(self, cache: ResponseCache, spec: GeneratorSpec | None = None) -> Judge:
+        from rag_pipeline.judge_model import ModelJudge, load_judge_spec
 
-        return GroqJudge(
-            lambda: GroqGenerator(
-                JUDGE_SPEC, transport=self._groq_transport, limiter=self._groq_limiter
-            ),
-            cache,
-        )
+        spec = spec if spec is not None else load_judge_spec()
+        return ModelJudge(spec, self.generator_for, cache)
 
     def embedder_for(self, spec: EmbedderSpec) -> Embedder:
         if spec not in self._embedders:

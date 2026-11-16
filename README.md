@@ -93,28 +93,49 @@ and averages the totals in notional USD. It is available when every model used h
 reference price and the run has complete token counts. The runtime costs nothing in API
 fees under [ADR 0001](docs/adr/0001-zero-cost-no-subscription-runtime.md).
 
-## Cached evaluations and the Groq comparison
+## Cached evaluations and the large-model comparison
 
 Evaluations cache completions, query embeddings and Reranker scores in
 `data/cache/models.sqlite3`. Stage traces flag cache hits and reuse the original
 model-call durations. Retrieval still queries the current index, so index timing
 can vary between runs. Pass `--no-cache` to bypass the response cache.
 
-Set `GROQ_API_KEY` with a Groq Free Plan key to run the large-model comparison.
-Start with one Smoke Set query, then use the fixed `test-400` subset for the held-out
-comparison. The score-once rule applies across `test` and `test-400` for each Pipeline
-Variant. The dry run needs no key or model calls.
+The large-model comparison and Judge default to Gemma 4 31B
+(`gemma-4-31b-it`) on the Gemini API. In Google AI Studio, open **API keys**
+and create a key against a **Free Tier** project. Put the key in the worktree's
+`.env` as `GEMINI_API_KEY`. The author's project showed 30 requests per minute,
+16,000 tokens per minute, and 14,400 requests per day on 2026-11-16. Check your
+project's current limits and regional availability before running.
+[AI Studio API keys](https://ai.google.dev/gemini-api/docs/api-key) ·
+[Project rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) ·
+[Available regions](https://ai.google.dev/gemini-api/docs/available-regions)
+
+Google may use free-tier prompts and responses to improve its products. Its terms
+provide regional exceptions for the EEA, the UK, and Switzerland. Remote
+benchmarking sends only public benchmark questions and Corpus text, along with
+answers generated from those inputs for judging. The demo API defaults to the
+local `hybrid-rerank-cited` variant. Arbitrary user questions stay on the machine
+unless the demo is explicitly configured to use a remote variant.
+[Gemini API data terms](https://ai.google.dev/gemini-api/terms)
+
+Set `GROQ_API_KEY` in the same file to use the Groq Free Plan alternative.
+
+Start with one Smoke Set query, then use the fixed `test-400` subset. The score-once
+rule applies across `test` and `test-400` for each Pipeline Variant. The dry run
+uses configured quotas and needs no key or model calls.
 
 ```bash
-uv run rag eval configs/variants/closed-book-groq.yaml --split test-400 --dry-run
-uv run rag eval configs/variants/closed-book-groq.yaml --split smoke --limit 1
+uv run --env-file .env rag eval configs/variants/closed-book-gemma.yaml --split test-400 --dry-run
+uv run --env-file .env rag eval configs/variants/closed-book-gemma.yaml --split smoke --limit 1
+uv run --env-file .env rag eval configs/variants/closed-book-groq.yaml --split smoke --limit 1
 ```
 
-The limiter persists requests and estimated token reservations in SQLite and reconciles
-them with Groq's reported usage. Limits use rolling minute and 24-hour windows. The
-dry run estimates quota days at a fresh allowance and, for retrieval variants, estimates
-the prompt length from the configured number of Chunks. Its cache count includes
-known prompts for the current index version.
+The limiter persists requests and estimated token reservations in SQLite and
+reconciles them with reported usage. Both providers use rolling minute and 24-hour
+windows. Gemma generation and judging share the same model quota when they use the
+same cache database. Dry runs estimate hours and whole quota days at a fresh allowance.
+For retrieval variants, the estimate uses the configured number of Chunks and known
+cache hits for the current index version.
 
 ## Chunk Context
 
@@ -226,20 +247,22 @@ Its latency and embedding token totals include the `route` stage.
 
 The [fixed Judge sample](data/judge-300.json) contains 300 queries stratified by query
 type within `test-400`. Judge completed Test Split runs to compare the same questions
-across local and Groq variants. The Judge reads saved answers and uses Groq
-`openai/gpt-oss-120b` for ambiguous correctness and Citation support.
+across local and remote variants. The Judge reads saved answers and grades ambiguous
+correctness and Citation support. The default `configs/judge.yaml` uses Gemma
+4 31B. The Judge must be from a different family than every generator used for
+the run. Select `configs/judge-groq.yaml` to use Groq `openai/gpt-oss-120b` for Gemma runs.
 
 ```bash
-uv run --no-env-file rag judge RUN_ID --dry-run
-uv run --no-env-file rag judge RUN_ID --dry-run --shared-tokens 800000 --shared-calls 400
+uv run --env-file .env rag judge RUN_ID --dry-run
+uv run --env-file .env rag judge RUN_ID --dry-run --shared-tokens 800000 --shared-calls 400
 uv run --env-file .env rag judge RUN_ID
+uv run --env-file .env rag judge GEMMA_RUN_ID --judge-config configs/judge-groq.yaml
 uv run --no-env-file rag table RUN_ID --metrics judge_accuracy,judge_flipped,citation_support_rate
 ```
 
-The dry run needs no key. Use the optional shared token and call estimates for upcoming
-GPT-OSS-120B generation runs. They use the same 200,000-token daily budget and persistent
-limiter as the Judge. The same Judge command resumes after interruption using the response
-cache. Keep the cache when running over several days.
+The dry run needs no key. Use the optional shared token and call estimates for
+upcoming workloads that use the same quota as the Judge. Rerun the same Judge command
+to resume after interruption using the response cache.
 
 Containment-correct answers keep their primary score. The Judge can accept an ambiguous
 answer that containment missed. The flipped share uses all containment-incorrect sampled
@@ -261,9 +284,10 @@ uv run --env-file .env rag judge calibration report
 Copy the exported cases into a subscription chat by hand for one-time labelling, then
 independently check at least 50 cases as the author. Keep both labels where they differ.
 Commit the cases and validated labels under `data/judge-calibration/`. The calibration
-command calls the Groq Judge and writes JSON and Markdown agreement reports under
-`runs/judge/`, with accuracy and Cohen's kappa for correctness and support. The reports
-also include subscription versus author agreement on the double-checked cases.
+command uses the selected Judge config and writes JSON and Markdown agreement reports
+under `runs/judge/`. They record the Judge model, accuracy, and Cohen's kappa for
+correctness and support, plus subscription versus author agreement on the
+double-checked cases. Use `--judge-config` to choose the Judge for calibration.
 
 ## Side Ablations
 
@@ -331,15 +355,18 @@ uv run --no-env-file rag ladder run --split test
 uv run --env-file .env rag ladder status --split test-400
 uv run --env-file .env rag ladder run --split test-400 --dry-run
 uv run --env-file .env rag ladder run --split test-400
+uv run --env-file .env rag ladder run --split test-400 --provider groq --dry-run
 uv run --no-env-file rag ladder report --split test --output docs/report/ladder
 ```
 
-The large-model comparison uses saved local answers on the same queries as Groq.
+The large-model comparison uses saved local answers on the same queries as the selected
+remote provider. Gemma is selected by default. Use `--provider groq` with
+`ladder status`, `ladder run`, and `ladder report` to select the Groq comparison.
 Agentic Search is the deepest rung with a direct generator to swap. Estimate its
-quota separately since it can call Groq multiple times per question.
+quota separately since it can call the remote generator multiple times per question.
 The report includes pending rows, source run IDs, and the Dev majority baseline
 once saved runs cover all fixed Dev and Test queries. After grading completed
-runs with `rag judge RUN_ID`, regenerate the report to include their Judge metrics.
+runs with the appropriate Judge config, regenerate the report to include their Judge metrics.
 
 ## Development
 

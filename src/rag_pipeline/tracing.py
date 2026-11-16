@@ -90,6 +90,7 @@ class StageTrace:
     output_tokens: int = 0
     model: str | None = None
     cache_hit: bool = False
+    malformed: bool = False
 
 
 @dataclass
@@ -101,6 +102,7 @@ class StageUsage:
     timing_adjustment: float = 0.0
     cache_hit: bool = False
     chosen_variant: str | None = None
+    malformed: bool = False
 
     def set_input_tokens(self, count: TokenCount) -> None:
         self.input_tokens = count
@@ -166,6 +168,7 @@ class AnswerTrace:
                     usage.output_tokens,
                     model,
                     usage.cache_hit,
+                    usage.malformed,
                 )
             )
             if model is not None:
@@ -175,4 +178,6 @@ class AnswerTrace:
                 span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
             if usage.chosen_variant is not None:
                 span.set_attribute("rag.chosen_variant", usage.chosen_variant)
+            if usage.malformed:
+                span.set_attribute("rag.malformed_response", True)
             set_chunk_ids(span, usage.chunks)

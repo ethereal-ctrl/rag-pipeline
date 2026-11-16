@@ -50,6 +50,7 @@ services:
       PHOENIX_URL: ${PHOENIX_URL:-http://localhost:6006}
       RAG_DEMO_VARIANT: ${RAG_DEMO_VARIANT:-hybrid-rerank-cited}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     volumes:
       - huggingface_cache:/home/rag/.cache/huggingface
       - api_data:/app/data

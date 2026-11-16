@@ -20,13 +20,15 @@ from rag_pipeline.evaluation import RunStore, evaluate
 from rag_pipeline.index import corpus_hash
 from rag_pipeline.judge_calibration import calibration_report, export_calibration, load_labels
 from rag_pipeline.judge_evaluation import CitedChunkLookup, judge_run
-from rag_pipeline.judge_model import JudgeRequest, JudgeVerdict
+from rag_pipeline.judge_model import JudgeRequest, JudgeVerdict, load_judge_spec
 from rag_pipeline.models import LocalModels
 from rag_pipeline.rate_limit import RateLimiter, groq_limits
 from rag_pipeline.splits import Splits, load_judge_sample, load_test_subset, make_judge_sample
 from rag_pipeline.variants import Answer, CitationConfig
 
 MODEL = "openai/gpt-oss-120b"
+GROQ_JUDGE_CONFIG = Path("configs/judge-groq.yaml")
+GROQ_JUDGE = load_judge_spec(GROQ_JUDGE_CONFIG)
 
 
 class CitedVariant(ScriptedVariant):
@@ -117,7 +119,7 @@ def test_judge_grades_only_eligible_answers_and_saves_metrics(
     cache = ResponseCache(tmp_path / "cache.sqlite3")
     limiter = RateLimiter(cache.path, groq_limits(MODEL), clock=FakeClock())
     models = LocalModels(groq_transport=httpx.MockTransport(respond), groq_limiter=limiter)
-    judge = models.judge_for(cache)
+    judge = models.judge_for(cache, GROQ_JUDGE)
     with pytest.raises(httpx.HTTPStatusError):
         judge_run(store, run_id, sample, judge)
 
@@ -125,7 +127,18 @@ def test_judge_grades_only_eligible_answers_and_saves_metrics(
     monkeypatch.setattr(cli, "_judge_sample", lambda: sample)
     monkeypatch.setattr(cli, "CACHE_FILE", cache.path)
     runner = CliRunner()
-    dry_run = runner.invoke(cli.app, ["judge", run_id, "--dry-run", "--shared-tokens", "200001"])
+    dry_run = runner.invoke(
+        cli.app,
+        [
+            "judge",
+            run_id,
+            "--judge-config",
+            str(GROQ_JUDGE_CONFIG),
+            "--dry-run",
+            "--shared-tokens",
+            "200001",
+        ],
+    )
     assert dry_run.exit_code == 0, dry_run.output
     plan = {
         label.strip(): int(value)
@@ -159,7 +172,7 @@ def test_judge_grades_only_eligible_answers_and_saves_metrics(
     assert rows[-2]["supported"] == [True, False]
 
     monkeypatch.delenv("GROQ_API_KEY")
-    assert judge_run(store, run_id, sample, LocalModels().judge_for(cache)) == report
+    assert judge_run(store, run_id, sample, LocalModels().judge_for(cache, GROQ_JUDGE)) == report
     table = runner.invoke(
         cli.app, ["table", run_id, "--metrics", "judge_accuracy,citation_support_rate"]
     )
@@ -195,6 +208,8 @@ def test_judge_recovers_cited_text_for_a_legacy_run_with_a_matching_corpus(tmp_p
     )
 
     class InspectingJudge:
+        spec = GROQ_JUDGE
+
         def judge(self, request: JudgeRequest) -> JudgeVerdict:
             assert request.chunks == {chunk.id: chunk.text}
             return JudgeVerdict(correct=None, supported=(True,))
@@ -300,8 +315,9 @@ def test_calibration_validates_dual_labels_and_reports_agreement(
     monkeypatch.setenv("GROQ_API_KEY", "fixture")
     judge = LocalModels(
         groq_transport=httpx.MockTransport(respond), groq_limiter=limiter
-    ).judge_for(cache)
+    ).judge_for(cache, GROQ_JUDGE)
     report = calibration_report(folder, store.root / "judge", judge)
+    assert report.model == MODEL and report.provider == "groq"
     assert len(calls) == 50 and calls.count("Supported?") == 1
     correctness = report.agreement["correctness"]["judge_vs_subscription"]
     # 26 true and 24 false labels on each side, with 26 matching decisions.

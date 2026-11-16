@@ -71,21 +71,20 @@ status insufficient and a single next_query targeting a missing fact. Use or rev
 remaining planned sub-query when it is relevant."""
 
 
-def planned_queries(text: str, question: str) -> tuple[str, ...]:
+def planned_queries(text: str, question: str) -> tuple[tuple[str, ...], bool]:
     try:
         plan = _Plan.model_validate_json(text)
     except ValidationError:
-        return (question,)
-    return tuple(dict.fromkeys(q for query in plan.sub_queries if (q := query.strip()))) or (
-        question,
-    )
+        return (question,), True
+    queries = tuple(dict.fromkeys(q for query in plan.sub_queries if (q := query.strip())))
+    return queries or (question,), False
 
 
-def next_query(text: str) -> str | None:
+def next_query(text: str) -> tuple[str | None, bool]:
     try:
         decision = _Decision.model_validate_json(text)
     except ValidationError:
-        return None
+        return None, True
     if decision.status == "insufficient" and decision.next_query is not None:
-        return decision.next_query.strip() or None
-    return None
+        return decision.next_query.strip() or None, False
+    return None, False

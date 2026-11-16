@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -52,8 +53,9 @@ from rag_pipeline.models import (
     estimate_tokens,
     model_version,
     query_embedding,
+    remote_instructions,
 )
-from rag_pipeline.rate_limit import groq_limits, quota_days
+from rag_pipeline.rate_limit import quota_hours, remote_limits
 from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids, span_trace_id
 
@@ -183,10 +185,12 @@ class VariantConfig(_Frozen):
     def uses_retrieval(self) -> bool:
         return self.retrieval.mode != "none"
 
-    def uses_groq(self, *, retrieval_only: bool = False) -> bool:
+    def remote_generators(self, *, retrieval_only: bool = False) -> tuple[GeneratorSpec, ...]:
         hyde = self.retrieval.hyde_generator
-        return (hyde is not None and hyde.provider == "groq") or (
-            not retrieval_only and self.generation.generator.provider == "groq"
+        return tuple(
+            spec
+            for spec in (hyde, None if retrieval_only else self.generation.generator)
+            if spec is not None and spec.remote_provider is not None
         )
 
     def run_config(self) -> dict[str, Any]:
@@ -304,8 +308,12 @@ def _hyde_prompt(question: str) -> str:
 class RemoteRunPlan:
     calls: int
     cached: int
-    days: int
+    hours: float
     upper_bound: bool = False
+
+    @property
+    def days(self) -> int:
+        return math.ceil(self.hours / 24)
 
 
 def plan_remote_run(
@@ -323,12 +331,12 @@ def plan_remote_run(
             for candidate in router_candidates(config.router)
         ]
         calls = max(plan.calls for plan in plans)
-        return RemoteRunPlan(calls, 0, max(plan.days for plan in plans), upper_bound=bool(calls))
+        return RemoteRunPlan(calls, 0, max(plan.hours for plan in plans), upper_bound=bool(calls))
     spec = config.generation.generator
     hyde = config.retrieval.hyde_generator
-    if hyde is not None and hyde.provider != "groq":
+    if hyde is not None and hyde.remote_provider is None:
         hyde = None
-    remote_answer = spec.provider == "groq" and not retrieval_only
+    remote_answer = spec.remote_provider is not None and not retrieval_only
     if not remote_answer and hyde is None:
         return RemoteRunPlan(0, 0, 0)
     agentic = None if retrieval_only else config.agentic
@@ -343,13 +351,13 @@ def plan_remote_run(
     answer_cached = answer_tokens = hyde_cached = hyde_tokens = 0
     system = SYSTEM_PROMPT if config.uses_retrieval else CLOSED_BOOK_SYSTEM_PROMPT
     if config.generation.citations.enabled:
-        system = CITATION_SYSTEM_PROMPT
+        system = remote_instructions(spec, CITATION_SYSTEM_PROMPT, CITATION_SCHEMA)
     for query in queries:
         prompt = f"Question: {query.question}"
         cached_calls = 0
         if cache is not None and stages:
             if not config.uses_retrieval:
-                key = _generation_key(spec, f"groq:{spec.model}", None, system, prompt)
+                key = _generation_key(spec, f"{spec.provider}:{spec.model}", None, system, prompt)
                 cached_calls += cache.contains(key)
             elif index_version is not None:
                 plan_key = _generation_plan_key(config, index_version, query.question)
@@ -369,30 +377,35 @@ def plan_remote_run(
         answer_tokens += call_tokens * (len(stages) - cached_calls)
         if hyde is not None:
             prompt = _hyde_prompt(query.question)
-            key = _generation_key(hyde, f"groq:{hyde.model}", None, HYDE_SYSTEM_PROMPT, prompt)
+            key = _generation_key(
+                hyde, f"{hyde.provider}:{hyde.model}", None, HYDE_SYSTEM_PROMPT, prompt
+            )
             if cache is not None and cache.contains(key):
                 hyde_cached += 1
             else:
                 hyde_tokens += estimate_tokens(HYDE_SYSTEM_PROMPT, prompt, hyde.max_output_tokens)
     answer_calls = len(queries) * len(stages)
     expansion_calls = len(queries) * hyde_calls
-    pending: dict[str, tuple[int, int]] = {}
+    pending: dict[tuple[str, str], tuple[int, int]] = {}
+    answer_model = (spec.provider, spec.model)
     if remote_answer:
-        pending[spec.model] = (answer_calls - answer_cached, answer_tokens)
+        pending[answer_model] = (answer_calls - answer_cached, answer_tokens)
     if hyde is not None:
-        previous_calls, previous_tokens = pending.get(hyde.model, (0, 0))
+        hyde_model = (hyde.provider, hyde.model)
+        previous_calls, previous_tokens = pending.get(hyde_model, (0, 0))
         tokens = previous_tokens + hyde_tokens
-        if agentic is not None and remote_answer and spec.model == hyde.model:
+        if agentic is not None and remote_answer and answer_model == hyde_model:
             # The LLM stages share the cap for an Agentic Search answer.
             tokens = hyde_tokens
-        pending[hyde.model] = (previous_calls + expansion_calls - hyde_cached, tokens)
-    days = max(
-        quota_days(groq_limits(model), calls, tokens) for model, (calls, tokens) in pending.items()
+        pending[hyde_model] = (previous_calls + expansion_calls - hyde_cached, tokens)
+    hours = max(
+        quota_hours(remote_limits(provider, model), calls, tokens)
+        for (provider, model), (calls, tokens) in pending.items()
     )
     return RemoteRunPlan(
         answer_calls + expansion_calls,
         answer_cached + hyde_cached,
-        days,
+        hours,
         upper_bound=agentic is not None,
     )
 
@@ -681,15 +694,16 @@ class PipelineVariant:
         budget: TokenBudget | None = None,
         generator_override: tuple[GeneratorSpec, Generator] | None = None,
     ) -> Completion | None:
-        if budget is not None and not budget.fits(system, prompt):
-            stage.chunks = ()
-            stage.seconds = 0.0
-            return None
         spec, generator = (
             generator_override
             if generator_override is not None
             else (self.config.generation.generator, self.generator)
         )
+        budget_system = remote_instructions(spec, system, schema)
+        if budget is not None and not budget.fits(budget_system, prompt):
+            stage.chunks = ()
+            stage.seconds = 0.0
+            return None
         assert generator is not None
         if schema is None:
             call = partial(generator.complete, system, prompt)
@@ -716,7 +730,7 @@ class PipelineVariant:
             stage.cache_hit = response.cache_hit
             completion = response.value
             if (
-                spec.provider == "groq"
+                spec.remote_provider is not None
                 and not stage_name.startswith("hyde")
                 and self.config.uses_retrieval
                 and (version := self._plan_index_version) is not None
@@ -724,7 +738,11 @@ class PipelineVariant:
                 plan_key = _generation_plan_key(self.config, version, question)
                 self._cache.remember_plan(_stage_plan_key(plan_key, stage_name), key)
         stage.input_tokens, stage.output_tokens = completion.input_tokens, completion.output_tokens
-        return completion if budget is None or budget.debit(completion, system, prompt) else None
+        return (
+            completion
+            if budget is None or budget.debit(completion, budget_system, prompt)
+            else None
+        )
 
     def _check_citations(
         self,
@@ -759,6 +777,7 @@ class PipelineVariant:
                 return "" if result is None else result.text
 
             verdicts = checker.check(citations, stage.chunks, complete)
+            stage.malformed = verdicts is None and not unavailable
         if verdicts is None:
             reason = "max_tokens" if unavailable else "invalid_support_verdict"
             return (), tuple(
@@ -787,10 +806,11 @@ class PipelineVariant:
                 stage_name="plan",
                 budget=budget,
             )
-        if plan is None:
-            return _SearchResult((), (), 0, "max_tokens")
+            if plan is None:
+                return _SearchResult((), (), 0, "max_tokens")
+            queries, stage.malformed = planned_queries(plan.text, question)
 
-        sub_query, *remaining = planned_queries(plan.text, question)
+        sub_query, *remaining = queries
         retrieved: dict[str, RetrievedChunk] = {}
         evidence_by_step: list[list[RetrievedChunk]] = []
         evidence_ids: set[str] = set()
@@ -835,10 +855,10 @@ class PipelineVariant:
                     stage_name=name,
                     budget=budget,
                 )
-            if result is None:
-                stop_reason = "max_tokens"
-                break
-            follow_up = next_query(result.text)
+                if result is None:
+                    stop_reason = "max_tokens"
+                    break
+                follow_up, stage.malformed = next_query(result.text)
             if follow_up is None:
                 stop_reason = "sufficient"
                 break
@@ -922,14 +942,15 @@ class PipelineVariant:
                     schema=CITATION_SCHEMA if cited else None,
                     budget=budget,
                 )
-            shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited and completion else ()
-            if completion is None:
-                stop_reason = "max_tokens"
-                answer_text, citations, removed = ABSTENTION_TEXT, (), ()
-            elif cited:
-                answer_text, citations, removed = parse_citations(completion.text, shown_ids)
-            else:
-                answer_text, citations, removed = completion.text, (), ()
+                shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited and completion else ()
+                if completion is None:
+                    stop_reason = "max_tokens"
+                    answer_text, citations, removed = ABSTENTION_TEXT, (), ()
+                elif cited:
+                    answer_text, citations, removed = parse_citations(completion.text, shown_ids)
+                    stage.malformed = any(item.reason.startswith("malformed_") for item in removed)
+                else:
+                    answer_text, citations, removed = completion.text, (), ()
             citations, rejected = self._check_citations(question, citations, shown, trace, budget)
             if any(item.reason == "max_tokens" for item in rejected):
                 stop_reason = "max_tokens"
@@ -950,7 +971,7 @@ class PipelineVariant:
                 output_tokens=sum(stage.output_tokens for stage in generator_stages),
                 seconds=(
                     sum(stage.seconds for stage in trace.stages)
-                    if self._cache is not None or self.config.uses_groq()
+                    if self._cache is not None or self.config.remote_generators()
                     else time.perf_counter() - started - trace.accounting_seconds
                 ),
                 stage_seconds={stage.name: stage.seconds for stage in trace.stages},

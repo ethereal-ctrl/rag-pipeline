@@ -1,0 +1,5 @@
+provider: gemini
+model: gemma-4-31b-it
+supports_system: true
+structured_output: prompt
+max_output_tokens: 512
