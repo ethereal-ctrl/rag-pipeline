@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
+from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import partial
@@ -15,6 +16,7 @@ from qdrant_client import QdrantClient, models
 
 from rag_pipeline import bm25
 from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
+from rag_pipeline.chunk_context import ContextBuild
 from rag_pipeline.chunking import Chunk, ChunkingSettings
 from rag_pipeline.corpus import article_hash
 from rag_pipeline.models import (
@@ -39,16 +41,24 @@ class IndexMismatch(Exception):
     """Raised when Chunks built with other settings or another embedder would be mixed in."""
 
 
-def index_collection(settings: ChunkingSettings, embedder_model: str | None) -> str:
-    """The collection for one chunking + embedder combination, e.g. chunks-sent-w200-o1-bge-m3.
+def index_collection(
+    settings: ChunkingSettings, embedder_model: str | None, *, context_model: str | None = None
+) -> str:
+    """The collection for one chunking, Chunk Context model and embedder combination.
 
     Different combinations live side by side; the Corpus hash is not part of the name, so
     re-ingesting a changed Corpus updates the same collection incrementally.
     """
+
+    def slug(name: str) -> str:
+        model = name.rsplit("/", 1)[-1].lower()
+        return re.sub(r"[^a-z0-9.]+", "-", model).strip("-")
+
     name = f"chunks-{settings.label}"
+    if context_model:
+        name += f"-ctx-{slug(context_model)}"
     if embedder_model:
-        model = embedder_model.rsplit("/", 1)[-1].lower()
-        name += "-" + re.sub(r"[^a-z0-9.]+", "-", model).strip("-")
+        name += f"-{slug(embedder_model)}"
     return name
 
 
@@ -66,6 +76,7 @@ class RetrievedChunk:
     published_at: str
     text: str
     score: float
+    context: str | None = None
 
 
 class ChunkIndex:
@@ -100,7 +111,7 @@ class ChunkIndex:
         vectors: list[list[float]] = []
         for start in range(0, len(chunks), EMBED_BATCH):
             batch = chunks[start : start + EMBED_BATCH]
-            vectors += self._embedder.embed_documents([c.text for c in batch])
+            vectors += self._embedder.embed_documents([c.index_text for c in batch])
         return vectors
 
     @property
@@ -117,7 +128,15 @@ class ChunkIndex:
                 self.collection,
                 limit=2048,
                 offset=offset,
-                with_payload=["article_id", "article_hash", "chunking", "embedder"],
+                with_payload=[
+                    "article_id",
+                    "article_hash",
+                    "chunking",
+                    "embedder",
+                    "context_model",
+                    "context_build",
+                    "article_chunk_count",
+                ],
                 with_vectors=False,
             )
             payloads += [p.payload or {} for p in points]
@@ -125,15 +144,39 @@ class ChunkIndex:
                 return payloads
 
     def stored_articles(self) -> dict[str, str | None]:
-        """Article id -> content hash of the Chunks in the index (None if built before hashing)."""
-        return {p["article_id"]: p.get("article_hash") for p in self._stored_payloads()}
+        """Article hashes, with None for legacy or incomplete sets of Chunks."""
+        payloads = self._stored_payloads()
+        counts: Counter[str] = Counter(
+            p["article_id"] for p in payloads if "article_chunk_count" in p
+        )
+        stored: dict[str, str | None] = {}
+        for payload in payloads:
+            article_id: str = payload["article_id"]
+            expected = payload.get("article_chunk_count")
+            # An interrupted batch must not make a partly indexed Article look unchanged.
+            stored[article_id] = (
+                None
+                if expected is not None and counts[article_id] != expected
+                else payload.get("article_hash")
+            )
+        return stored
 
-    def check_build(self, chunking: str) -> None:
-        """Refuse to mix Chunks from other chunking settings or another embedder."""
+    def check_build(self, chunking: str, context: ContextBuild | None = None) -> None:
+        """Refuse to mix incompatible chunking, Chunk Context or embedding settings."""
         for payload in self._stored_payloads():
             for key, expected in (("chunking", chunking), ("embedder", self._embedder_name)):
                 stored = payload.get(key)
                 if stored is not None and stored != expected:
+                    raise IndexMismatch(
+                        f"{self.collection!r} holds Chunks with {key} {stored!r}, not "
+                        f"{expected!r}; ingest into its own collection instead"
+                    )
+            for key, expected in (
+                ("context_model", context.model if context else None),
+                ("context_build", context.key if context else None),
+            ):
+                stored = payload.get(key)
+                if stored != expected:
                     raise IndexMismatch(
                         f"{self.collection!r} holds Chunks with {key} {stored!r}, not "
                         f"{expected!r}; ingest into its own collection instead"
@@ -157,17 +200,20 @@ class ChunkIndex:
         stored = self.stored_articles()
         return f"{self.collection}@{corpus_hash({a: h or '' for a, h in stored.items()})}"
 
-    def upsert(self, chunks: Iterable[Chunk]) -> int:
+    def upsert(self, chunks: Iterable[Chunk], *, context: ContextBuild | None = None) -> int:
         chunks = list(chunks)
         if not chunks:
             return 0
+        if any((chunk.context is None) != (context is None) for chunk in chunks):
+            raise IndexMismatch("Chunk Context payloads require matching build metadata")
         dense = self._dense_vectors(chunks)
+        counts = Counter(chunk.article.id for chunk in chunks) if context else Counter[str]()
         self._ensure_collection(len(dense[0]) if dense else None)
         points = [
             models.PointStruct(
                 id=str(uuid.uuid5(_POINT_NAMESPACE, chunk.id)),
                 vector={
-                    BM25_VECTOR: bm25.document_vector(chunk.text),
+                    BM25_VECTOR: bm25.document_vector(chunk.index_text),
                     **({DENSE_VECTOR: dense[n]} if dense else {}),
                 },
                 payload={
@@ -181,6 +227,16 @@ class ChunkIndex:
                     "article_hash": article_hash(chunk.article),
                     "chunking": chunk.chunking,
                     "embedder": self._embedder_name,
+                    **(
+                        {
+                            "context": chunk.context,
+                            "context_model": context.model,
+                            "context_build": context.key,
+                            "article_chunk_count": counts[chunk.article.id],
+                        }
+                        if context
+                        else {}
+                    ),
                 },
             )
             for n, chunk in enumerate(chunks)
@@ -304,4 +360,5 @@ def _to_retrieved(payload: dict[str, Any], score: float) -> RetrievedChunk:
         published_at=payload["published_at"],
         text=payload["text"],
         score=score,
+        context=payload.get("context"),
     )

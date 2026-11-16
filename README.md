@@ -73,6 +73,29 @@ dry run estimates quota days at a fresh allowance and, for retrieval variants, e
 the prompt length from the configured number of Chunks. Its cache count includes
 known prompts for the current index version.
 
+## Chunk Context
+
+Build and evaluate the contextual Hybrid + Reranker variant after the model bake-off.
+
+```bash
+uv run --no-env-file rag ingest --embedder qwen3-embedding:0.6b --chunk-context qwen3.5:4b --context-size 8192 --article-tokens 4096
+uv run --no-env-file rag eval configs/variants/hybrid-rerank-context.yaml --split smoke
+```
+
+Ingestion sends each Article's Chunks consecutively with the same Article prefix.
+`--context-size` sets the model's context window. `--article-tokens` caps the Article
+body using a conservative estimate, and the prefix may be shorter to leave room for the
+Chunk. Restart the same command after an interruption to reuse cached contexts. At one
+to three seconds per uncached Chunk, the full 6,759-Chunk Corpus takes roughly two to six
+hours of generation.
+
+BM25 and dense search index the Chunk Context followed by the original Chunk text.
+Answer generation, Citations and Evidence matching use the original text. For the plain
+comparison, use the same variant settings with the collection
+`chunks-sent-w200-o1-qwen3-embedding-0.6b`. Contextual ingest reports under `runs/ingest/`
+record each invocation's Chunk count, cache hits, original generation time and tokens,
+truncated Article IDs, and notional USD where a reference price is available.
+
 ## Citations and Abstention
 
 The [cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml) asks
