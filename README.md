@@ -4,11 +4,54 @@ Work in progress. The goal: measure, with confidence intervals, which advanced r
 techniques actually pay off on multi-hop questions, running fully locally.
 See `GLOSSARY.md` for the vocabulary and `docs/adr/` for the design decisions.
 
-## Quick start
+## Run it yourself
+
+1. Install Docker with Compose and Ollama, then start Ollama on the host. On an Apple M4,
+   host Ollama uses the Apple GPU. The container's Reranker runs on CPU and takes longer
+   than the host Reranker on MPS.
+2. Pull the generator and embedder for the default `hybrid-rerank-cited` variant.
+
+   ```bash
+   ollama pull qwen3.5:4b && ollama pull bge-m3
+   ```
+
+3. In the clone, start the API, Qdrant and Phoenix, then build the demo index.
+
+   ```bash
+   docker compose up -d
+   docker compose run --rm api rag bootstrap
+   ```
+
+   Bootstrap fetches the pinned MultiHop-RAG dataset, verifies its checksums, and builds the
+   selected variant's index. As a reference, embedding the Corpus with Qwen3-Embedding 0.6B
+   took about 16 minutes on an M4. Later runs skip unchanged Articles. The first request using
+   a Reranker also downloads its weights into the persistent Hugging Face cache.
+4. Open [the demo](http://localhost:8000) and ask a question. Expand the Citations to see the
+   original Chunk text. Open the answer's trace in [Phoenix](http://localhost:6006).
+5. For host inference with MPS, keep Qdrant and Phoenix running, stop the container API if it
+   is running, and start the same app with uv.
+
+   ```bash
+   docker compose stop api
+   uv run rag serve
+   ```
+
+The default demo runtime costs nothing. Set `RAG_DEMO_VARIANT` to choose the default in the
+page and the index that bootstrap builds. Pull the Ollama models listed in the selected
+variant's config. The container reaches host Ollama at `http://host.docker.internal:11434`.
+If the container cannot reach Ollama on macOS, quit the desktop app and start the host server
+with `OLLAMA_HOST=0.0.0.0:11434 ollama serve` in a separate terminal.
+
+The API reads `OLLAMA_URL`, `QDRANT_URL`, `RAG_TRACING_ENDPOINT` and `PHOENIX_URL`. The first
+three configure connections, and `PHOENIX_URL` sets the URL used in browser trace links.
+The local demo page, API docs and reachability checks are available at `/`, `/docs` and
+`/health` respectively.
+
+## Run evaluations
 
 ```bash
 uv sync
-docker compose up -d          # Qdrant and Phoenix
+docker compose up -d qdrant phoenix
 ollama pull qwen3.5:4b        # local generator
 uv run rag data fetch         # pinned MultiHop-RAG files, checksum-verified
 uv run rag ingest             # chunk + index the Corpus (incremental)

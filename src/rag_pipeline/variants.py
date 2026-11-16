@@ -54,7 +54,7 @@ from rag_pipeline.models import (
 )
 from rag_pipeline.rate_limit import groq_limits, quota_days
 from rag_pipeline.router import RouterArtifact, RouterConfig
-from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids
+from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids, span_trace_id
 
 ABSTENTION_TEXT = "Insufficient information."
 _COMPLETION_ADAPTER = TypeAdapter(Completion)
@@ -81,6 +81,7 @@ class _Frozen(BaseModel):
 class IndexConfig(_Frozen):
     collection: str
     embedder: EmbedderSpec | None = None  # must match the embedder used at ingestion
+    chunk_context: str | None = None  # Context model used to rebuild this collection.
 
 
 class RerankConfig(_Frozen):
@@ -142,7 +143,7 @@ class VariantConfig(_Frozen):
         return self.retrieval.mode != "none"
 
     def run_config(self) -> dict[str, Any]:
-        config = self.model_dump(mode="json")
+        config = self.model_dump(mode="json", exclude={"index": {"chunk_context"}})
         if not self.generation.citations.enabled:
             del config["generation"]["citations"]
         if self.agentic is None:
@@ -183,6 +184,7 @@ class Answer:
     chosen_variant: str | None = None
     route_candidates: tuple[str, ...] = ()
     used_retrieval: bool | None = None
+    trace_id: str | None = field(default=None, compare=False)
 
 
 @dataclass(frozen=True)
@@ -735,6 +737,7 @@ class PipelineVariant:
             chosen_variant=candidate.config.name,
             route_candidates=routing.artifact.candidate_order,
             used_retrieval=candidate.config.uses_retrieval,
+            trace_id=span_trace_id(root),
         )
 
     def answer(self, question: str) -> Answer:
@@ -815,6 +818,7 @@ class PipelineVariant:
                 shown_chunk_ids=shown_ids,
                 search_steps=search_steps,
                 stop_reason=stop_reason,
+                trace_id=span_trace_id(root),
             )
 
 

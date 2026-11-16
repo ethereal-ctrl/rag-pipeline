@@ -14,7 +14,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.trace import Span, StatusCode, Tracer
+from opentelemetry.trace import Span, StatusCode, Tracer, format_trace_id
 
 from rag_pipeline.index import RetrievedChunk, TokenCount
 
@@ -22,22 +22,19 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:6006/v1/traces"
 PROBE_TIMEOUT = 0.5
 
 
-def _collector_available(endpoint: str) -> bool:
+def collector_available(endpoint: str, *, transport: httpx.BaseTransport | None = None) -> bool:
     available = Event()
 
     def probe() -> None:
         try:
             # An empty protobuf request checks the actual OTLP route without sending spans.
-            with httpx.stream(
-                "POST",
-                endpoint,
-                content=b"",
-                headers={"Content-Type": "application/x-protobuf"},
-                timeout=PROBE_TIMEOUT,
-            ) as response:
-                content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
-                if response.is_success and content_type == "application/x-protobuf":
-                    available.set()
+            with httpx.Client(timeout=PROBE_TIMEOUT, transport=transport) as client:
+                response = client.post(
+                    endpoint, content=b"", headers={"Content-Type": "application/x-protobuf"}
+                )
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
+            if response.is_success and content_type == "application/x-protobuf":
+                available.set()
         except (httpx.HTTPError, httpx.InvalidURL):
             pass
 
@@ -52,20 +49,37 @@ def _collector_available(endpoint: str) -> bool:
 def cli_tracer() -> Generator[Tracer | None]:
     """Probe once, then export in batches for the duration of the CLI command."""
     endpoint = os.environ.get("RAG_TRACING_ENDPOINT", DEFAULT_ENDPOINT)
-    if os.environ.get("RAG_TRACING") == "0" or not _collector_available(endpoint):
+    if os.environ.get("RAG_TRACING") == "0" or not collector_available(endpoint):
         yield None
         return
+    with exporting_tracer(endpoint) as tracer:
+        yield tracer
+
+
+@contextmanager
+def exporting_tracer(endpoint: str | None) -> Generator[Tracer]:
+    """Create a local trace context and optionally export spans over OTLP."""
     provider = TracerProvider(
         resource=Resource.create(
             {"service.name": "rag-pipeline", "openinference.project.name": "rag-pipeline"}
         ),
         shutdown_on_exit=False,
     )
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint, timeout=1)))
+    if endpoint is not None:
+        provider.add_span_processor(
+            BatchSpanProcessor(
+                OTLPSpanExporter(endpoint=endpoint, timeout=1), schedule_delay_millis=200
+            )
+        )
     try:
         yield provider.get_tracer("rag_pipeline")
     finally:
         provider.shutdown()
+
+
+def span_trace_id(span: Span) -> str | None:
+    context = span.get_span_context()
+    return format_trace_id(context.trace_id) if context.is_valid else None
 
 
 @dataclass(frozen=True)

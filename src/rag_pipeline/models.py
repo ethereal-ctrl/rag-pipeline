@@ -18,6 +18,12 @@ from rag_pipeline.rate_limit import RateLimiter, groq_limits
 if TYPE_CHECKING:
     from rag_pipeline.judge_model import Judge
 
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+
+
+def configured_ollama_url() -> str:
+    return os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
+
 
 class GeneratorSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -148,7 +154,7 @@ class OllamaGenerator:
     def __init__(
         self,
         spec: GeneratorSpec,
-        base_url: str = "http://localhost:11434",
+        base_url: str = DEFAULT_OLLAMA_URL,
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -300,9 +306,15 @@ class GroqGenerator:
 
 
 class OllamaEmbedder:
-    def __init__(self, spec: EmbedderSpec, base_url: str = "http://localhost:11434") -> None:
+    def __init__(
+        self,
+        spec: EmbedderSpec,
+        base_url: str = DEFAULT_OLLAMA_URL,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self._spec = spec
-        self._http = httpx.Client(base_url=base_url, timeout=600)
+        self._http = httpx.Client(base_url=base_url, timeout=600, transport=transport)
 
     @property
     def name(self) -> str:
@@ -422,13 +434,13 @@ class LocalModels:
 
     def __init__(
         self,
-        ollama_url: str = "http://localhost:11434",
+        ollama_url: str | None = None,
         *,
         ollama_transport: httpx.BaseTransport | None = None,
         groq_transport: httpx.BaseTransport | None = None,
         groq_limiter: RateLimiter | None = None,
     ) -> None:
-        self._ollama_url = ollama_url
+        self._ollama_url = configured_ollama_url() if ollama_url is None else ollama_url
         self._ollama_transport = ollama_transport
         self._groq_transport = groq_transport
         self._groq_limiter = groq_limiter
@@ -460,6 +472,6 @@ class LocalModels:
             self._embedders[spec] = (
                 SentenceTransformersEmbedder(spec)
                 if spec.provider == "sentence-transformers"
-                else OllamaEmbedder(spec, self._ollama_url)
+                else OllamaEmbedder(spec, self._ollama_url, transport=self._ollama_transport)
             )
         return self._embedders[spec]

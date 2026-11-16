@@ -1,6 +1,7 @@
 name: hybrid-rerank-context
 index:
   collection: chunks-sent-w200-o1-ctx-qwen3.5-4b-qwen3-embedding-0.6b
+  chunk_context: qwen3.5:4b
   embedder:
     provider: ollama
     model: qwen3-embedding:0.6b

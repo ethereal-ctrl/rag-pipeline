@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RAG Pipeline Demo</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.6 system-ui, sans-serif; }
+    body { margin: 0; }
+    main { width: min(44rem, calc(100% - 2rem)); margin: 3rem auto; }
+    h1, h2 { line-height: 1.2; }
+    form { display: grid; gap: 0.7rem; }
+    textarea, select, button { font: inherit; padding: 0.5rem; }
+    button { justify-self: start; cursor: pointer; }
+    label { font-weight: 600; }
+    small, #status { opacity: 0.85; }
+    details { margin: 0.5rem 0; }
+    summary { cursor: pointer; }
+    blockquote { margin: 0.5rem 0 1rem; border-inline-start: 2px solid; padding-inline-start: 0.7rem; white-space: pre-wrap; }
+    #answer { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>RAG Pipeline Demo</h1>
+    <form id="ask">
+      <label for="question">Question</label>
+      <textarea id="question" rows="3" maxlength="500" required></textarea>
+      <label for="variant">Pipeline Variant</label>
+      <select id="variant" aria-describedby="description" required></select>
+      <small id="description"></small>
+      <button id="submit" type="submit" disabled>Ask</button>
+    </form>
+    <p id="status" role="status" aria-live="polite"></p>
+    <section id="result" aria-labelledby="answer-heading" hidden>
+      <h2 id="answer-heading">Answer</h2>
+      <p id="answer"></p>
+      <ul id="citations"></ul>
+      <p><a id="trace" target="_blank" rel="noopener noreferrer">Open trace in Phoenix</a></p>
+    </section>
+  </main>
+  <script>
+    const get = (id) => document.getElementById(id);
+    const form = get("ask");
+    const variants = get("variant");
+    const status = get("status");
+    const submit = get("submit");
+    const result = get("result");
+
+    function element(tag, text) {
+      const node = document.createElement(tag);
+      node.textContent = text;
+      return node;
+    }
+
+    function render(data) {
+      get("answer-heading").textContent = data.abstained ? "Abstention" : "Answer";
+      get("answer").textContent = data.answer;
+      const list = get("citations");
+      list.replaceChildren();
+      for (const citation of data.citations) {
+        const row = element("li", citation.statement);
+        for (const chunk of citation.chunks) {
+          const details = document.createElement("details");
+          details.append(
+            element("summary", [chunk.title, chunk.source, chunk.published_at.slice(0, 10)].join(" · ")),
+            element("blockquote", chunk.text),
+          );
+          row.append(details);
+        }
+        list.append(row);
+      }
+      const trace = new URL(data.phoenix_url, window.location.origin);
+      if (trace.protocol === "http:" || trace.protocol === "https:") get("trace").href = trace.href;
+      else get("trace").removeAttribute("href");
+      result.hidden = false;
+    }
+
+    async function loadVariants() {
+      const response = await fetch("/variants");
+      if (!response.ok) throw new Error("Could not load Pipeline Variants.");
+      const catalog = await response.json();
+      const descriptions = new Map();
+      for (const variant of catalog.variants) {
+        const option = element("option", variant.name);
+        option.value = variant.name;
+        variants.append(option);
+        descriptions.set(variant.name, variant.description);
+      }
+      const describe = () => { get("description").textContent = descriptions.get(variants.value) ?? ""; };
+      variants.value = catalog.default;
+      variants.addEventListener("change", describe);
+      describe();
+      submit.disabled = false;
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      result.hidden = true;
+      status.textContent = "Asking the Pipeline Variant…";
+      try {
+        const response = await fetch("/answer", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({question: get("question").value, variant: variants.value}),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Check your question.");
+        render(data);
+        status.textContent = "";
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        submit.disabled = false;
+      }
+    });
+
+    loadVariants().catch((error) => { status.textContent = error.message; });
+  </script>
+</body>
+</html>

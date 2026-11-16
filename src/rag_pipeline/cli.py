@@ -30,6 +30,14 @@ from rag_pipeline.corpus import (
     load_articles,
     load_queries,
 )
+from rag_pipeline.demo import (
+    DEFAULT_QDRANT_URL,
+    VARIANTS_DIR,
+    IndexBuild,
+    answer_variants,
+    demo_variant,
+    load_variants,
+)
 from rag_pipeline.evaluation import (
     RunStore,
     TestSplitAlreadyScored,
@@ -151,6 +159,23 @@ def _save_ingest_report(report: IngestReport, collection: str) -> Path:
     return path
 
 
+def _context_writer(
+    models: LocalModels,
+    model: str,
+    context_size: int = 8192,
+    article_tokens: int = DEFAULT_ARTICLE_TOKENS,
+) -> ModelContextualiser:
+    spec = GeneratorSpec(
+        provider="ollama",
+        model=model,
+        context_size=context_size,
+        max_output_tokens=CONTEXT_OUTPUT_TOKENS,
+    )
+    return ModelContextualiser(
+        spec, models.generator_for, ResponseCache(), article_tokens=article_tokens
+    )
+
+
 @app.command("ingest")
 def ingest_command(
     max_words: int = 200,
@@ -188,18 +213,7 @@ def ingest_command(
     try:
         writer = None
         if chunk_context is not None:
-            spec = GeneratorSpec(
-                provider="ollama",
-                model=chunk_context,
-                context_size=context_size,
-                max_output_tokens=CONTEXT_OUTPUT_TOKENS,
-            )
-            writer = ModelContextualiser(
-                spec,
-                models.generator_for,
-                ResponseCache(),
-                article_tokens=article_tokens,
-            )
+            writer = _context_writer(models, chunk_context, context_size, article_tokens)
         report = ingest(load_articles(RAW_DIR), index, settings, contextualiser=writer)
     except (IndexMismatch, ValueError) as error:
         typer.echo(str(error), err=True)
@@ -208,6 +222,58 @@ def ingest_command(
     if report.context is not None:
         path = _save_ingest_report(report, name)
         typer.echo(f"Wrote {path}.")
+
+
+@app.command("bootstrap")
+def bootstrap_command(qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL) -> None:
+    """Fetch the pinned Corpus and incrementally build the configured demo index."""
+    name = demo_variant()
+    try:
+        config = load_variants(VARIANTS_DIR).get(name)
+        if config is None:
+            raise ValueError(f"Unknown RAG_DEMO_VARIANT {name!r}. Check {VARIANTS_DIR}.")
+        builds = {
+            IndexBuild.for_variant(candidate)
+            for candidate in answer_variants(config)
+            if candidate.index is not None
+        }
+        fetch_dataset(RAW_DIR)
+        if not builds:
+            typer.echo(f"Dataset ready. Variant {name!r} needs no collection.")
+            return
+        articles = load_articles(RAW_DIR)
+        models = LocalModels()
+        client = QdrantClient(url=qdrant_url, check_compatibility=False)
+        try:
+            for build in sorted(builds, key=lambda item: item.collection):
+                embedder = models.embedder_for(build.embedder) if build.embedder else None
+                writer = (
+                    _context_writer(models, build.context_model) if build.context_model else None
+                )
+                typer.echo(f"Ingesting {build.collection} for {name}.")
+                report = ingest(
+                    articles,
+                    ChunkIndex(client, build.collection, embedder),
+                    build.settings,
+                    contextualiser=writer,
+                )
+                _print_ingest(report)
+        finally:
+            client.close()
+    except (IndexMismatch, OSError, ValueError, HTTPError, ResponseHandlingException) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+
+
+@app.command("serve")
+def serve_command(
+    host: Annotated[str, typer.Option(help="Bind the API to this address.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(min=1, max=65535)] = 8000,
+) -> None:
+    """Serve the demo page and Answer API."""
+    import uvicorn
+
+    uvicorn.run("rag_pipeline.api:app", host=host, port=port)
 
 
 @app.command("eval")
