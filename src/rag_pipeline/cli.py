@@ -394,7 +394,7 @@ def eval_command(
             allow_rescore=allow_rescore,
             retrieval_only=retrieval_only,
         )
-    except (TestSplitAlreadyScored, ValueError) as error:
+    except (TestSplitAlreadyScored, ValueError, HTTPError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"Run {result.run_id}")

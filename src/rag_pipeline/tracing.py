@@ -8,6 +8,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Event, Thread
+from typing import TYPE_CHECKING
 
 import httpx
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -17,6 +18,9 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Span, StatusCode, Tracer, format_trace_id
 
 from rag_pipeline.index import RetrievedChunk, TokenCount
+
+if TYPE_CHECKING:
+    from rag_pipeline.models import Completion
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:6006/v1/traces"
 PROBE_TIMEOUT = 0.5
@@ -91,6 +95,8 @@ class StageTrace:
     model: str | None = None
     cache_hit: bool = False
     malformed: bool = False
+    reasoning_tokens: int = 0
+    raw_content_length: int | None = None
 
 
 @dataclass
@@ -103,9 +109,17 @@ class StageUsage:
     cache_hit: bool = False
     chosen_variant: str | None = None
     malformed: bool = False
+    reasoning_tokens: int = 0
+    raw_content_length: int | None = None
 
     def set_input_tokens(self, count: TokenCount) -> None:
         self.input_tokens = count
+
+    def set_completion(self, completion: Completion) -> None:
+        self.input_tokens = completion.input_tokens
+        self.output_tokens = completion.output_tokens
+        self.reasoning_tokens = completion.reasoning_tokens
+        self.raw_content_length = completion.raw_content_length
 
 
 def set_chunk_ids(span: Span, chunks: tuple[RetrievedChunk, ...]) -> None:
@@ -169,6 +183,8 @@ class AnswerTrace:
                     model,
                     usage.cache_hit,
                     usage.malformed,
+                    usage.reasoning_tokens,
+                    usage.raw_content_length,
                 )
             )
             if model is not None:
@@ -180,4 +196,7 @@ class AnswerTrace:
                 span.set_attribute("rag.chosen_variant", usage.chosen_variant)
             if usage.malformed:
                 span.set_attribute("rag.malformed_response", True)
+            if usage.raw_content_length is not None:
+                span.set_attribute("rag.raw_content_length", usage.raw_content_length)
+                span.set_attribute("rag.reasoning_tokens", usage.reasoning_tokens)
             set_chunk_ids(span, usage.chunks)
