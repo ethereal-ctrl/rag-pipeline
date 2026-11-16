@@ -10,6 +10,7 @@ import random
 import re
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,7 +38,7 @@ class Evaluable(Protocol):
     def config(self) -> VariantConfig: ...
 
     @property
-    def generator(self) -> Generator: ...
+    def generator(self) -> Generator | None: ...
 
     def answer(self, question: str) -> Answer: ...
 
@@ -90,6 +91,8 @@ class QueryRecord:
     citation_counts: CitationCounts | None = None
     search_steps: int | None = None
     stop_reason: StopReason | None = None
+    chosen_variant: str | None = None
+    route_candidates: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -211,7 +214,10 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         answer = _retrieve_only(variant, query.question)
     else:
         answer = variant.answer(query.question)
-    scored = variant.config.uses_retrieval and not query.is_null
+    uses_retrieval = (
+        variant.config.uses_retrieval if answer.used_retrieval is None else answer.used_retrieval
+    )
+    scored = uses_retrieval and not query.is_null
     ranks = _rank_scores(query, answer.retrieved) if scored else None
     return QueryRecord(
         query_id=query.id,
@@ -237,9 +243,12 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         shown_chunk_ids=answer.shown_chunk_ids,
         search_steps=answer.search_steps,
         stop_reason=answer.stop_reason,
+        chosen_variant=answer.chosen_variant,
+        route_candidates=answer.route_candidates,
         citation_counts=(
             _citation_counts(query, answer)
-            if not retrieval_only and variant.config.generation.citations.enabled
+            if not retrieval_only
+            and (variant.config.generation.citations.enabled or answer.chosen_variant is not None)
             else None
         ),
     )
@@ -312,6 +321,10 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     if reasons:
         for reason in ("sufficient", "max_steps", "max_tokens"):
             metrics[f"stop_reason[{reason}]"] = reasons.count(reason) / len(reasons)
+    routed = [r.chosen_variant for r in records if r.chosen_variant is not None]
+    if routed:
+        for name in dict.fromkeys(name for r in records for name in r.route_candidates):
+            metrics[f"routed_share[{name}]"] = routed.count(name) / len(routed)
     seconds = sorted(r.seconds for r in records)
     if seconds:
         metrics["latency_p50"] = _percentile(seconds, 0.50)
@@ -345,16 +358,20 @@ def _interval(samples: list[float]) -> tuple[float, float]:
 
 
 def bootstrap_intervals(
-    records: list[QueryRecord], samples: int = BOOTSTRAP_SAMPLES, seed: int = BOOTSTRAP_SEED
+    records: list[QueryRecord],
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+    *,
+    metric_fn: Callable[[list[QueryRecord]], dict[str, float]] = aggregate,
 ) -> dict[str, tuple[float, float]]:
     """Percentile bootstrap 95% intervals, resampling queries with replacement."""
     rng = random.Random(seed)
     draws: dict[str, list[float]] = {}
     for _ in range(samples):
         resample = [records[rng.randrange(len(records))] for _ in records]
-        for name, value in aggregate(resample).items():
+        for name, value in metric_fn(resample).items():
             draws.setdefault(name, []).append(value)
-    reported = aggregate(records).keys() - {"queries"}
+    reported = metric_fn(records).keys() - {"queries"}
     return {name: _interval(values) for name, values in draws.items() if name in reported}
 
 
@@ -417,6 +434,7 @@ def _record_from_row(row: dict[str, Any]) -> QueryRecord:
     row["retrieved_chunk_ids"] = tuple(row["retrieved_chunk_ids"])
     row["trace"] = tuple(StageTrace(**stage) for stage in row.get("trace", ()))
     row["shown_chunk_ids"] = tuple(row.get("shown_chunk_ids", ()))
+    row["route_candidates"] = tuple(row.get("route_candidates", ()))
     row["citations"] = tuple(
         Citation(cite["statement"], tuple(cite["chunk_ids"])) for cite in row.get("citations", ())
     )
@@ -585,6 +603,7 @@ def evaluate(
         run_id = f"{started:%Y%m%dT%H%M%S%f}-{config.name}-{split}{suffix}"
         generator = variant.generator
         version = getattr(generator, "version", None)
+        generator_name = generator.name if generator is not None else None
         store.begin(
             run_id,
             {
@@ -592,8 +611,8 @@ def evaluate(
                 "split": split,
                 "index_version": index_version,
                 "fingerprint": fingerprint,
-                "generator": generator.name,
-                "generator_version": version() if callable(version) else generator.name,
+                "generator": generator_name,
+                "generator_version": version() if callable(version) else generator_name,
                 "commit": _git_commit(),
                 "started_at": started.isoformat(),
                 "rescored": allow_rescore and split in TEST_SPLITS,
@@ -640,7 +659,13 @@ def export_records(result: RunResult, path: Path) -> Path:
         row["retrieved_chunk_ids"] = " ".join(row["retrieved_chunk_ids"])
         row["stage_seconds"] = json.dumps(row["stage_seconds"])
         row["trace"] = json.dumps(row["trace"])
-        for name in ("citations", "removed_statements", "shown_chunk_ids", "citation_counts"):
+        for name in (
+            "citations",
+            "removed_statements",
+            "shown_chunk_ids",
+            "citation_counts",
+            "route_candidates",
+        ):
             row[name] = json.dumps(row[name])
     with path.open("w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=list(rows[0]) if rows else ["query_id"])

@@ -11,11 +11,10 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
-from pydantic import TypeAdapter
 from qdrant_client import QdrantClient, models
 
 from rag_pipeline import bm25
-from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
+from rag_pipeline.cache import ModelResponse, ResponseCache
 from rag_pipeline.chunk_context import ContextBuild
 from rag_pipeline.chunking import Chunk, ChunkingSettings
 from rag_pipeline.corpus import article_hash
@@ -24,11 +23,10 @@ from rag_pipeline.models import (
     EmbedderSpec,
     EmbedderWithUsage,
     QueryTokenCounter,
-    model_version,
+    query_embedding,
 )
 
 type TokenCount = int | Callable[[], int | None] | None
-_QUERY_EMBEDDING = TypeAdapter(tuple[list[float], int | None])
 
 BM25_VECTOR = "bm25"
 DENSE_VECTOR = "dense"
@@ -284,22 +282,7 @@ class ChunkIndex:
         embedder = self._embedder
         if embedder is None:
             raise ValueError(f"index {self.collection!r} has no embedder for dense search")
-        key = cache_key(
-            "embed_query", spec.model_dump(), embedder.name, model_version(embedder), query
-        )
-
-        def embed() -> ModelResponse[tuple[list[float], int | None]]:
-            if isinstance(embedder, EmbedderWithUsage):
-                return measure_call(partial(embedder.embed_query_with_usage, query))
-            response = measure_call(lambda: embedder.embed_query(query))
-            tokens = (
-                embedder.count_query_tokens(query)
-                if isinstance(embedder, QueryTokenCounter)
-                else None
-            )
-            return ModelResponse((response.value, tokens), response.seconds)
-
-        return cache.get_or_call(key, _QUERY_EMBEDDING, embed)
+        return query_embedding(embedder, spec, query, cache)
 
     def search_hybrid(
         self,

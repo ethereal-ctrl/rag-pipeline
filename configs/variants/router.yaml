@@ -1,0 +1,20 @@
+name: router
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+router:
+  artifact: configs/router/trained.json
+  candidates:
+    - configs/variants/closed-book.yaml
+    - configs/variants/bm25.yaml
+    - configs/variants/hybrid-rerank.yaml
+    - configs/variants/agentic.yaml

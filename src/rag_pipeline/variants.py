@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from itertools import chain, islice, zip_longest
@@ -40,7 +41,9 @@ from rag_pipeline.corpus import BenchmarkQuery
 from rag_pipeline.index import ChunkIndex, RetrievedChunk
 from rag_pipeline.models import (
     Completion,
+    Embedder,
     EmbedderSpec,
+    Generator,
     GeneratorSpec,
     ModelProvider,
     RerankerSpec,
@@ -48,8 +51,10 @@ from rag_pipeline.models import (
     StructuredGenerator,
     estimate_tokens,
     model_version,
+    query_embedding,
 )
 from rag_pipeline.rate_limit import DAY, MINUTE, groq_limits
+from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids
 
 ABSTENTION_TEXT = "Insufficient information."
@@ -112,6 +117,7 @@ class VariantConfig(_Frozen):
     retrieval: RetrievalConfig
     generation: GenerationConfig
     agentic: AgenticConfig | None = None
+    router: RouterConfig | None = None
 
     @model_validator(mode="after")
     def _retrieval_needs_an_index(self) -> Self:
@@ -125,6 +131,11 @@ class VariantConfig(_Frozen):
             raise ValueError("Citations require retrieval")
         if self.agentic is not None and not self.generation.citations.enabled:
             raise ValueError("Agentic Search requires Citations")
+        if self.router is not None:
+            if self.index is None or self.index.embedder is None:
+                raise ValueError("Router requires an index embedder for its question features")
+            if self.uses_retrieval or self.retrieval.rerank is not None:
+                raise ValueError("Router retrieval belongs to its candidate Pipeline Variants")
         return self
 
     @property
@@ -132,16 +143,27 @@ class VariantConfig(_Frozen):
         return self.retrieval.mode != "none"
 
     def run_config(self) -> dict[str, Any]:
-        config = self.model_dump()
+        config = self.model_dump(mode="json")
         if not self.generation.citations.enabled:
             del config["generation"]["citations"]
         if self.agentic is None:
             del config["agentic"]
+        if self.router is None:
+            del config["router"]
         return config
 
     @classmethod
     def from_yaml(cls, path: Path) -> VariantConfig:
         return cls.model_validate(yaml.safe_load(path.read_text("utf-8")))
+
+
+def router_candidates(config: RouterConfig) -> tuple[VariantConfig, ...]:
+    candidates = tuple(VariantConfig.from_yaml(path) for path in config.candidates)
+    if any(candidate.router is not None for candidate in candidates):
+        raise ValueError("Router candidates must be direct Pipeline Variants")
+    if len({candidate.name for candidate in candidates}) != len(candidates):
+        raise ValueError("Router candidate names must be unique")
+    return candidates
 
 
 @dataclass(frozen=True)
@@ -159,6 +181,9 @@ class Answer:
     shown_chunk_ids: tuple[str, ...] = ()
     search_steps: int | None = None
     stop_reason: StopReason | None = None
+    chosen_variant: str | None = None
+    route_candidates: tuple[str, ...] = ()
+    used_retrieval: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +192,13 @@ class _SearchResult:
     answer_context: tuple[RetrievedChunk, ...]
     steps: int
     stop_reason: StopReason
+
+
+@dataclass(frozen=True)
+class _Routing:
+    artifact: RouterArtifact
+    embedder: Embedder
+    candidates: tuple[PipelineVariant, ...]
 
 
 def is_abstention(text: str) -> bool:
@@ -223,6 +255,15 @@ def plan_remote_run(
     index_version: str | None = None,
 ) -> RemoteRunPlan:
     """Estimate quota days without building a model or requesting any completion."""
+    if config.router is not None:
+        if retrieval_only:
+            return RemoteRunPlan(0, 0, 0)
+        plans = [
+            plan_remote_run(candidate, queries, None)
+            for candidate in router_candidates(config.router)
+        ]
+        calls = max(plan.calls for plan in plans)
+        return RemoteRunPlan(calls, 0, max(plan.days for plan in plans), upper_bound=bool(calls))
     spec = config.generation.generator
     if spec.provider != "groq" or retrieval_only:
         return RemoteRunPlan(0, 0, 0)
@@ -281,6 +322,9 @@ class PipelineVariant:
         models: ModelProvider,
         tracer: Tracer | None = None,
         cache: ResponseCache | None = None,
+        *,
+        router_embedder: Embedder | None = None,
+        index_for: Callable[[VariantConfig], ChunkIndex | None] | None = None,
     ) -> None:
         if config.uses_retrieval and index is None:
             raise ValueError(f"variant {config.name!r} retrieves but no index was given")
@@ -288,12 +332,51 @@ class PipelineVariant:
         self._index = index
         self._tracer = tracer if tracer is not None else NoOpTracer()
         self._cache = cache
+        self._routing: _Routing | None = None
+        self.generator: Generator | None = None
+        self.reranker = None
+        self._support_checker: SupportChecker | None = None
+        if config.router is not None:
+            if router_embedder is None:
+                raise ValueError("Router needs a query embedder")
+            artifact = RouterArtifact.load(config.router.artifact)
+            candidates = router_candidates(config.router)
+            if (
+                tuple(candidate.name for candidate in candidates) != artifact.candidate_order
+                or tuple(cache_key(candidate.run_config()) for candidate in candidates)
+                != artifact.candidate_config_hashes
+            ):
+                raise ValueError("Router candidates differ from the trained artifact")
+            assert config.index is not None and config.index.embedder is not None
+            features = artifact.feature_settings
+            if features.embedder != config.index.embedder:
+                raise ValueError("Router embedder settings differ from the trained artifact")
+            if (
+                features.embedder_revision is not None
+                and features.embedder_revision != model_version(router_embedder)
+            ):
+                raise ValueError("Router embedder revision differs from the trained artifact")
+            self._routing = _Routing(
+                artifact,
+                router_embedder,
+                tuple(
+                    PipelineVariant(
+                        child,
+                        index_for(child) if index_for and child.index else None,
+                        models,
+                        self._tracer,
+                        cache,
+                    )
+                    for child in candidates
+                ),
+            )
+            return
         self.generator = models.generator_for(config.generation.generator)
         if config.generation.citations.enabled and not isinstance(
             self.generator, StructuredGenerator
         ):
             raise ValueError("Citations require a generator that supports structured output")
-        self._support_checker: SupportChecker | None = (
+        self._support_checker = (
             LLMSupportChecker() if config.generation.citations.checks_support else None
         )
         rerank = config.retrieval.rerank
@@ -408,6 +491,14 @@ class PipelineVariant:
         return retrieved[: self.config.retrieval.top_k]
 
     def index_version(self) -> str | None:
+        if self._routing is not None:
+            return (
+                "router@"
+                + cache_key(
+                    self._routing.artifact.digest,
+                    [candidate.index_version() for candidate in self._routing.candidates],
+                )[:16]
+            )
         self._plan_index_version = self._index.version() if self._index is not None else None
         return self._plan_index_version
 
@@ -430,6 +521,8 @@ class PipelineVariant:
 
     def retrieve_answer(self, question: str) -> Answer:
         """Run retrieval alone and include its timings and token usage."""
+        if self._routing is not None:
+            return self._route(question, self._routing, retrieval_only=True)
         started = time.perf_counter()
         trace = AnswerTrace(self._tracer, self.config.name)
         with trace.span("retrieve_only", "CHAIN") as root:
@@ -464,6 +557,7 @@ class PipelineVariant:
             stage.seconds = 0.0
             return None
         generator = self.generator
+        assert generator is not None
         if schema is None:
             call = partial(generator.complete, system, prompt)
         else:
@@ -622,7 +716,40 @@ class PipelineVariant:
         answer_context = tuple(islice(by_rank, config.max_context_chunks))
         return _SearchResult(tuple(retrieved.values()), answer_context, steps, stop_reason)
 
+    def _route(self, question: str, routing: _Routing, *, retrieval_only: bool) -> Answer:
+        trace = AnswerTrace(self._tracer, self.config.name)
+        spec = routing.artifact.feature_settings.embedder
+        with trace.span("answer", "CHAIN") as root:
+            with trace.stage("route", "CHAIN", model=spec.model, operation="embeddings") as stage:
+                started = time.perf_counter()
+                response = query_embedding(routing.embedder, spec, question, self._cache)
+                stage.timing_adjustment = response.seconds - (time.perf_counter() - started)
+                embedding, stage.input_tokens = response.value
+                stage.cache_hit = response.cache_hit
+                candidate = routing.candidates[routing.artifact.choose(question, embedding)]
+                stage.chosen_variant = candidate.config.name
+            root.set_attribute("rag.chosen_variant", candidate.config.name)
+            result = (
+                candidate.retrieve_answer(question)
+                if retrieval_only
+                else candidate.answer(question)
+            )
+            set_chunk_ids(root, result.retrieved)
+        (route,) = trace.stages
+        return replace(
+            result,
+            input_tokens=result.input_tokens + (route.input_tokens or 0),
+            seconds=route.seconds + result.seconds,
+            stage_seconds={"route": route.seconds, **result.stage_seconds},
+            trace=(route, *result.trace),
+            chosen_variant=candidate.config.name,
+            route_candidates=routing.artifact.candidate_order,
+            used_retrieval=candidate.config.uses_retrieval,
+        )
+
     def answer(self, question: str) -> Answer:
+        if self._routing is not None:
+            return self._route(question, self._routing, retrieval_only=False)
         started = time.perf_counter()
         trace = AnswerTrace(self._tracer, self.config.name)
         with trace.span("answer", "CHAIN") as root:
@@ -708,5 +835,9 @@ def build_variant(
     models: ModelProvider,
     tracer: Tracer | None = None,
     cache: ResponseCache | None = None,
+    router_embedder: Embedder | None = None,
+    index_for: Callable[[VariantConfig], ChunkIndex | None] | None = None,
 ) -> PipelineVariant:
-    return PipelineVariant(config, index, models, tracer, cache)
+    return PipelineVariant(
+        config, index, models, tracer, cache, router_embedder=router_embedder, index_for=index_for
+    )
