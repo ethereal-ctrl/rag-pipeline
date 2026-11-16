@@ -1,9 +1,11 @@
 name: agentic
 index:
-  collection: chunks-sent-w200-o1-bge-m3
+  collection: chunks-sent-w200-o1-ctx-qwen3.5-4b-qwen3-embedding-0.6b
+  chunk_context: qwen3.5:4b
   embedder:
     provider: ollama
-    model: bge-m3
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
 retrieval:
   mode: hybrid
   top_k: 10
