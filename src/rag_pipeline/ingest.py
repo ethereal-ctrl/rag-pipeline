@@ -25,6 +25,7 @@ class ChunkContextReport:
     output_tokens: int
     truncated_articles: tuple[str, ...]
     notional_cost_usd: float | None
+    empty_contexts: int = 0
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,7 @@ def _contextualise(
         output_tokens=output_tokens,
         truncated_articles=tuple(truncated),
         notional_cost_usd=cost,
+        empty_contexts=sum(not chunk.context for chunk in chunks),
     )
 
 

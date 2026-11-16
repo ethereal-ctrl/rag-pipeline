@@ -184,12 +184,15 @@ class OllamaGenerator:
         return self._digest
 
 
+ESTIMATED_BYTES_PER_TOKEN = 3
+
+
 def estimate_tokens(
     system: str, prompt: str, max_output_tokens: int, *, conservative: bool = False
 ) -> int:
     size = len(system.encode("utf-8")) + len(prompt.encode("utf-8"))
     # Agentic Search reserves one token per byte and extra room for chat framing.
-    input_tokens = size + 128 if conservative else math.ceil(size / 3) + 32
+    input_tokens = size + 128 if conservative else math.ceil(size / ESTIMATED_BYTES_PER_TOKEN) + 32
     return input_tokens + max_output_tokens
 
 

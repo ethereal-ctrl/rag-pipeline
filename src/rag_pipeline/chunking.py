@@ -31,7 +31,7 @@ class Chunk:
 
     @property
     def index_text(self) -> str:
-        return self.text if self.context is None else f"{self.context}\n\n{self.text}"
+        return f"{self.context}\n\n{self.text}" if self.context else self.text
 
 
 def _sentences(text: str) -> list[str]:

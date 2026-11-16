@@ -90,7 +90,8 @@ def _print_ingest(report: IngestReport) -> None:
     context = report.context
     if context is not None:
         typer.echo(
-            f"  {context.chunks_contextualised} Chunks contextualised, "
+            f"  {context.chunks_contextualised} Chunks contextualised "
+            f"({context.empty_contexts} empty), "
             f"{context.cache_hits} cache hits, {context.generation_seconds:.1f} generation seconds."
         )
         typer.echo(
@@ -157,7 +158,7 @@ def ingest_command(
             )
             writer = ModelContextualiser(
                 spec,
-                models.generator_for(spec),
+                models.generator_for,
                 ResponseCache(),
                 article_tokens=article_tokens,
             )

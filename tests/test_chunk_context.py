@@ -11,7 +11,7 @@ from rag_pipeline.chunk_context import ModelContextualiser
 from rag_pipeline.evaluation import RunStore, evaluate
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import ChunkingSettings, ingest
-from rag_pipeline.models import Completion, GeneratorSpec
+from rag_pipeline.models import Completion, GeneratorSpec, estimate_tokens
 from rag_pipeline.variants import VariantConfig, build_variant
 
 SMALL = ChunkingSettings(max_words=20, overlap_sentences=0)
@@ -53,7 +53,9 @@ def contextualiser(
         context_size=context_size,
         max_output_tokens=128,
     )
-    return ModelContextualiser(spec, generator, ResponseCache(path), article_tokens=article_tokens)
+    return ModelContextualiser(
+        spec, lambda _: generator, ResponseCache(path), article_tokens=article_tokens
+    )
 
 
 def test_context_generation_resumes_by_chunk_and_keeps_each_article_prefix(
@@ -112,7 +114,35 @@ def test_article_truncation_is_reported_and_prefix_stays_shared(index: ChunkInde
     assert FTX.body not in prefixes[0]
     assert "The jury will hear" in generator.prompts[-1].split("<chunk>")[1]
     assert all(
-        len((system + prompt).encode("utf-8")) + 256 <= context_size
+        estimate_tokens(system, prompt, 128) <= context_size
+        for system, prompt in zip(generator.systems, generator.prompts, strict=True)
+    )
+
+
+@pytest.mark.parametrize(("repetitions", "truncated"), [(129, False), (260, True)])
+def test_article_prefix_uses_token_budget_with_default_window(
+    index: ChunkIndex, tmp_path: Path, repetitions: int, truncated: bool
+):
+    sentence = "The local council reviewed plans for the region's rail network. "
+    last = "At year's end, the council approved the Northbank station."
+    article = replace(FTX, body=sentence * repetitions + last)
+    generator = ContextGenerator()
+
+    report = ingest(
+        [article],
+        index,
+        ChunkingSettings(),
+        contextualiser=contextualiser(tmp_path / "responses.sqlite3", generator),
+    )
+
+    assert report.context is not None
+    assert report.context.truncated_articles == ((article.id,) if truncated else ())
+    prefix, _, chunk = generator.prompts[-1].partition("<chunk>")
+    assert (article.body in prefix) is not truncated
+    assert (last in prefix) is not truncated
+    assert last in chunk
+    assert all(
+        estimate_tokens(system, prompt, 128) <= 8192
         for system, prompt in zip(generator.systems, generator.prompts, strict=True)
     )
 
@@ -127,6 +157,60 @@ class ContextEmbedder(ConceptFakeEmbedder):
 
     def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0]
+
+
+@pytest.mark.parametrize("retry_text", [" ", "Retry context."], ids=["fallback", "recovered"])
+def test_empty_chunk_context_retries_and_is_cached(tmp_path: Path, retry_text: str):
+    calls: list[tuple[int, str]] = []
+
+    class SeededGenerator(ContextGenerator):
+        def __init__(self, seed: int) -> None:
+            super().__init__()
+            self.seed = seed
+
+        def complete(self, system: str, prompt: str) -> Completion:
+            chunk = prompt.split("<chunk>")[1]
+            calls.append((self.seed, chunk))
+            if "Sam Bankman-Fried" in chunk:
+                text = "" if self.seed == 7 else retry_text
+                return Completion(text, 100, 2)
+            return Completion("Phone news.", 100, 10)
+
+    client = QdrantClient(":memory:")
+    embedder = ContextEmbedder()
+    first = ChunkIndex(client, "first", embedder)
+    second = ChunkIndex(client, "second", embedder)
+    spec = GeneratorSpec(provider="ollama", model=MODEL, seed=7)
+    cache_path = tmp_path / "responses.sqlite3"
+
+    def generator_for(options: GeneratorSpec) -> SeededGenerator:
+        return SeededGenerator(options.seed)
+
+    writer = ModelContextualiser(spec, generator_for, ResponseCache(cache_path))
+    settings = ChunkingSettings(max_words=100)
+
+    report = ingest([FTX, PIXEL], first, settings, contextualiser=writer)
+    restarted = ingest(
+        [FTX, PIXEL],
+        second,
+        settings,
+        contextualiser=ModelContextualiser(spec, generator_for, ResponseCache(cache_path)),
+    )
+
+    assert report.chunks_written == restarted.chunks_written == 2
+    stats = report.context
+    assert stats is not None and restarted.context is not None
+    assert stats.empty_contexts == restarted.context.empty_contexts == int(not retry_text.strip())
+    assert stats.input_tokens == restarted.context.input_tokens == 300
+    assert stats.output_tokens == restarted.context.output_tokens == 14
+    assert stats.generation_seconds == restarted.context.generation_seconds
+    assert stats.cache_hits == 0 and restarted.context.cache_hits == 2
+    assert [seed for seed, _ in calls] == [7, 8, 7]
+    assert calls[0][1] == calls[1][1]
+    original = first.search_bm25("Sam Bankman-Fried", limit=1)[0]
+    assert original.text == FTX.body and original.context == retry_text.strip()
+    indexed_text = f"{retry_text}\n\n{FTX.body}" if retry_text.strip() else FTX.body
+    assert embedder.indexed_texts[0] == embedder.indexed_texts[2] == indexed_text
 
 
 @pytest.mark.parametrize("mode", ["bm25", "dense"])

@@ -84,17 +84,19 @@ uv run --no-env-file rag eval configs/variants/hybrid-rerank-context.yaml --spli
 
 Ingestion sends each Article's Chunks consecutively with the same Article prefix.
 `--context-size` sets the model's context window. `--article-tokens` caps the Article
-body using a conservative estimate, and the prefix may be shorter to leave room for the
-Chunk. Restart the same command after an interruption to reuse cached contexts. At one
-to three seconds per uncached Chunk, the full 6,759-Chunk Corpus takes roughly two to six
-hours of generation.
+body in estimated tokens, and the prefix may be shorter to leave room for the Chunk.
+An empty response is retried once with the next seed. If it stays empty, ingestion
+indexes that Chunk's original text. Restart the same command after an interruption to
+reuse cached responses. At one to three seconds per uncached Chunk, the full 6,759-Chunk
+Corpus takes roughly two to six hours of generation.
 
 BM25 and dense search index the Chunk Context followed by the original Chunk text.
 Answer generation, Citations and Evidence matching use the original text. For the plain
 comparison, use the same variant settings with the collection
 `chunks-sent-w200-o1-qwen3-embedding-0.6b`. Contextual ingest reports under `runs/ingest/`
-record each invocation's Chunk count, cache hits, original generation time and tokens,
-truncated Article IDs, and notional USD where a reference price is available.
+record each invocation's Chunk count, empty contexts, cache hits, generation time and
+tokens for all attempts, truncated Article IDs, and notional USD where a reference price
+is available.
 
 ## Citations and Abstention
 

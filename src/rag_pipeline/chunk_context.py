@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Protocol
@@ -12,7 +13,14 @@ from pydantic import TypeAdapter
 from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.chunking import Chunk
 from rag_pipeline.corpus import Article
-from rag_pipeline.models import Completion, Generator, GeneratorSpec, estimate_tokens, model_version
+from rag_pipeline.models import (
+    ESTIMATED_BYTES_PER_TOKEN,
+    Completion,
+    Generator,
+    GeneratorSpec,
+    estimate_tokens,
+    model_version,
+)
 
 DEFAULT_ARTICLE_TOKENS = 4096
 CONTEXT_OUTPUT_TOKENS = 128
@@ -52,7 +60,7 @@ class ModelContextualiser:
     def __init__(
         self,
         spec: GeneratorSpec,
-        generator: Generator,
+        generator_for: Callable[[GeneratorSpec], Generator],
         cache: ResponseCache,
         *,
         article_tokens: int = DEFAULT_ARTICLE_TOKENS,
@@ -62,7 +70,8 @@ class ModelContextualiser:
         if article_tokens < 1:
             raise ValueError("Chunk Context Article token budget must be positive")
         self._spec = spec
-        self._generator = generator
+        self._generator_for = generator_for
+        self._generator = generator_for(spec)
         self._cache = cache
         self._article_tokens = article_tokens
 
@@ -73,7 +82,7 @@ class ModelContextualiser:
     @cached_property
     def _build(self) -> ContextBuild:
         key = cache_key(
-            "chunk-context-v1",
+            "chunk-context-v2",
             SYSTEM_PROMPT,
             self._spec.model_dump(),
             self._generator.name,
@@ -98,35 +107,59 @@ class ModelContextualiser:
         header = f"<article>\n{metadata}\n"
         before_chunk = "\n</article>\n\n<chunk>\n"
         end = "\n</chunk>"
-        fixed = estimate_tokens(
+        fixed_tokens = estimate_tokens(
             SYSTEM_PROMPT,
             header + before_chunk + end,
             self._spec.max_output_tokens,
-            conservative=True,
         )
-        capacity = self._spec.context_size - fixed
-        if capacity < 1:
+        capacity_tokens = self._spec.context_size - fixed_tokens
+        if capacity_tokens < 1:
             raise ValueError("Chunk Context prompt metadata exceeds --context-size")
+        capacity_bytes = capacity_tokens * ESTIMATED_BYTES_PER_TOKEN
         chunk_bytes = [_escape(chunk.text).encode("utf-8") for chunk in chunks]
         # Reserve the longest Chunk's space once, so every request shares the Article prefix.
-        article_capacity = min(self._article_tokens, max(0, capacity - max(map(len, chunk_bytes))))
-        full_article = _escape(article.body).encode("utf-8")
-        body = full_article[:article_capacity].decode("utf-8", errors="ignore")
+        article_budget_bytes = self._article_tokens * ESTIMATED_BYTES_PER_TOKEN
+        article_capacity_bytes = min(
+            article_budget_bytes, max(0, capacity_bytes - max(map(len, chunk_bytes)))
+        )
+        full_article_bytes = _escape(article.body).encode("utf-8")
+        body = full_article_bytes[:article_capacity_bytes].decode("utf-8", errors="ignore")
         prefix = header + body + before_chunk
-        chunk_capacity = capacity - len(body.encode("utf-8"))
+        chunk_capacity_bytes = capacity_bytes - len(body.encode("utf-8"))
         responses = tuple(
-            self._complete(prefix + text[:chunk_capacity].decode("utf-8", errors="ignore") + end)
+            self._complete(
+                prefix + text[:chunk_capacity_bytes].decode("utf-8", errors="ignore") + end
+            )
             for text in chunk_bytes
         )
-        return ArticleContexts(responses, len(full_article) > article_capacity)
+        return ArticleContexts(responses, len(full_article_bytes) > article_capacity_bytes)
 
     def _complete(self, prompt: str) -> ModelResponse[Completion]:
-        key = cache_key(self.build.key, prompt)
+        first = self._attempt(prompt)
+        if first.value.text.strip():
+            return first
+        retry = self._attempt(prompt, retry=True)
+        return ModelResponse(
+            value=Completion(
+                retry.value.text.strip(),
+                first.value.input_tokens + retry.value.input_tokens,
+                first.value.output_tokens + retry.value.output_tokens,
+            ),
+            seconds=first.seconds + retry.seconds,
+            cache_hit=first.cache_hit and retry.cache_hit,
+        )
+
+    @cached_property
+    def _retry_generator(self) -> Generator:
+        spec = self._spec.model_copy(update={"seed": self._spec.seed + 1})
+        return self._generator_for(spec)
+
+    def _attempt(self, prompt: str, *, retry: bool = False) -> ModelResponse[Completion]:
+        seed = self._spec.seed + int(retry)
+        key = cache_key(self.build.key, prompt, seed)
 
         def generate() -> ModelResponse[Completion]:
-            response = measure_call(lambda: self._generator.complete(SYSTEM_PROMPT, prompt))
-            if not response.value.text.strip():
-                raise ValueError("Chunk Context model returned no context")
-            return response
+            generator = self._retry_generator if retry else self._generator
+            return measure_call(lambda: generator.complete(SYSTEM_PROMPT, prompt))
 
         return self._cache.get_or_call(key, _COMPLETION, generate)
