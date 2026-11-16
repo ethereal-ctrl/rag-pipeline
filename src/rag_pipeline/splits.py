@@ -13,6 +13,7 @@ from rag_pipeline.corpus import BenchmarkQuery
 SPLIT_NAMES = ("dev", "smoke", "test", "reserve")
 TEST_SPLITS = ("test", "test-400")
 TEST_SUBSET_SIZE = 400
+JUDGE_SAMPLE_SIZE = 300
 
 
 @dataclass(frozen=True)
@@ -62,11 +63,23 @@ def _allocate(total: int, group_sizes: dict[str, int]) -> dict[str, int]:
 
 
 def make_test_subset(queries: list[BenchmarkQuery], splits: Splits) -> tuple[str, ...]:
+    return _stratified_sample(queries, splits.test, TEST_SUBSET_SIZE)
+
+
+def make_judge_sample(
+    queries: list[BenchmarkQuery], test_subset: tuple[str, ...]
+) -> tuple[str, ...]:
+    return _stratified_sample(queries, test_subset, JUDGE_SAMPLE_SIZE)
+
+
+def _stratified_sample(
+    queries: list[BenchmarkQuery], population: tuple[str, ...], size: int
+) -> tuple[str, ...]:
     by_id = {q.id: q for q in queries}
     by_type: dict[str, list[str]] = defaultdict(list)
-    for id_ in sorted(splits.test):
+    for id_ in sorted(population):
         by_type[by_id[id_].query_type].append(id_)
-    counts = _allocate(TEST_SUBSET_SIZE, {name: len(ids) for name, ids in by_type.items()})
+    counts = _allocate(size, {name: len(ids) for name, ids in by_type.items()})
     rng = random.Random(DEFAULT_SEED)
     return tuple(id_ for name in sorted(by_type) for id_ in rng.sample(by_type[name], counts[name]))
 
@@ -81,6 +94,19 @@ def load_test_subset(path: Path, splits: Splits) -> tuple[str, ...]:
         or not set(ids).issubset(splits.test)
     ):
         raise ValueError("invalid committed 400-query Test Split subset")
+    return ids
+
+
+def load_judge_sample(path: Path, test_subset: tuple[str, ...]) -> tuple[str, ...]:
+    data = json.loads(path.read_text("utf-8"))
+    ids: tuple[str, ...] = tuple(data["judge-300"])
+    if (
+        data["seed"] != DEFAULT_SEED
+        or len(ids) != JUDGE_SAMPLE_SIZE
+        or len(set(ids)) != JUDGE_SAMPLE_SIZE
+        or not set(ids).issubset(test_subset)
+    ):
+        raise ValueError("invalid committed Judge sample of the 400-query Test Split subset")
     return ids
 
 

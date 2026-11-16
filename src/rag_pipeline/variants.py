@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -53,7 +52,7 @@ from rag_pipeline.models import (
     model_version,
     query_embedding,
 )
-from rag_pipeline.rate_limit import DAY, MINUTE, groq_limits
+from rag_pipeline.rate_limit import groq_limits, quota_days
 from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids
 
@@ -301,16 +300,7 @@ def plan_remote_run(
         if config.uses_retrieval:
             call_tokens += ESTIMATED_TOKENS_PER_CHUNK * config.generation.context_chunks
         tokens += call_tokens * (len(stages) - cached_calls)
-    remaining = calls - cached
-    minutes_per_day = DAY // MINUTE
-    days = math.ceil(
-        max(
-            remaining / limits.requests_per_day,
-            remaining / (limits.requests_per_minute * minutes_per_day),
-            tokens / limits.tokens_per_day,
-            tokens / (limits.tokens_per_minute * minutes_per_day),
-        )
-    )
+    days = quota_days(limits, calls - cached, tokens)
     return RemoteRunPlan(calls, cached, days, upper_bound=agentic is not None)
 
 

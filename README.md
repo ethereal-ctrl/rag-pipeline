@@ -179,6 +179,49 @@ and features for word count, digit count, years and comparison words.
 The evaluation records each chosen variant and reports `routed_share[<variant>]`.
 Its latency and embedding token totals include the `route` stage.
 
+## Judge and calibration
+
+The [fixed Judge sample](data/judge-300.json) contains 300 queries stratified by query
+type within `test-400`. Judge completed Test Split runs to compare the same questions
+across local and Groq variants. The Judge reads saved answers and uses Groq
+`openai/gpt-oss-120b` for ambiguous correctness and Citation support.
+
+```bash
+uv run --no-env-file rag judge RUN_ID --dry-run
+uv run --no-env-file rag judge RUN_ID --dry-run --shared-tokens 800000 --shared-calls 400
+uv run --env-file .env rag judge RUN_ID
+uv run --no-env-file rag table RUN_ID --metrics judge_accuracy,judge_flipped,citation_support_rate
+```
+
+The dry run needs no key. Use the optional shared token and call estimates for upcoming
+GPT-OSS-120B generation runs. They use the same 200,000-token daily budget and persistent
+limiter as the Judge. The same Judge command resumes after interruption using the response
+cache. Keep the cache when running over several days.
+
+Containment-correct answers keep their primary score. The Judge can accept an ambiguous
+answer that containment missed. The flipped share uses all containment-incorrect sampled
+answers. For a non-abstained answer to a non-Null Query, Judge support covers the final cited
+statements and uses only their cited text. Malformed verdicts are recorded as null and
+count as no new correct or supported decisions. The verdicts and metrics with bootstrap
+intervals are stored in `judge.jsonl` and `judge-metrics.json` alongside the run.
+Older runs need the matching local Corpus when their saved records lack cited text.
+
+Export from completed Dev runs, including a citation variant to cover both tasks.
+With no run IDs, the command uses all completed Dev runs with scored answers.
+
+```bash
+uv run --no-env-file rag judge calibration export DEV_RUN_ID CITED_DEV_RUN_ID
+# Follow data/judge-calibration/LABELLING.md to create labels.jsonl.
+uv run --env-file .env rag judge calibration report
+```
+
+Copy the exported cases into a subscription chat by hand for one-time labelling, then
+independently check at least 50 cases as the author. Keep both labels where they differ.
+Commit the cases and validated labels under `data/judge-calibration/`. The calibration
+command calls the Groq Judge and writes JSON and Markdown agreement reports under
+`runs/judge/`, with accuracy and Cohen's kappa for correctness and support. The reports
+also include subscription versus author agreement on the double-checked cases.
+
 ## Development
 
 ```bash

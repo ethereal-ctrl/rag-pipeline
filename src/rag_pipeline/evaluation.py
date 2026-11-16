@@ -93,6 +93,7 @@ class QueryRecord:
     stop_reason: StopReason | None = None
     chosen_variant: str | None = None
     route_candidates: tuple[str, ...] = ()
+    cited_chunk_texts: dict[str, str] = field(default_factory=dict[str, str])
 
 
 @dataclass(frozen=True)
@@ -219,6 +220,7 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
     )
     scored = uses_retrieval and not query.is_null
     ranks = _rank_scores(query, answer.retrieved) if scored else None
+    cited_ids = {id_ for citation in answer.citations for id_ in citation.chunk_ids}
     return QueryRecord(
         query_id=query.id,
         query_type=query.query_type,
@@ -245,6 +247,9 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         stop_reason=answer.stop_reason,
         chosen_variant=answer.chosen_variant,
         route_candidates=answer.route_candidates,
+        cited_chunk_texts={
+            chunk.chunk_id: chunk.text for chunk in answer.retrieved if chunk.chunk_id in cited_ids
+        },
         citation_counts=(
             _citation_counts(query, answer)
             if not retrieval_only
@@ -364,6 +369,15 @@ def bootstrap_intervals(
     *,
     metric_fn: Callable[[list[QueryRecord]], dict[str, float]] = aggregate,
 ) -> dict[str, tuple[float, float]]:
+    return bootstrap_metric_intervals(records, metric_fn, samples, seed)
+
+
+def bootstrap_metric_intervals[T](
+    records: list[T],
+    metric_fn: Callable[[list[T]], dict[str, float]],
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict[str, tuple[float, float]]:
     """Percentile bootstrap 95% intervals, resampling queries with replacement."""
     rng = random.Random(seed)
     draws: dict[str, list[float]] = {}
@@ -476,11 +490,19 @@ class RunStore:
         return (run_dir / "metrics.json").exists()
 
     def completed(self, split: str) -> list[dict[str, Any]]:
+        return [meta for _, meta in self._completed_runs(split)]
+
+    def completed_answer_ids(self, split: str) -> list[str]:
         return [
-            self._meta(d)
-            for d in self._run_dirs()
-            if self._is_complete(d) and self._meta(d)["split"] == split
+            run_id for run_id, meta in self._completed_runs(split) if not meta.get("retrieval_only")
         ]
+
+    def _completed_runs(self, split: str):
+        for run_dir in self._run_dirs():
+            if self._is_complete(run_dir):
+                meta = self._meta(run_dir)
+                if meta["split"] == split:
+                    yield run_dir.name, meta
 
     def find_incomplete(self, fingerprint: str) -> str | None:
         for run_dir in reversed(self._run_dirs()):
@@ -665,6 +687,7 @@ def export_records(result: RunResult, path: Path) -> Path:
             "shown_chunk_ids",
             "citation_counts",
             "route_candidates",
+            "cited_chunk_texts",
         ):
             row[name] = json.dumps(row[name])
     with path.open("w", newline="", encoding="utf-8") as out:
