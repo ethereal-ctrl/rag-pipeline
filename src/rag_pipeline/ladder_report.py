@@ -16,8 +16,9 @@ from rag_pipeline.evaluation import (
     answer_is_correct,
     bootstrap_intervals,
     compare_runs,
+    write_text,
 )
-from rag_pipeline.judge_evaluation import with_judge_metrics, write_text
+from rag_pipeline.judge_evaluation import with_judge_metrics
 from rag_pipeline.ladder import HeldOutSplit, Ladder, LadderProvider, LadderRung, ladder_status
 from rag_pipeline.report import metric_cell, metric_number
 from rag_pipeline.variants import ABSTENTION_TEXT, VariantConfig

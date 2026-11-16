@@ -224,6 +224,8 @@ def run_ladder(
     store: RunStore,
     queries: list[BenchmarkQuery],
     build: Callable[[LadderRung], Evaluable],
+    *,
+    workers: int = 1,
 ) -> Iterator[RunResult]:
     for rung in rungs:
         status = _status(rung, split, store.runs(), None)
@@ -232,7 +234,8 @@ def run_ladder(
         if status.state == "blocked":
             raise RuntimeError(f"{rung.label}: {status.missing[0]}")
         try:
-            yield evaluate(build(rung), queries, split, store)
+            remote = rung.config.generation.generator.remote_provider is not None
+            yield evaluate(build(rung), queries, split, store, workers=workers if remote else 1)
         except Exception as error:
             raise RuntimeError(f"{rung.label} ({rung.config.name}): {error}") from error
 

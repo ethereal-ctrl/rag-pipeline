@@ -6,6 +6,7 @@ import json
 import math
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
 from itertools import chain, islice, zip_longest
@@ -52,11 +53,12 @@ from rag_pipeline.models import (
     StructuredGenerator,
     estimate_tokens,
     generation_key,
+    local_model_lock,
     model_version,
     query_embedding,
     remote_instructions,
 )
-from rag_pipeline.rate_limit import quota_hours, remote_limits
+from rag_pipeline.rate_limit import quota_hours, quota_wait_seconds, remote_limits, validate_workers
 from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids, span_trace_id
 
@@ -194,6 +196,11 @@ class VariantConfig(_Frozen):
             if spec is not None and spec.remote_provider is not None
         )
 
+    def validate_workers(self, workers: int, *, retrieval_only: bool = False) -> None:
+        spec = self.generation.generator
+        provider = spec.remote_provider if not retrieval_only and self.router is None else None
+        validate_workers(workers, provider, spec.model)
+
     def run_config(self) -> dict[str, Any]:
         config = self.model_dump(mode="json", exclude={"index": {"chunk_context"}})
         if not self.uses_retrieval and self.router is None:
@@ -305,6 +312,7 @@ class RemoteRunPlan:
     cached: int
     hours: float
     upper_bound: bool = False
+    quota_wait_seconds: float = 0
 
     @property
     def days(self) -> int:
@@ -326,7 +334,13 @@ def plan_remote_run(
             for candidate in router_candidates(config.router)
         ]
         calls = max(plan.calls for plan in plans)
-        return RemoteRunPlan(calls, 0, max(plan.hours for plan in plans), upper_bound=bool(calls))
+        return RemoteRunPlan(
+            calls,
+            0,
+            max(plan.hours for plan in plans),
+            upper_bound=bool(calls),
+            quota_wait_seconds=max(plan.quota_wait_seconds for plan in plans),
+        )
     spec = config.generation.generator
     hyde = config.retrieval.hyde_generator
     if hyde is not None and hyde.remote_provider is None:
@@ -393,15 +407,16 @@ def plan_remote_run(
             # The LLM stages share the cap for an Agentic Search answer.
             tokens = hyde_tokens
         pending[hyde_model] = (previous_calls + expansion_calls - hyde_cached, tokens)
-    hours = max(
-        quota_hours(remote_limits(provider, model), calls, tokens)
+    workload = [
+        (remote_limits(provider, model), calls, tokens)
         for (provider, model), (calls, tokens) in pending.items()
-    )
+    ]
     return RemoteRunPlan(
         answer_calls + expansion_calls,
         answer_cached + hyde_cached,
-        hours,
+        max(quota_hours(*item) for item in workload),
         upper_bound=agentic is not None,
+        quota_wait_seconds=max(quota_wait_seconds(*item) for item in workload),
     )
 
 
@@ -487,7 +502,10 @@ class PipelineVariant:
         top_k = max(retrieval.top_k, retrieval.rerank.candidates if retrieval.rerank else 0)
         embedding = None
         index_config = self.config.index
-        if self._cache is not None and retrieval.mode in ("dense", "hybrid"):
+        serialized_embedding = (
+            self._cache is not None or self.config.generation.generator.remote_provider is not None
+        )
+        if serialized_embedding and retrieval.mode in ("dense", "hybrid"):
             assert index_config is not None and index_config.embedder is not None
             started = time.perf_counter()
             response = self._index.cached_embedding(dense_query, index_config.embedder, self._cache)
@@ -591,13 +609,17 @@ class PipelineVariant:
                 stage.seconds = 0.0
         rerank = self.config.retrieval.rerank
         if rerank is not None:
-            with trace.stage(
-                f"rerank{suffix}",
-                "RERANKER",
-                model=rerank.reranker.model,
-                operation="rerank",
-                sub_query=sub_query,
-            ) as stage:
+            spec = rerank.reranker
+            with (
+                local_model_lock(spec.provider, spec.model),
+                trace.stage(
+                    f"rerank{suffix}",
+                    "RERANKER",
+                    model=spec.model,
+                    operation="rerank",
+                    sub_query=sub_query,
+                ) as stage,
+            ):
                 retrieved = stage.chunks = self._rerank(question, retrieved, stage)
         return retrieved[: self.config.retrieval.top_k]
 
@@ -705,33 +727,43 @@ class PipelineVariant:
         else:
             assert isinstance(generator, StructuredGenerator)
             call = partial(generator.complete_structured, system, prompt, schema)
-        if self._cache is None:
+        guard = (
+            local_model_lock(spec.provider, spec.model)
+            if spec.remote_provider is None
+            else nullcontext()
+        )
+        queued_at = time.perf_counter()
+        with guard:
             started = time.perf_counter()
-            completion = call()
-            if completion.call_seconds is not None:
-                stage.timing_adjustment = completion.call_seconds - (time.perf_counter() - started)
-        else:
-            key = generation_key(spec, generator.name, model_version(generator), system, prompt)
-            if schema is not None:
-                key = cache_key(key, schema)
+            stage.timing_adjustment -= started - queued_at
+            if self._cache is None:
+                completion = call()
+                if completion.call_seconds is not None:
+                    stage.timing_adjustment -= (
+                        time.perf_counter() - started - completion.call_seconds
+                    )
+            else:
+                key = generation_key(spec, generator.name, model_version(generator), system, prompt)
+                if schema is not None:
+                    key = cache_key(key, schema)
 
-            def generate() -> ModelResponse[Completion]:
-                result = measure_call(call)
-                seconds = result.value.call_seconds
-                return result if seconds is None else ModelResponse(result.value, seconds)
+                def generate() -> ModelResponse[Completion]:
+                    result = measure_call(call)
+                    seconds = result.value.call_seconds
+                    return result if seconds is None else ModelResponse(result.value, seconds)
 
-            response = self._cache.get_or_call(key, _COMPLETION_ADAPTER, generate)
-            stage.seconds = response.seconds
-            stage.cache_hit = response.cache_hit
-            completion = response.value
-            if (
-                spec.remote_provider is not None
-                and not stage_name.startswith("hyde")
-                and self.config.uses_retrieval
-                and (version := self._plan_index_version) is not None
-            ):
-                plan_key = _generation_plan_key(self.config, version, question)
-                self._cache.remember_plan(_stage_plan_key(plan_key, stage_name), key)
+                response = self._cache.get_or_call(key, _COMPLETION_ADAPTER, generate)
+                stage.seconds = response.seconds
+                stage.cache_hit = response.cache_hit
+                completion = response.value
+                if (
+                    spec.remote_provider is not None
+                    and not stage_name.startswith("hyde")
+                    and self.config.uses_retrieval
+                    and (version := self._plan_index_version) is not None
+                ):
+                    plan_key = _generation_plan_key(self.config, version, question)
+                    self._cache.remember_plan(_stage_plan_key(plan_key, stage_name), key)
         stage.set_completion(completion)
         return (
             completion

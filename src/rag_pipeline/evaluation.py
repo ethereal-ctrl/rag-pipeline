@@ -14,6 +14,8 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from threading import Lock
 from typing import Any, Protocol, runtime_checkable
 
 from rag_pipeline.agentic import StopReason
@@ -22,6 +24,7 @@ from rag_pipeline.corpus import NULL_QUERY_TYPE, BenchmarkQuery
 from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Generator
+from rag_pipeline.parallel import completed_work
 from rag_pipeline.splits import TEST_SPLITS
 from rag_pipeline.tracing import StageTrace
 from rag_pipeline.variants import Answer, VariantConfig
@@ -489,6 +492,22 @@ def _record_from_row(row: dict[str, Any]) -> QueryRecord:
     return QueryRecord(**row)
 
 
+def write_text(path: Path, content: str) -> None:
+    """Replace generated output atomically, including when a previous run was interrupted."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    destination = None
+    try:
+        with NamedTemporaryFile(
+            dir=path.parent, mode="w", encoding="utf-8", delete=False
+        ) as temporary:
+            destination = Path(temporary.name)
+            temporary.write(content)
+        destination.replace(path)
+    finally:
+        if destination is not None:
+            destination.unlink(missing_ok=True)
+
+
 class RunStore:
     """Append-only store of evaluation runs, one directory per run.
 
@@ -499,6 +518,7 @@ class RunStore:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._append_lock = Lock()
 
     def _run_dirs(self) -> list[Path]:
         if not self.root.exists():
@@ -544,33 +564,41 @@ class RunStore:
     def begin(self, run_id: str, meta: dict[str, Any]) -> None:
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        (run_dir / "meta.json").write_text(json.dumps(meta, indent=1), "utf-8")
         (run_dir / "records.jsonl").touch()
+        write_text(run_dir / "meta.json", json.dumps(meta, indent=1))
 
-    def records_so_far(self, run_id: str) -> list[QueryRecord]:
-        lines = (self.root / run_id / "records.jsonl").read_text("utf-8").splitlines()
+    def records_so_far(self, run_id: str, *, repair: bool = False) -> list[QueryRecord]:
         records: list[QueryRecord] = []
-        for line in lines:
-            try:
-                records.append(_record_from_row(json.loads(line)))
-            except json.JSONDecodeError:
-                break  # a torn final line from a crash mid-write
+        path = self.root / run_id / "records.jsonl"
+        with self._append_lock, path.open("r+b" if repair else "rb") as data:
+            offset = 0
+            for line in data:
+                try:
+                    if not line.endswith(b"\n"):
+                        break
+                    records.append(_record_from_row(json.loads(line)))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    break  # A crash can interrupt the final line, including a UTF-8 character.
+                offset += len(line)
+            if repair:
+                data.truncate(offset)
         return records
 
     def append(self, run_id: str, record: QueryRecord) -> None:
-        with (self.root / run_id / "records.jsonl").open("a", encoding="utf-8") as out:
-            out.write(json.dumps(asdict(record)) + "\n")
+        line = json.dumps(asdict(record)) + "\n"
+        path = self.root / run_id / "records.jsonl"
+        with self._append_lock, path.open("a", encoding="utf-8") as out:
+            out.write(line)
             out.flush()
 
     def finish(self, result: RunResult) -> None:
         run_dir = self.root / result.run_id
-        records_file = run_dir / "records.jsonl"
-        records_file.write_text(
-            "".join(json.dumps(asdict(r)) + "\n" for r in result.records), "utf-8"
+        write_text(
+            run_dir / "records.jsonl", "".join(json.dumps(asdict(r)) + "\n" for r in result.records)
         )
-        (run_dir / "meta.json").write_text(json.dumps(result.meta, indent=1), "utf-8")
-        (run_dir / "intervals.json").write_text(json.dumps(result.intervals, indent=1), "utf-8")
-        (run_dir / "metrics.json").write_text(json.dumps(result.metrics, indent=1), "utf-8")
+        write_text(run_dir / "meta.json", json.dumps(result.meta, indent=1))
+        write_text(run_dir / "intervals.json", json.dumps(result.intervals, indent=1))
+        write_text(run_dir / "metrics.json", json.dumps(result.metrics, indent=1))
 
     def load(self, run_id: str) -> RunResult:
         run_dir = self.root / run_id
@@ -638,6 +666,7 @@ def evaluate(
     *,
     allow_rescore: bool = False,
     retrieval_only: bool = False,
+    workers: int = 1,
 ) -> RunResult:
     """Score a Pipeline Variant on a split, resuming an interrupted identical run if present.
 
@@ -645,6 +674,7 @@ def evaluate(
     Split); it is refused on the Test Split, which is scored once with the whole pipeline.
     """
     config = variant.config
+    config.validate_workers(workers, retrieval_only=retrieval_only)
     scope = variant.evaluation_scope() if isinstance(variant, _ScopedEvaluation) else None
     if scope is not None:
         if split != scope.split or retrieval_only:
@@ -683,22 +713,37 @@ def evaluate(
                 "rescored": allow_rescore and split in TEST_SPLITS,
                 "retrieval_only": retrieval_only,
                 "cache_enabled": cache_enabled,
+                "workers": workers,
                 **(scope.provenance if scope is not None else {}),
                 **({"query_types": list(scope.query_types)} if scope is not None else {}),
             },
         )
-    done = {r.query_id: r for r in store.records_so_far(run_id)}
+    meta = store.load_meta(run_id)
+    wall_start = time.perf_counter()
+    done = {r.query_id: r for r in store.records_so_far(run_id, repair=True)}
+    remaining: dict[str, BenchmarkQuery] = {}
     for query in queries:
         if query.id not in done:
-            record = _score(query, variant, retrieval_only)
-            store.append(run_id, record)
-            done[query.id] = record
+            remaining.setdefault(query.id, query)
+
+    def score(query: BenchmarkQuery) -> QueryRecord:
+        record = _score(query, variant, retrieval_only)
+        store.append(run_id, record)
+        return record
+
+    try:
+        for record in completed_work(remaining.values(), score, workers):
+            done[record.query_id] = record
+    finally:
+        meta["workers"] = workers
+        meta["wall_seconds"] = meta.get("wall_seconds", 0.0) + (time.perf_counter() - wall_start)
+        write_text(store.root / run_id / "meta.json", json.dumps(meta, indent=1))
     prices = load_prices()
     records = [done[q.id] for q in queries]
     records = [
         replace(record, notional_cost_usd=notional_cost(record.trace, prices)) for record in records
     ]
-    meta = {**store.load_meta(run_id), "finished_at": datetime.now(UTC).isoformat()}
+    meta["finished_at"] = datetime.now(UTC).isoformat()
     priced_models = {
         stage.model
         for record in records

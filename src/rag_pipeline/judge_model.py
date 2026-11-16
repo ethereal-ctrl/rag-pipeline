@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
+from threading import Lock
 from typing import Protocol
 
 import yaml
@@ -123,18 +124,22 @@ class ModelJudge:
         self.spec = spec
         self._generator_for = generator_for
         self._cache = cache
+        self._generator_lock = Lock()
 
     @cached_property
     def _generator(self) -> StructuredGenerator:
         return self._generator_for(self.spec)
 
     def judge(self, request: JudgeRequest) -> JudgeVerdict:
+        def complete() -> Completion:
+            with self._generator_lock:
+                generator = self._generator
+            return generator.complete_structured(_SYSTEM, request.prompt(), _SCHEMA)
+
         response = self._cache.get_or_call(
             request.cache_key(self.spec),
             _COMPLETION,
-            lambda: measure_call(
-                lambda: self._generator.complete_structured(_SYSTEM, request.prompt(), _SCHEMA)
-            ),
+            lambda: measure_call(complete),
         )
         try:
             parsed = _Response.model_validate_json(response.value.text)

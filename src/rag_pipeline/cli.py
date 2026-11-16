@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -85,7 +86,7 @@ from rag_pipeline.ladder import (
 )
 from rag_pipeline.ladder_report import write_ladder_report
 from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels, missing_remote_keys
-from rag_pipeline.rate_limit import remote_limits
+from rag_pipeline.rate_limit import remote_limits, validate_workers
 from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.router_training import RouterTrainingConfig, train_router
 from rag_pipeline.splits import (
@@ -143,6 +144,11 @@ app.add_typer(judge_app, name="judge", help="Grade a stored run with `rag judge 
 judge_app.add_typer(calibration_app, name="calibration", help="Calibrate the Judge on Dev cases.")
 
 QdrantUrl = Annotated[str, typer.Option(envvar="QDRANT_URL")]
+Workers = Annotated[int, typer.Option(min=1, help="Maximum concurrent remote jobs.")]
+CallLatency = Annotated[
+    float, typer.Option(min=0.001, help="Seconds per uncached call for dry-run estimates.")
+]
+DEFAULT_CALL_LATENCY = 35.0
 
 
 @data_app.command("fetch")
@@ -361,6 +367,8 @@ def eval_command(
         bool, typer.Option(help="Estimate remote calls without running any models.")
     ] = False,
     qdrant_url: QdrantUrl = "http://localhost:6333",
+    workers: Workers = 1,
+    call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
     splits = (*SPLIT_NAMES, "test-400")
@@ -372,6 +380,7 @@ def eval_command(
         raise typer.BadParameter("--retrieval-only is not allowed on the Test Split")
     config = VariantConfig.from_yaml(variant_file)
     try:
+        config.validate_workers(workers, retrieval_only=retrieval_only)
         if dry_run:
             candidates = (config,) if config.router is None else router_candidates(config.router)
             remote = any(
@@ -379,7 +388,9 @@ def eval_command(
                 for candidate in candidates
             )
             queries = _split_queries(split)[:limit] if remote else []
-            _print_remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
+            _print_remote_plan(
+                config, queries, qdrant_url, retrieval_only, no_cache, workers, call_latency
+            )
             return
         queries = _split_queries(split)[:limit]
         tracer = ctx.with_resource(cli_tracer())
@@ -393,6 +404,7 @@ def eval_command(
             RunStore(RUNS_DIR),
             allow_rescore=allow_rescore,
             retrieval_only=retrieval_only,
+            workers=workers,
         )
     except (TestSplitAlreadyScored, ValueError, HTTPError) as error:
         typer.echo(str(error), err=True)
@@ -446,6 +458,8 @@ def _print_remote_plan(
     qdrant_url: str,
     retrieval_only: bool,
     no_cache: bool,
+    workers: int,
+    call_latency: float,
 ) -> None:
     plan = _remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
     label = "Remote calls before cache"
@@ -457,6 +471,27 @@ def _print_remote_plan(
     typer.echo(f"Remote calls needed       {plan.calls - plan.cached}")
     typer.echo(f"Estimated quota hours      {plan.hours:.3f}")
     typer.echo(f"Estimated quota days       {plan.days}")
+    _print_worker_estimate(
+        plan.calls - plan.cached,
+        plan.quota_wait_seconds,
+        workers,
+        call_latency,
+        gemini=config.generation.generator.provider == "gemini",
+    )
+
+
+def _print_worker_estimate(
+    calls: int, quota_wait: float, workers: int, call_latency: float, *, gemini: bool
+) -> float:
+    if not math.isfinite(call_latency):
+        raise ValueError("--call-latency must be finite.")
+    seconds = max(math.ceil(calls / workers) * call_latency, quota_wait)
+    typer.echo(
+        f"Estimated remote wall time  {seconds:.1f} s ({workers} workers, {call_latency:g} s/call)"
+    )
+    if gemini:
+        typer.echo("Gemma recommendation       --workers 8")
+    return seconds
 
 
 def _index_for(config: VariantConfig, models: LocalModels, qdrant_url: str) -> ChunkIndex | None:
@@ -547,6 +582,8 @@ def judge_command(
         int, typer.Option(min=0, help="Other planned calls sharing the provider's quota.")
     ] = 0,
     judge_config: Path = JUDGE_CONFIG,
+    workers: Workers = 1,
+    call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
     """Grade the fixed Judge sample in a completed run."""
     store = RunStore(RUNS_DIR)
@@ -554,6 +591,7 @@ def judge_command(
     try:
         sample = _judge_sample()
         spec = load_judge_spec(judge_config)
+        validate_workers(workers, spec.remote_provider, spec.model)
         if dry_run:
             saved_run = load_answer_run(store, run_id)
             check_judge_family(spec, generator_models(saved_run), run_id)
@@ -577,11 +615,18 @@ def judge_command(
                 typer.echo(f"{spec.provider.title()} token quota  {plan.tokens_per_day:,}/day")
             if plan.tokens_per_month is not None:
                 typer.echo(f"{spec.provider.title()} token quota  {plan.tokens_per_month:,}/month")
+            _print_worker_estimate(
+                plan.calls - plan.cached,
+                plan.quota_wait_seconds,
+                workers,
+                call_latency,
+                gemini=spec.provider == "gemini",
+            )
             return
         if shared_tokens or shared_calls:
             raise ValueError("--shared-tokens and --shared-calls are only used with --dry-run.")
         judge = LocalModels().judge_for(ResponseCache(CACHE_FILE), spec)
-        report = judge_run(store, run_id, sample, judge, chunks=lookup)
+        report = judge_run(store, run_id, sample, judge, chunks=lookup, workers=workers)
     except (OSError, ValueError, HTTPError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
@@ -720,12 +765,18 @@ def ladder_status_command(
 
 
 def _print_ladder_estimate(
-    rungs: tuple[LadderRung, ...], split: HeldOutSplit, store: RunStore, qdrant_url: str
+    rungs: tuple[LadderRung, ...],
+    split: HeldOutSplit,
+    store: RunStore,
+    qdrant_url: str,
+    workers: int,
+    call_latency: float,
 ) -> None:
     count = len(_split_ids(split))
     estimates = estimate_ladder(rungs, split, store, count)
     total = 0.0
     quota_hours = 0.0
+    remote_seconds = 0.0
     pending = unknown = quota_days = 0
     queries: list[BenchmarkQuery] | None = None
     for estimate in estimates:
@@ -757,10 +808,20 @@ def _print_ladder_estimate(
                 f"{plan.calls - plan.cached} calls after cache, "
                 f"{plan.hours:.3f} quota hours, {plan.days} quota day(s){upper}"
             )
+            provider = status.rung.config.generation.generator.remote_provider
+            if provider is not None:
+                remote_seconds += _print_worker_estimate(
+                    plan.calls - plan.cached,
+                    plan.quota_wait_seconds,
+                    workers,
+                    call_latency,
+                    gemini=provider == "gemini",
+                )
     typer.echo(f"Estimated wall time  {total:.1f} s across {pending - unknown} rung(s)")
     if unknown:
         typer.echo(f"Rungs without a Dev estimate  {unknown}")
     if split == "test-400":
+        typer.echo(f"Sum of per-rung remote wall time estimates  {remote_seconds:.1f} s")
         typer.echo(f"Sum of per-rung remote quota hour estimates  {quota_hours:.3f}")
         typer.echo(f"Sum of per-rung remote quota day estimates  {quota_days}")
 
@@ -772,13 +833,18 @@ def ladder_run_command(
     dry_run: bool = False,
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
     provider: Literal["groq", "gemma"] | None = None,
+    workers: Workers = 1,
+    call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
     """Run unfinished rungs in order using the normal held-out score guard."""
     try:
         rungs = Ladder.load(LADDER_FILE).for_split(split, provider)
+        for rung in rungs:
+            if rung.config.generation.generator.remote_provider is not None:
+                rung.config.validate_workers(workers)
         store = RunStore(RUNS_DIR)
         if dry_run:
-            _print_ladder_estimate(rungs, split, store, qdrant_url)
+            _print_ladder_estimate(rungs, split, store, qdrant_url, workers, call_latency)
             return
         statuses = ladder_status(rungs, split, store)
         if all(row.state == "complete" for row in statuses):
@@ -798,7 +864,7 @@ def ladder_run_command(
             typer.echo(f"Evaluating {rung.label} ({rung.config.name}) on {split}.")
             return _evaluation_variant(rung.config, models, qdrant_url, tracer, cache)
 
-        for result in run_ladder(rungs, split, store, queries, build):
+        for result in run_ladder(rungs, split, store, queries, build, workers=workers):
             typer.echo(f"Completed {result.run_id}")
     except (OSError, ValueError, RuntimeError) as error:
         typer.echo(str(error), err=True)
@@ -831,10 +897,17 @@ def ladder_report_command(
 
 
 @graphrag_app.command("build")
-def graphrag_build(config: Path, dry_run: bool = False) -> None:
+def graphrag_build(
+    config: Path,
+    dry_run: bool = False,
+    workers: Workers = 1,
+    call_latency: CallLatency = DEFAULT_CALL_LATENCY,
+) -> None:
     """Build or resume a local LightRAG graph from the Corpus."""
     try:
         settings = GraphConfig.from_yaml(config)
+        spec = settings.extraction
+        validate_workers(workers, spec.remote_provider, spec.model)
         if dry_run:
             estimate = estimate_build(settings, load_articles(RAW_DIR))
             typer.echo(f"Articles                    {estimate.articles}")
@@ -844,8 +917,15 @@ def graphrag_build(config: Path, dry_run: bool = False) -> None:
             if estimate.quota_hours is not None:
                 typer.echo(f"Estimated quota hours       {estimate.quota_hours:.2f}")
                 typer.echo(f"Estimated quota days        {estimate.quota_days}")
+                _print_worker_estimate(
+                    estimate.llm_calls,
+                    estimate.quota_wait_seconds,
+                    workers,
+                    call_latency,
+                    gemini=spec.provider == "gemini",
+                )
             return
-        factory = load_light_rag()
+        factory = load_light_rag(workers=workers)
         articles = load_articles(RAW_DIR)
         with cli_tracer() as tracer:
             report = build_graph(

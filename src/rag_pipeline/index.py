@@ -310,7 +310,7 @@ class ChunkIndex:
         return self._embedder.embed_query(query)
 
     def cached_embedding(
-        self, query: str, spec: EmbedderSpec, cache: ResponseCache
+        self, query: str, spec: EmbedderSpec, cache: ResponseCache | None
     ) -> ModelResponse[tuple[list[float], int | None]]:
         embedder = self._embedder
         if embedder is None:
