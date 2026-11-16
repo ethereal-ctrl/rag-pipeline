@@ -139,16 +139,26 @@ class PipelineVariant:
         ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0])
         return tuple(replace(chunk, score=score) for score, chunk in ranked)
 
-    def answer(self, question: str) -> Answer:
-        started = time.perf_counter()
-        stages: dict[str, float] = {}
+    def _retrieve_timed(
+        self, question: str, stages: dict[str, float]
+    ) -> tuple[RetrievedChunk, ...]:
+        mark = time.perf_counter()
         retrieved = self._first_stage(question)
-        stages["retrieve"] = time.perf_counter() - started
+        stages["retrieve"] = time.perf_counter() - mark
         if self.reranker is not None:
             mark = time.perf_counter()
             retrieved = self._rerank(question, retrieved)
             stages["rerank"] = time.perf_counter() - mark
-        retrieved = retrieved[: self.config.retrieval.top_k]
+        return retrieved[: self.config.retrieval.top_k]
+
+    def retrieve(self, question: str) -> tuple[RetrievedChunk, ...]:
+        """The ranked Chunks this variant would show the generator, without generating."""
+        return self._retrieve_timed(question, {})
+
+    def answer(self, question: str) -> Answer:
+        started = time.perf_counter()
+        stages: dict[str, float] = {}
+        retrieved = self._retrieve_timed(question, stages)
         mark = time.perf_counter()
         if self.config.uses_retrieval:
             context = _format_context(retrieved[: self.config.generation.context_chunks])

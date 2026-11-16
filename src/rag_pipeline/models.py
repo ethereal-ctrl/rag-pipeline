@@ -28,7 +28,7 @@ class Completion:
 class EmbedderSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Literal["ollama"]
+    provider: Literal["ollama", "sentence-transformers"]
     model: str
     query_prefix: str = ""  # some embedders (e.g. Qwen3-Embedding) want an instruction
 
@@ -141,6 +141,32 @@ class OllamaEmbedder:
         return self._embed([self._spec.query_prefix + text])[0]
 
 
+class SentenceTransformersEmbedder:
+    """A bi-encoder run in-process; small models make the CI gate possible on a CPU runner."""
+
+    def __init__(self, spec: EmbedderSpec) -> None:
+        from sentence_transformers import SentenceTransformer  # heavy import, only when used
+
+        self._spec = spec
+        self._model = SentenceTransformer(spec.model)
+
+    @property
+    def name(self) -> str:
+        return f"sentence-transformers:{self._spec.model}"
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        vectors = self._model.encode(  # pyright: ignore[reportUnknownMemberType]
+            texts, batch_size=32, normalize_embeddings=True, show_progress_bar=False
+        )
+        return [[float(x) for x in row] for row in vectors]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([self._spec.query_prefix + text])[0]
+
+
 class SentenceTransformersReranker:
     """A cross-encoder run locally (Apple GPU via MPS when available)."""
 
@@ -169,6 +195,7 @@ class LocalModels:
     def __init__(self, ollama_url: str = "http://localhost:11434") -> None:
         self._ollama_url = ollama_url
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
+        self._embedders: dict[EmbedderSpec, Embedder] = {}
 
     def reranker_for(self, spec: RerankerSpec) -> SentenceTransformersReranker:
         if spec not in self._rerankers:
@@ -178,5 +205,11 @@ class LocalModels:
     def generator_for(self, spec: GeneratorSpec) -> OllamaGenerator:
         return OllamaGenerator(spec, self._ollama_url)
 
-    def embedder_for(self, spec: EmbedderSpec) -> OllamaEmbedder:
-        return OllamaEmbedder(spec, self._ollama_url)
+    def embedder_for(self, spec: EmbedderSpec) -> Embedder:
+        if spec not in self._embedders:
+            self._embedders[spec] = (
+                SentenceTransformersEmbedder(spec)
+                if spec.provider == "sentence-transformers"
+                else OllamaEmbedder(spec, self._ollama_url)
+            )
+        return self._embedders[spec]
