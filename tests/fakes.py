@@ -8,7 +8,7 @@ from typing import ClassVar, Literal
 
 from rag_pipeline.bm25 import tokenize
 from rag_pipeline.index import RetrievedChunk
-from rag_pipeline.models import Completion, GeneratorSpec
+from rag_pipeline.models import Completion, GeneratorSpec, RerankerSpec
 from rag_pipeline.variants import (
     Answer,
     GenerationConfig,
@@ -44,15 +44,23 @@ class GroundedFakeGenerator:
 
 
 class FakeModels:
-    """A model provider that hands out the same fake generator for every spec."""
+    """A model provider that hands out the same fakes for every spec."""
 
-    def __init__(self, generator: GroundedFakeGenerator) -> None:
+    def __init__(
+        self, generator: GroundedFakeGenerator, reranker: PhraseFakeReranker | None = None
+    ) -> None:
         self.generator = generator
+        self.reranker = reranker
         self.requested: list[GeneratorSpec] = []
 
     def generator_for(self, spec: GeneratorSpec) -> GroundedFakeGenerator:
         self.requested.append(spec)
         return self.generator
+
+    def reranker_for(self, spec: RerankerSpec) -> PhraseFakeReranker:
+        if self.reranker is None:
+            raise AssertionError("this test did not expect a reranker")
+        return self.reranker
 
 
 class ScriptedVariant:
@@ -125,3 +133,19 @@ class ConceptFakeEmbedder:
 
     def embed_query(self, text: str) -> list[float]:
         return self._vector(text)
+
+
+class PhraseFakeReranker:
+    """Scores a Chunk 1.0 if it contains the preferred phrase, else 0.0."""
+
+    def __init__(self, preferred_phrase: str) -> None:
+        self._phrase = preferred_phrase
+        self.calls: list[tuple[str, int]] = []
+
+    @property
+    def name(self) -> str:
+        return "fake-phrase-reranker"
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        self.calls.append((query, len(texts)))
+        return [1.0 if self._phrase in t else 0.0 for t in texts]

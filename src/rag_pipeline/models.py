@@ -42,6 +42,22 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
+class RerankerSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: Literal["sentence-transformers"]
+    model: str
+    max_length: int = 512
+    batch_size: int = 16
+
+
+class Reranker(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    def score(self, query: str, texts: list[str]) -> list[float]: ...
+
+
 class Generator(Protocol):
     @property
     def name(self) -> str: ...
@@ -51,6 +67,8 @@ class Generator(Protocol):
 
 class ModelProvider(Protocol):
     def generator_for(self, spec: GeneratorSpec) -> Generator: ...
+
+    def reranker_for(self, spec: RerankerSpec) -> Reranker: ...
 
 
 class OllamaGenerator:
@@ -123,11 +141,39 @@ class OllamaEmbedder:
         return self._embed([self._spec.query_prefix + text])[0]
 
 
+class SentenceTransformersReranker:
+    """A cross-encoder run locally (Apple GPU via MPS when available)."""
+
+    def __init__(self, spec: RerankerSpec) -> None:
+        from sentence_transformers import CrossEncoder  # heavy import, only when used
+
+        self._spec = spec
+        self._model = CrossEncoder(spec.model, max_length=spec.max_length)
+
+    @property
+    def name(self) -> str:
+        return f"sentence-transformers:{self._spec.model}"
+
+    def score(self, query: str, texts: list[str]) -> list[float]:
+        if not texts:
+            return []
+        scores = self._model.predict(  # pyright: ignore[reportUnknownMemberType]
+            [(query, t) for t in texts], batch_size=self._spec.batch_size, show_progress_bar=False
+        )
+        return [float(s) for s in scores]
+
+
 class LocalModels:
     """The runtime model provider: everything served locally (ADR 0001)."""
 
     def __init__(self, ollama_url: str = "http://localhost:11434") -> None:
         self._ollama_url = ollama_url
+        self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
+
+    def reranker_for(self, spec: RerankerSpec) -> SentenceTransformersReranker:
+        if spec not in self._rerankers:
+            self._rerankers[spec] = SentenceTransformersReranker(spec)
+        return self._rerankers[spec]
 
     def generator_for(self, spec: GeneratorSpec) -> OllamaGenerator:
         return OllamaGenerator(spec, self._ollama_url)

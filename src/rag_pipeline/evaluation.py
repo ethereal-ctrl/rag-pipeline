@@ -9,7 +9,7 @@ import math
 import random
 import re
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
@@ -57,6 +57,7 @@ class QueryRecord:
     input_tokens: int
     output_tokens: int
     seconds: float
+    stage_seconds: dict[str, float] = field(default_factory=dict[str, float])
 
 
 @dataclass(frozen=True)
@@ -160,6 +161,7 @@ def _score(query: BenchmarkQuery, variant: Evaluable) -> QueryRecord:
         input_tokens=answer.input_tokens,
         output_tokens=answer.output_tokens,
         seconds=answer.seconds,
+        stage_seconds=answer.stage_seconds,
     )
 
 
@@ -179,8 +181,8 @@ _RETRIEVAL_METRICS = {
 def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     """Corpus-level metrics from per-query records (Null Queries excluded from retrieval)."""
     metrics: dict[str, float] = {"queries": len(records)}
-    for name, field in _RETRIEVAL_METRICS.items():
-        values = [float(v) for r in records if (v := getattr(r, field)) is not None]
+    for name, attribute in _RETRIEVAL_METRICS.items():
+        values = [float(v) for r in records if (v := getattr(r, attribute)) is not None]
         if values:  # absent for Closed-Book runs and Null-Query-only samples
             metrics[name] = _mean(values)
     metrics["accuracy"] = _mean([float(r.correct) for r in records])
@@ -437,6 +439,7 @@ def export_records(result: RunResult, path: Path) -> Path:
     rows = [asdict(r) for r in result.records]
     for row in rows:
         row["retrieved_chunk_ids"] = " ".join(row["retrieved_chunk_ids"])
+        row["stage_seconds"] = json.dumps(row["stage_seconds"])
     with path.open("w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=list(rows[0]) if rows else ["query_id"])
         writer.writeheader()

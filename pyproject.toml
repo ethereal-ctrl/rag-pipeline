@@ -9,6 +9,7 @@ dependencies = [
     "pydantic>=2.10",
     "pyyaml>=6.0",
     "qdrant-client>=1.15",
+    "sentence-transformers>=5.0",
     "typer>=0.15",
 ]
 

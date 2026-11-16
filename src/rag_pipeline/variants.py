@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, Self
 
@@ -11,7 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from rag_pipeline.index import ChunkIndex, RetrievedChunk
-from rag_pipeline.models import EmbedderSpec, GeneratorSpec, ModelProvider
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, ModelProvider, RerankerSpec
 
 ABSTENTION_TEXT = "Insufficient information."
 
@@ -37,10 +37,16 @@ class IndexConfig(_Frozen):
     embedder: EmbedderSpec | None = None  # must match the embedder used at ingestion
 
 
+class RerankConfig(_Frozen):
+    reranker: RerankerSpec
+    candidates: int = 30  # first-stage Chunks re-scored by the cross-encoder
+
+
 class RetrievalConfig(_Frozen):
     mode: Literal["none", "bm25", "dense", "hybrid"]
     top_k: int = 10
     candidates: int = 50  # per arm, before Reciprocal Rank Fusion (hybrid only)
+    rerank: RerankConfig | None = None
 
 
 class GenerationConfig(_Frozen):
@@ -81,6 +87,7 @@ class Answer:
     input_tokens: int
     output_tokens: int
     seconds: float
+    stage_seconds: dict[str, float] = field(default_factory=dict[str, float])
 
 
 def is_abstention(text: str) -> bool:
@@ -105,12 +112,15 @@ class PipelineVariant:
         self.config = config
         self._index = index
         self.generator = models.generator_for(config.generation.generator)
+        rerank = config.retrieval.rerank
+        self.reranker = models.reranker_for(rerank.reranker) if rerank else None
 
-    def _retrieve(self, question: str) -> tuple[RetrievedChunk, ...]:
+    def _first_stage(self, question: str) -> tuple[RetrievedChunk, ...]:
         if self._index is None or not self.config.uses_retrieval:
             return ()
-        top_k = self.config.retrieval.top_k
-        match self.config.retrieval.mode:
+        retrieval = self.config.retrieval
+        top_k = max(retrieval.top_k, retrieval.rerank.candidates if retrieval.rerank else 0)
+        match retrieval.mode:
             case "bm25":
                 return tuple(self._index.search_bm25(question, limit=top_k))
             case "dense":
@@ -121,9 +131,25 @@ class PipelineVariant:
             case _:
                 raise ValueError(f"unsupported retrieval mode {self.config.retrieval.mode!r}")
 
+    def _rerank(
+        self, question: str, candidates: tuple[RetrievedChunk, ...]
+    ) -> tuple[RetrievedChunk, ...]:
+        assert self.reranker is not None
+        scores = self.reranker.score(question, [c.text for c in candidates])
+        ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0])
+        return tuple(replace(chunk, score=score) for score, chunk in ranked)
+
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()
-        retrieved = self._retrieve(question)
+        stages: dict[str, float] = {}
+        retrieved = self._first_stage(question)
+        stages["retrieve"] = time.perf_counter() - started
+        if self.reranker is not None:
+            mark = time.perf_counter()
+            retrieved = self._rerank(question, retrieved)
+            stages["rerank"] = time.perf_counter() - mark
+        retrieved = retrieved[: self.config.retrieval.top_k]
+        mark = time.perf_counter()
         if self.config.uses_retrieval:
             context = _format_context(retrieved[: self.config.generation.context_chunks])
             system = SYSTEM_PROMPT
@@ -131,6 +157,7 @@ class PipelineVariant:
         else:
             system, prompt = CLOSED_BOOK_SYSTEM_PROMPT, f"Question: {question}"
         completion = self.generator.complete(system, prompt)
+        stages["generate"] = time.perf_counter() - mark
         return Answer(
             text=completion.text,
             abstained=is_abstention(completion.text),
@@ -138,6 +165,7 @@ class PipelineVariant:
             input_tokens=completion.input_tokens,
             output_tokens=completion.output_tokens,
             seconds=time.perf_counter() - started,
+            stage_seconds=stages,
         )
 
 

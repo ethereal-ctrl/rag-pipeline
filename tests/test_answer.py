@@ -2,15 +2,16 @@ from pathlib import Path
 
 import pytest
 from conftest import ARTICLES, FTX, FTX_QUERY, NULL_QUERY
-from fakes import FakeModels, GroundedFakeGenerator
+from fakes import FakeModels, GroundedFakeGenerator, PhraseFakeReranker
 
 from rag_pipeline.index import ChunkIndex
 from rag_pipeline.ingest import ChunkingSettings, ingest
-from rag_pipeline.models import EmbedderSpec, GeneratorSpec
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, RerankerSpec
 from rag_pipeline.variants import (
     GenerationConfig,
     IndexConfig,
     PipelineVariant,
+    RerankConfig,
     RetrievalConfig,
     VariantConfig,
     build_variant,
@@ -151,3 +152,37 @@ def test_dense_variant_without_an_index_embedder_is_rejected():
             retrieval=RetrievalConfig(mode="dense"),
             generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
         )
+
+
+def test_reranker_reorders_first_stage_candidates(dense_index: ChunkIndex):
+    ingest(ARTICLES, dense_index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    question = "What did prosecutors say about the FTX trial and the jury?"
+    reranker = PhraseFakeReranker("The jury will hear")
+    config = VariantConfig(
+        name="hybrid-rerank",
+        index=IndexConfig(
+            collection=dense_index.collection,
+            embedder=EmbedderSpec(provider="ollama", model="fake"),
+        ),
+        retrieval=RetrievalConfig(
+            mode="hybrid",
+            top_k=2,
+            rerank=RerankConfig(
+                reranker=RerankerSpec(provider="sentence-transformers", model="fake"),
+                candidates=6,
+            ),
+        ),
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+    )
+    first_stage = _retrieval_variant("hybrid", dense_index).answer(question)
+    variant = build_variant(
+        config, index=dense_index, models=FakeModels(GroundedFakeGenerator({}), reranker)
+    )
+
+    answer = variant.answer(question)
+
+    assert "The jury will hear" not in first_stage.retrieved[0].text
+    assert "The jury will hear" in answer.retrieved[0].text
+    assert len(answer.retrieved) == 2
+    assert reranker.calls == [(question, 6)]
+    assert answer.stage_seconds.keys() == {"retrieve", "rerank", "generate"}
