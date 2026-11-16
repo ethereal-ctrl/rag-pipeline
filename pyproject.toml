@@ -5,6 +5,7 @@ description = "A measured RAG Ablation Ladder on MultiHop-RAG, running fully loc
 authors = [{ name = "Safak Top" }]
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi==0.163.1",
     "httpx>=0.28",
     "opentelemetry-api>=1.39.0",
     "opentelemetry-exporter-otlp-proto-http>=1.39.0",
@@ -16,6 +17,7 @@ dependencies = [
     "sentence-transformers>=5.0",
     "torch>=2.9",
     "typer>=0.15",
+    "uvicorn==0.54.0",
 ]
 
 [project.scripts]
