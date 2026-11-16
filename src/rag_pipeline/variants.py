@@ -151,6 +151,9 @@ class PipelineVariant:
             stages["rerank"] = time.perf_counter() - mark
         return retrieved[: self.config.retrieval.top_k]
 
+    def index_version(self) -> str | None:
+        return self._index.version() if self._index is not None else None
+
     def retrieve(self, question: str) -> tuple[RetrievedChunk, ...]:
         """The ranked Chunks this variant would show the generator, without generating."""
         return self._retrieve_timed(question, {})

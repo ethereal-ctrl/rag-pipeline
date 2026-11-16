@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -10,13 +11,36 @@ from typing import Any
 from qdrant_client import QdrantClient, models
 
 from rag_pipeline import bm25
-from rag_pipeline.chunking import Chunk
+from rag_pipeline.chunking import Chunk, ChunkingSettings
+from rag_pipeline.corpus import article_hash
 from rag_pipeline.models import Embedder
 
 BM25_VECTOR = "bm25"
 DENSE_VECTOR = "dense"
 EMBED_BATCH = 64
 _POINT_NAMESPACE = uuid.UUID("6f1c4a52-1b7e-4f3e-9a51-3f4e2b7c9d10")
+_NO_EMBEDDER = "none"
+
+
+class IndexMismatch(Exception):
+    """Raised when Chunks built with other settings or another embedder would be mixed in."""
+
+
+def index_collection(settings: ChunkingSettings, embedder_model: str | None) -> str:
+    """The collection for one chunking + embedder combination, e.g. chunks-sent-w200-o1-bge-m3.
+
+    Different combinations live side by side; the Corpus hash is not part of the name, so
+    re-ingesting a changed Corpus updates the same collection incrementally.
+    """
+    name = f"chunks-{settings.label}"
+    if embedder_model:
+        name += "-" + embedder_model.rsplit("/", 1)[-1].lower()
+    return name
+
+
+def corpus_hash(article_hashes: dict[str, str]) -> str:
+    lines = "\n".join(f"{a}:{h}" for a, h in sorted(article_hashes.items()))
+    return hashlib.sha256(lines.encode("utf-8")).hexdigest()[:12]
 
 
 @dataclass(frozen=True)
@@ -65,8 +89,64 @@ class ChunkIndex:
             vectors += self._embedder.embed_documents([c.text for c in batch])
         return vectors
 
+    @property
+    def _embedder_name(self) -> str:
+        return self._embedder.name if self._embedder else _NO_EMBEDDER
+
+    def _stored_payloads(self) -> list[dict[str, Any]]:
+        if not self._client.collection_exists(self.collection):
+            return []
+        payloads: list[dict[str, Any]] = []
+        offset: Any = None
+        while True:
+            points, offset = self._client.scroll(
+                self.collection,
+                limit=2048,
+                offset=offset,
+                with_payload=["article_id", "article_hash", "chunking", "embedder"],
+                with_vectors=False,
+            )
+            payloads += [p.payload or {} for p in points]
+            if offset is None:
+                return payloads
+
+    def stored_articles(self) -> dict[str, str | None]:
+        """Article id -> content hash of the Chunks in the index (None if built before hashing)."""
+        return {p["article_id"]: p.get("article_hash") for p in self._stored_payloads()}
+
+    def check_build(self, chunking: str) -> None:
+        """Refuse to mix Chunks from other chunking settings or another embedder."""
+        for payload in self._stored_payloads():
+            for key, expected in (("chunking", chunking), ("embedder", self._embedder_name)):
+                stored = payload.get(key)
+                if stored is not None and stored != expected:
+                    raise IndexMismatch(
+                        f"{self.collection!r} holds Chunks with {key} {stored!r}, not "
+                        f"{expected!r}; ingest into its own collection instead"
+                    )
+
+    def delete_articles(self, article_ids: Iterable[str]) -> None:
+        ids = list(article_ids)
+        if not ids or not self._client.collection_exists(self.collection):
+            return
+        self._client.delete(
+            self.collection,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[models.FieldCondition(key="article_id", match=models.MatchAny(any=ids))]
+                )
+            ),
+        )
+
+    def version(self) -> str:
+        """Collection plus Corpus hash, e.g. chunks-sent-w200-o1-bge-m3@3f9a1c0b2d4e."""
+        stored = self.stored_articles()
+        return f"{self.collection}@{corpus_hash({a: h or '' for a, h in stored.items()})}"
+
     def upsert(self, chunks: Iterable[Chunk]) -> int:
         chunks = list(chunks)
+        if not chunks:
+            return 0
         dense = self._dense_vectors(chunks)
         self._ensure_collection(len(dense[0]) if dense else None)
         points = [
@@ -84,6 +164,9 @@ class ChunkIndex:
                     "source": chunk.article.source,
                     "published_at": chunk.article.published_at,
                     "text": chunk.text,
+                    "article_hash": article_hash(chunk.article),
+                    "chunking": chunk.chunking,
+                    "embedder": self._embedder_name,
                 },
             )
             for n, chunk in enumerate(chunks)

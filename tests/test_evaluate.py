@@ -95,3 +95,12 @@ def test_run_is_stored_with_its_metadata_and_records(ingested: ChunkIndex, tmp_p
     assert loaded.meta["split"] == "smoke"
     assert loaded.meta["generator"] == "fake-grounded"
     assert "commit" in loaded.meta
+
+
+def test_every_run_records_the_index_version_it_was_scored_on(ingested: ChunkIndex, tmp_path: Path):
+    version = ingest(ARTICLES, ingested, ChunkingSettings(20, 0)).index_version
+
+    result = evaluate(_bm25_variant(ingested), QUERIES, "smoke", RunStore(tmp_path))
+
+    assert result.meta["index_version"] == version
+    assert version.startswith("fixture@")

@@ -1,6 +1,6 @@
 name: gate-bm25
 index:
-  collection: gate-chunks-sent-w200-o1-bge-small
+  collection: chunks-sent-w200-o1-bge-small-en-v1.5
 retrieval:
   mode: bm25
   top_k: 10

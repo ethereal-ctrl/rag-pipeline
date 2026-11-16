@@ -1,6 +1,6 @@
 name: gate-hybrid
 index:
-  collection: gate-chunks-sent-w200-o1-bge-small
+  collection: chunks-sent-w200-o1-bge-small-en-v1.5
   embedder:
     provider: sentence-transformers
     model: BAAI/bge-small-en-v1.5
