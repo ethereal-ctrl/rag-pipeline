@@ -73,6 +73,24 @@ dry run estimates quota days at a fresh allowance and, for retrieval variants, e
 the prompt length from the configured number of Chunks. Its cache count includes
 known prompts for the current index version.
 
+## Citations and Abstention
+
+The [cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml) asks
+for structured statements with Chunk IDs. Its support check evaluates the statements
+in one call using the cited Chunk text. The answer keeps supported statements and
+abstains if all are removed. Per-query records include shown Chunk IDs, the retained
+Citations, and the removed statements with rejection reasons.
+
+Evaluation reports Abstention on Null Queries and False Abstention on answerable
+queries. Citation validity measures the share of proposed IDs actually shown to the
+generator. Citation Evidence precision measures the share that point to a shown
+Chunk containing a Benchmark Query's Evidence fact. Evidence precision uses
+answerable queries, and both metrics are omitted when their denominator is empty.
+
+```bash
+uv run rag eval configs/variants/hybrid-rerank-cited.yaml --split smoke
+```
+
 ## Development
 
 ```bash
