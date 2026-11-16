@@ -345,6 +345,14 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
             metrics["input_tokens_per_question"] = sum(
                 stage.input_tokens or 0 for r in records for stage in r.trace
             ) / len(records)
+        generator_tokens = [
+            stage.input_tokens
+            for record in records
+            for stage in record.trace
+            if stage.name == "generate" and stage.input_tokens is not None
+        ]
+        if len(generator_tokens) == len(records):
+            metrics["generator_context_tokens_per_question"] = sum(generator_tokens) / len(records)
     return metrics
 
 

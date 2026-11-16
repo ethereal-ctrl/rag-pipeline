@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 from httpx import HTTPError
@@ -25,6 +25,7 @@ from rag_pipeline.chunk_context import (
 from rag_pipeline.chunking import ChunkingSettings
 from rag_pipeline.corpus import (
     DATASET_LICENSE,
+    Article,
     BenchmarkQuery,
     fetch_dataset,
     load_articles,
@@ -176,6 +177,31 @@ def _context_writer(
     )
 
 
+def _build_index(
+    build: IndexBuild,
+    client: QdrantClient,
+    models: LocalModels,
+    articles: list[Article],
+    *,
+    context_size: int = 8192,
+    article_tokens: int = DEFAULT_ARTICLE_TOKENS,
+) -> IngestReport:
+    embedder = models.embedder_for(build.embedder) if build.embedder else None
+    writer = (
+        _context_writer(models, build.context_model, context_size, article_tokens)
+        if build.context_model
+        else None
+    )
+    cache = ResponseCache() if build.settings.strategy == "semantic" else None
+    return ingest(
+        articles,
+        ChunkIndex(client, build.collection, embedder),
+        build.settings,
+        contextualiser=writer,
+        cache=cache,
+    )
+
+
 @app.command("ingest")
 def ingest_command(
     max_words: int = 200,
@@ -197,30 +223,46 @@ def ingest_command(
     article_tokens: Annotated[
         int, typer.Option(min=1, help="Maximum estimated tokens for the Article prefix body.")
     ] = DEFAULT_ARTICLE_TOKENS,
+    strategy: Literal["sentences", "semantic"] = "sentences",
+    semantic_percentile: Annotated[int, typer.Option(min=0, max=100)] = 90,
+    variant_file: Annotated[
+        Path | None, typer.Option(help="Use the index settings from this Pipeline Variant.")
+    ] = None,
 ) -> None:
     """Chunk and index the Corpus incrementally (BM25 always; dense vectors with --embedder)."""
-    settings = ChunkingSettings(max_words, overlap_sentences)
-    models = LocalModels()
-    dense = (
-        models.embedder_for(
-            EmbedderSpec.model_validate({"provider": embedder_provider, "model": embedder})
-        )
-        if embedder
-        else None
-    )
-    name = collection or index_collection(settings, embedder, context_model=chunk_context)
-    index = ChunkIndex(QdrantClient(url=qdrant_url), name, dense)
     try:
-        writer = None
-        if chunk_context is not None:
-            writer = _context_writer(models, chunk_context, context_size, article_tokens)
-        report = ingest(load_articles(RAW_DIR), index, settings, contextualiser=writer)
-    except (IndexMismatch, ValueError) as error:
+        if variant_file is None:
+            settings = ChunkingSettings(max_words, overlap_sentences, strategy, semantic_percentile)
+            spec = (
+                EmbedderSpec.model_validate({"provider": embedder_provider, "model": embedder})
+                if embedder
+                else None
+            )
+            name = collection or index_collection(settings, embedder, context_model=chunk_context)
+            build = IndexBuild(name, spec, settings, chunk_context)
+        else:
+            config = VariantConfig.from_yaml(variant_file)
+            if config.index is None or config.router is not None:
+                raise ValueError("Choose a Pipeline Variant with a direct index to ingest.")
+            build = IndexBuild.for_variant(config)
+        client = QdrantClient(url=qdrant_url, check_compatibility=False)
+        try:
+            report = _build_index(
+                build,
+                client,
+                LocalModels(),
+                load_articles(RAW_DIR),
+                context_size=context_size,
+                article_tokens=article_tokens,
+            )
+        finally:
+            client.close()
+    except (IndexMismatch, OSError, ValueError, HTTPError, ResponseHandlingException) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     _print_ingest(report)
     if report.context is not None:
-        path = _save_ingest_report(report, name)
+        path = _save_ingest_report(report, build.collection)
         typer.echo(f"Wrote {path}.")
 
 
@@ -246,18 +288,8 @@ def bootstrap_command(qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL) -> None:
         client = QdrantClient(url=qdrant_url, check_compatibility=False)
         try:
             for build in sorted(builds, key=lambda item: item.collection):
-                embedder = models.embedder_for(build.embedder) if build.embedder else None
-                writer = (
-                    _context_writer(models, build.context_model) if build.context_model else None
-                )
                 typer.echo(f"Ingesting {build.collection} for {name}.")
-                report = ingest(
-                    articles,
-                    ChunkIndex(client, build.collection, embedder),
-                    build.settings,
-                    contextualiser=writer,
-                )
-                _print_ingest(report)
+                _print_ingest(_build_index(build, client, models, articles))
         finally:
             client.close()
     except (IndexMismatch, OSError, ValueError, HTTPError, ResponseHandlingException) as error:
@@ -286,7 +318,7 @@ def eval_command(
         bool, typer.Option(help="Re-score a variant on the Test Split (ADR 0005).")
     ] = False,
     retrieval_only: Annotated[
-        bool, typer.Option(help="Score retrieval alone, without generating (not on test).")
+        bool, typer.Option(help="Score retrieval without forming a final answer (Dev or Smoke).")
     ] = False,
     no_cache: Annotated[
         bool, typer.Option(help="Bypass stored model responses for this run.")
@@ -308,8 +340,8 @@ def eval_command(
     try:
         if dry_run:
             candidates = (config,) if config.router is None else router_candidates(config.router)
-            remote = not retrieval_only and any(
-                candidate.generation.generator.provider == "groq" for candidate in candidates
+            remote = any(
+                candidate.uses_groq(retrieval_only=retrieval_only) for candidate in candidates
             )
             queries = _split_queries(split)[:limit] if remote else []
             _print_remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
@@ -359,14 +391,16 @@ def _print_remote_plan(
     retrieval_only: bool,
     no_cache: bool,
 ) -> None:
-    remote = (
-        config.router is None
-        and config.generation.generator.provider == "groq"
-        and not retrieval_only
-    )
+    remote = config.router is None and config.uses_groq(retrieval_only=retrieval_only)
     cache = ResponseCache() if remote and not no_cache and CACHE_FILE.exists() else None
     version = None
-    if cache is not None and config.uses_retrieval and config.index is not None:
+    if (
+        cache is not None
+        and not retrieval_only
+        and config.generation.generator.provider == "groq"
+        and config.uses_retrieval
+        and config.index is not None
+    ):
         client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
         try:
             version = ChunkIndex(client, config.index.collection).version()
@@ -546,7 +580,7 @@ def table_command(
     run_ids: list[str],
     metrics: Annotated[str, typer.Option(help="Comma-separated metric names, in column order.")] = (
         "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,"
-        "latency_p50,latency_p95,cost_per_question"
+        "generator_context_tokens_per_question,latency_p50,latency_p95,cost_per_question"
     ),
     output: Annotated[Path | None, typer.Option(help="Also write the table here.")] = None,
 ) -> None:

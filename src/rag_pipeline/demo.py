@@ -56,7 +56,11 @@ class IndexBuild:
         assert config.index is not None
         collection = config.index.collection
         match = re.match(r"chunks-sent-w([1-9]\d*)-o(\d*)(?:-|$)", collection)
-        settings = ChunkingSettings(int(match[1]), int(match[2])) if match else ChunkingSettings()
+        settings = config.index.chunking
+        if settings is None:
+            settings = (
+                ChunkingSettings(int(match[1]), int(match[2])) if match else ChunkingSettings()
+            )
         return cls(collection, config.index.embedder, settings, config.index.chunk_context)
 
     def ingest_command(self) -> str:
@@ -74,6 +78,13 @@ class IndexBuild:
                 str(self.settings.max_words),
                 "--overlap-sentences",
                 str(self.settings.overlap_sentences),
+            ]
+        if self.settings.strategy == "semantic":
+            args += [
+                "--strategy",
+                "semantic",
+                "--semantic-percentile",
+                str(self.settings.semantic_percentile),
             ]
         if self.context_model is not None:
             args += ["--chunk-context", self.context_model]

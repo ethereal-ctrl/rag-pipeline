@@ -265,6 +265,44 @@ command calls the Groq Judge and writes JSON and Markdown agreement reports unde
 `runs/judge/`, with accuracy and Cohen's kappa for correctness and support. The reports
 also include subscription versus author agreement on the double-checked cases.
 
+## Side Ablations
+
+The configs in `configs/side-ablations/` compare against Hybrid + Reranker with
+Qwen3-Embedding 0.6B, BGE-Reranker-v2-m3 over 30 candidates, and the provisional
+Qwen3.5 4B generator. Build the four collections from their Pipeline Variants and
+score all five variants on Dev. HyDE reuses the 200-word reference collection.
+
+```bash
+for variant in chunk-100 chunk-200 chunk-400 semantic; do
+  uv run --no-env-file rag ingest --variant-file "configs/side-ablations/${variant}.yaml" || break
+done
+
+for variant in chunk-100 chunk-200 chunk-400 semantic hyde; do
+  uv run --no-env-file rag eval "configs/side-ablations/${variant}.yaml" --split dev || break
+done
+```
+
+Larger Chunks can raise Evidence Recall@10 by packing more facts into the same number
+of retrieved Chunks. They also give the generator more text. The default `rag table`
+includes `generator_context_tokens_per_question`, the mean input tokens from the
+final `generate` stage including the prompt framing.
+
+Semantic chunking starts a new Chunk where adjacent sentence cosine distance exceeds
+the Article's 90th percentile or the next sentence exceeds the Chunk's 200-word budget.
+This variant uses the same one-sentence overlap setting as the reference. It carries
+the previous Chunk's last sentence across either type of boundary when it fits. A
+sentence longer than the budget stays whole in its own Chunk. Ingestion batches and
+caches the sentence embeddings and skips unchanged Articles on subsequent builds.
+
+HyDE generates a short hypothetical passage for the dense arm. By default BM25 uses
+the question. Set `retrieval.hyde.bm25: both` to search the combined question and
+passage with BM25. The answer generator receives the original question and retrieved
+Chunks as Evidence. The `hyde` stage records the extra generation time and tokens.
+[HyDE paper](https://aclanthology.org/2023.acl-long.99/)
+
+The [Side Ablations report](docs/report/side-ablations.md) has slots for the measured
+comparisons and conclusions.
+
 ## Development
 
 ```bash

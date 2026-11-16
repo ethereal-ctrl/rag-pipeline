@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from rag_pipeline.cache import ModelResponse
+from rag_pipeline.cache import ModelResponse, ResponseCache
 from rag_pipeline.chunk_context import Contextualiser
 from rag_pipeline.chunking import Chunk, ChunkingSettings, chunk_article
 from rag_pipeline.corpus import Article, article_hash
@@ -41,13 +42,15 @@ class IngestReport:
 
 
 def _contextualise(
-    articles: list[Article], settings: ChunkingSettings, contextualiser: Contextualiser
+    articles: list[Article],
+    chunker: Callable[[Article], list[Chunk]],
+    contextualiser: Contextualiser,
 ) -> tuple[list[Chunk], ChunkContextReport]:
     chunks: list[Chunk] = []
     responses: list[ModelResponse[Completion]] = []
     truncated: list[str] = []
     for article in articles:
-        original = chunk_article(article, settings)
+        original = chunker(article)
         contexts = contextualiser.contextualise(article, original)
         if contexts.article_truncated:
             truncated.append(article.id)
@@ -88,6 +91,7 @@ def ingest(
     settings: ChunkingSettings,
     *,
     contextualiser: Contextualiser | None = None,
+    cache: ResponseCache | None = None,
 ) -> IngestReport:
     """Bring the index in line with `articles`, re-chunking only what changed.
 
@@ -102,18 +106,23 @@ def ingest(
     changed = tuple(i for i in current if i in stored and stored[i] != article_hash(current[i]))
     unchanged = tuple(i for i in current if i in stored and i not in changed)
     deleted = tuple(sorted(i for i in stored if i not in current))
+    pending = [current[i] for i in added + changed]
+
+    def chunker(article: Article) -> list[Chunk]:
+        return chunk_article(
+            article, settings, embed_sentences=lambda texts: index.embed_sentences(texts, cache)
+        )
+
     context_report = None
     if contextualiser is None:
-        index.delete_articles(changed + deleted)
-        chunks = [c for i in added + changed for c in chunk_article(current[i], settings)]
+        chunks = [chunk for article in pending for chunk in chunker(article)]
     else:
         # Cache each response before changing the index, so a killed run can reuse it.
-        chunks, context_report = _contextualise(
-            [current[i] for i in added + changed], settings, contextualiser
-        )
-        # Context generation can take hours. Recheck the collection before writing to it.
+        chunks, context_report = _contextualise(pending, chunker, contextualiser)
+    if contextualiser is not None or settings.strategy == "semantic":
+        # The collection can change while the models prepare Chunks.
         index.check_build(settings.label, context_build)
-        index.delete_articles(changed + deleted)
+    index.delete_articles(changed + deleted)
     written = index.upsert(chunks, context=context_build)
     return IngestReport(
         articles=len(articles),

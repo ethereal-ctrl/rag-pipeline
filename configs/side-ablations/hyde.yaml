@@ -1,0 +1,32 @@
+name: side-hyde
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+  chunking:
+    strategy: sentences
+    max_words: 200
+    overlap_sentences: 1
+retrieval:
+  mode: hybrid
+  top_k: 10
+  candidates: 50
+  rerank:
+    reranker:
+      provider: sentence-transformers
+      model: BAAI/bge-reranker-v2-m3
+    candidates: 30
+  hyde:
+    enabled: true
+    generator:
+      provider: ollama
+      model: qwen3.5:4b
+      max_output_tokens: 96
+    bm25: question
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5

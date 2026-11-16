@@ -1,0 +1,25 @@
+name: side-chunk-100
+index:
+  collection: chunks-sent-w100-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+  chunking:
+    strategy: sentences
+    max_words: 100
+    overlap_sentences: 1
+retrieval:
+  mode: hybrid
+  top_k: 10
+  candidates: 50
+  rerank:
+    reranker:
+      provider: sentence-transformers
+      model: BAAI/bge-reranker-v2-m3
+    candidates: 30
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5
