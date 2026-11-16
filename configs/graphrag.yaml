@@ -1,0 +1,23 @@
+extraction:
+  provider: gemini
+  model: gemma-4-31b-it
+  supports_system: true
+  structured_output: prompt
+  max_output_tokens: 2048
+answer:
+  provider: ollama
+  model: qwen3.5:4b
+  max_output_tokens: 256
+embedder:
+  provider: ollama
+  model: qwen3-embedding:0.6b
+  query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+embedding_dimensions: 1024
+mode: mix
+query_types: [inference_query, comparison_query]
+context_tokens: 4000
+chunk_tokens: 1200
+chunk_overlap: 100
+gleanings: 1
+# Approximate instruction and previous-turn overhead per extraction or gleaning call.
+prompt_tokens: 3000

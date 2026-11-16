@@ -51,6 +51,7 @@ from rag_pipeline.models import (
     RerankTokenCounter,
     StructuredGenerator,
     estimate_tokens,
+    generation_key,
     model_version,
     query_embedding,
     remote_instructions,
@@ -281,12 +282,6 @@ def _format_context(chunks: tuple[RetrievedChunk, ...]) -> str:
     return "\n".join(blocks)
 
 
-def _generation_key(
-    spec: GeneratorSpec, name: str, version: str | None, system: str, prompt: str
-) -> str:
-    return cache_key("generate-v1", spec.model_dump(), name, version, system, prompt)
-
-
 def _generation_plan_key(config: VariantConfig, index_version: str, question: str) -> str:
     # Older plans can refer to prompts with different escaping or a different output schema.
     return cache_key("generation-plan-v3", config.run_config(), index_version, question)
@@ -357,7 +352,7 @@ def plan_remote_run(
         cached_calls = 0
         if cache is not None and stages:
             if not config.uses_retrieval:
-                key = _generation_key(spec, f"{spec.provider}:{spec.model}", None, system, prompt)
+                key = generation_key(spec, f"{spec.provider}:{spec.model}", None, system, prompt)
                 cached_calls += cache.contains(key)
             elif index_version is not None:
                 plan_key = _generation_plan_key(config, index_version, query.question)
@@ -377,7 +372,7 @@ def plan_remote_run(
         answer_tokens += call_tokens * (len(stages) - cached_calls)
         if hyde is not None:
             prompt = _hyde_prompt(query.question)
-            key = _generation_key(
+            key = generation_key(
                 hyde, f"{hyde.provider}:{hyde.model}", None, HYDE_SYSTEM_PROMPT, prompt
             )
             if cache is not None and cache.contains(key):
@@ -716,7 +711,7 @@ class PipelineVariant:
             if completion.call_seconds is not None:
                 stage.timing_adjustment = completion.call_seconds - (time.perf_counter() - started)
         else:
-            key = _generation_key(spec, generator.name, model_version(generator), system, prompt)
+            key = generation_key(spec, generator.name, model_version(generator), system, prompt)
             if schema is not None:
                 key = cache_key(key, schema)
 
