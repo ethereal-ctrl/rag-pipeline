@@ -145,6 +145,9 @@ class ConceptFakeEmbedder:
     def embed_query(self, text: str) -> list[float]:
         return self._vector(text)
 
+    def embed_query_with_usage(self, text: str) -> tuple[list[float], int]:
+        return self.embed_query(text), len(text.split())
+
 
 class PhraseFakeReranker:
     """Scores a Chunk 1.0 if it contains the preferred phrase, else 0.0."""
@@ -160,3 +163,7 @@ class PhraseFakeReranker:
     def score(self, query: str, texts: list[str]) -> list[float]:
         self.calls.append((query, len(texts)))
         return [1.0 if self._phrase in t else 0.0 for t in texts]
+
+    def score_with_usage(self, query: str, texts: list[str]) -> tuple[list[float], int]:
+        query_tokens = len(query.split())
+        return self.score(query, texts), sum(query_tokens + len(text.split()) for text in texts)

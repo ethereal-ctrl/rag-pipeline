@@ -10,14 +10,16 @@ import random
 import re
 import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from rag_pipeline.corpus import BenchmarkQuery
+from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Generator
+from rag_pipeline.tracing import StageTrace
 from rag_pipeline.variants import Answer, VariantConfig
 
 RANK_CUTOFF = 10
@@ -43,6 +45,11 @@ class Evaluable(Protocol):
     def index_version(self) -> str | None: ...
 
 
+@runtime_checkable
+class _RetrievalWithTrace(Protocol):
+    def retrieve_answer(self, question: str) -> Answer: ...
+
+
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
 
@@ -65,6 +72,8 @@ class QueryRecord:
     output_tokens: int
     seconds: float
     stage_seconds: dict[str, float] = field(default_factory=dict[str, float])
+    trace: tuple[StageTrace, ...] = ()
+    notional_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +157,8 @@ def _is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
 
 
 def _retrieve_only(variant: Evaluable, question: str) -> Answer:
+    if isinstance(variant, _RetrievalWithTrace):
+        return variant.retrieve_answer(question)
     stages: dict[str, float] = {}
     started = time.perf_counter()
     retrieved = variant.retrieve(question, stages)
@@ -179,6 +190,7 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         output_tokens=answer.output_tokens,
         seconds=answer.seconds,
         stage_seconds=answer.stage_seconds,
+        trace=answer.trace,
     )
 
 
@@ -230,6 +242,17 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     if seconds:
         metrics["latency_p50"] = _percentile(seconds, 0.50)
         metrics["latency_p95"] = _percentile(seconds, 0.95)
+    costs = [r.notional_cost_usd for r in records if r.notional_cost_usd is not None]
+    if costs and len(costs) == len(records):
+        metrics["cost_per_question"] = _mean(costs)
+    if records and all(r.trace for r in records):
+        metrics["output_tokens_per_question"] = sum(
+            stage.output_tokens for r in records for stage in r.trace
+        ) / len(records)
+        if all(stage.input_tokens is not None for r in records for stage in r.trace):
+            metrics["input_tokens_per_question"] = sum(
+                stage.input_tokens or 0 for r in records for stage in r.trace
+            ) / len(records)
     return metrics
 
 
@@ -257,7 +280,8 @@ def bootstrap_intervals(
         resample = [records[rng.randrange(len(records))] for _ in records]
         for name, value in aggregate(resample).items():
             draws.setdefault(name, []).append(value)
-    return {name: _interval(values) for name, values in draws.items() if name != "queries"}
+    reported = aggregate(records).keys() - {"queries"}
+    return {name: _interval(values) for name, values in draws.items() if name in reported}
 
 
 def compare_runs(
@@ -317,6 +341,7 @@ class TestSplitAlreadyScored(Exception):
 
 def _record_from_row(row: dict[str, Any]) -> QueryRecord:
     row["retrieved_chunk_ids"] = tuple(row["retrieved_chunk_ids"])
+    row["trace"] = tuple(StageTrace(**stage) for stage in row.get("trace", ()))
     return QueryRecord(**row)
 
 
@@ -485,8 +510,21 @@ def evaluate(
             record = _score(query, variant, retrieval_only)
             store.append(run_id, record)
             done[query.id] = record
+    prices = load_prices()
     records = [done[q.id] for q in queries]
+    records = [
+        replace(record, notional_cost_usd=notional_cost(record.trace, prices)) for record in records
+    ]
     meta = {**store.load_meta(run_id), "finished_at": datetime.now(UTC).isoformat()}
+    priced_models = {
+        stage.model
+        for record in records
+        for stage in record.trace
+        if stage.model is not None and stage.model in prices
+    }
+    meta["notional_cost_reference_prices"] = {
+        model: prices[model].model_dump() for model in sorted(priced_models)
+    }
     result = RunResult(
         run_id=run_id,
         meta=meta,
@@ -504,6 +542,7 @@ def export_records(result: RunResult, path: Path) -> Path:
     for row in rows:
         row["retrieved_chunk_ids"] = " ".join(row["retrieved_chunk_ids"])
         row["stage_seconds"] = json.dumps(row["stage_seconds"])
+        row["trace"] = json.dumps(row["trace"])
     with path.open("w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=list(rows[0]) if rows else ["query_id"])
         writer.writeheader()
