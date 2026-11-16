@@ -19,7 +19,7 @@ from rag_pipeline.evaluation import (
 )
 from rag_pipeline.index import ChunkIndex
 from rag_pipeline.ingest import ingest
-from rag_pipeline.models import LocalModels
+from rag_pipeline.models import EmbedderSpec, LocalModels
 from rag_pipeline.splits import DEFAULT_SEED, DEFAULT_SIZES, SPLIT_NAMES, Splits, make_splits
 from rag_pipeline.variants import VariantConfig, build_variant
 
@@ -55,10 +55,18 @@ def ingest_command(
     collection: str = "chunks-sent-w200-o1",
     max_words: int = 200,
     overlap_sentences: int = 1,
+    embedder: Annotated[
+        str | None, typer.Option(help="Ollama embedding model for dense vectors.")
+    ] = None,
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
-    """Chunk and index the Corpus."""
-    index = ChunkIndex(QdrantClient(url=qdrant_url), collection)
+    """Chunk and index the Corpus (BM25 always; dense vectors with --embedder)."""
+    dense = (
+        LocalModels().embedder_for(EmbedderSpec(provider="ollama", model=embedder))
+        if embedder
+        else None
+    )
+    index = ChunkIndex(QdrantClient(url=qdrant_url), collection, dense)
     report = ingest(load_articles(RAW_DIR), index, ChunkingSettings(max_words, overlap_sentences))
     typer.echo(f"{report.articles} Articles -> {report.chunks_written} Chunks in {collection}.")
 
@@ -81,10 +89,12 @@ def eval_command(
     config = VariantConfig.from_yaml(variant_file)
     by_id = {q.id: q for q in load_queries(RAW_DIR)}
     queries = [by_id[i] for i in Splits.load(SPLITS_FILE).ids(split)][:limit]
-    index = (
-        ChunkIndex(QdrantClient(url=qdrant_url), config.index.collection) if config.index else None
-    )
-    variant = build_variant(config, index=index, models=LocalModels())
+    models = LocalModels()
+    index = None
+    if config.index is not None:
+        embedder = models.embedder_for(config.index.embedder) if config.index.embedder else None
+        index = ChunkIndex(QdrantClient(url=qdrant_url), config.index.collection, embedder)
+    variant = build_variant(config, index=index, models=models)
     try:
         result = evaluate(variant, queries, split, RunStore(RUNS_DIR), allow_rescore=allow_rescore)
     except TestSplitAlreadyScored as error:

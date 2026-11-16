@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+import hashlib
+import math
+from typing import ClassVar, Literal
 
+from rag_pipeline.bm25 import tokenize
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Completion, GeneratorSpec
 from rag_pipeline.variants import (
@@ -89,3 +92,36 @@ class ScriptedVariant:
             for i, body in enumerate(chunk_texts)
         )
         return Answer(text, is_abstention(text), retrieved, 10, 2, 0.5)
+
+
+class ConceptFakeEmbedder:
+    """Bag-of-concepts embeddings: a few synonyms share a concept, so dense search can find
+    Chunks that share no words with the question, which BM25 cannot."""
+
+    SYNONYMS: ClassVar[dict[str, str]] = {
+        "smartphone": "phone",
+        "handset": "phone",
+        "pictures": "photos",
+        "dark": "light",
+        "crypto": "ftx",
+    }
+    dimensions = 64
+
+    @property
+    def name(self) -> str:
+        return "fake-concepts"
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        for token in tokenize(text):
+            concept = self.SYNONYMS.get(token, token)
+            bucket = int(hashlib.md5(concept.encode()).hexdigest(), 16) % self.dimensions
+            vector[bucket] += 1.0
+        norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+        return [v / norm for v in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(t) for t in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._vector(text)

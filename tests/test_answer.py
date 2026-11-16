@@ -6,7 +6,15 @@ from fakes import FakeModels, GroundedFakeGenerator
 
 from rag_pipeline.index import ChunkIndex
 from rag_pipeline.ingest import ChunkingSettings, ingest
-from rag_pipeline.variants import VariantConfig, build_variant
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec
+from rag_pipeline.variants import (
+    GenerationConfig,
+    IndexConfig,
+    PipelineVariant,
+    RetrievalConfig,
+    VariantConfig,
+    build_variant,
+)
 
 BM25_YAML = """
 name: bm25
@@ -90,3 +98,56 @@ def test_a_retrieval_variant_without_an_index_is_rejected(tmp_path: Path):
 
     with pytest.raises(ValueError, match="index"):
         VariantConfig.from_yaml(path)
+
+
+def _retrieval_variant(mode: str, index: ChunkIndex) -> PipelineVariant:
+    config = VariantConfig(
+        name=mode,
+        index=IndexConfig(
+            collection=index.collection, embedder=EmbedderSpec(provider="ollama", model="fake")
+        ),
+        retrieval=RetrievalConfig(mode=mode, top_k=3),  # type: ignore[arg-type]
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+    )
+    return build_variant(config, index=index, models=FakeModels(GroundedFakeGenerator({})))
+
+
+# Shares no words with the Pixel camera Chunk, only synonyms of its words.
+SYNONYM_QUESTION = "Does the smartphone take good pictures in the dark?"
+PIXEL_CAMERA_SENTENCE = "Its camera uses a new sensor for low light photos."
+
+
+def test_dense_retrieval_finds_chunks_that_share_no_words_with_the_question(
+    dense_index: ChunkIndex,
+):
+    ingest(ARTICLES, dense_index, ChunkingSettings(max_words=20, overlap_sentences=0))
+
+    dense = _retrieval_variant("dense", dense_index).answer(SYNONYM_QUESTION)
+    lexical = _retrieval_variant("bm25", dense_index).answer(SYNONYM_QUESTION)
+
+    assert PIXEL_CAMERA_SENTENCE in dense.retrieved[0].text
+    assert not any(PIXEL_CAMERA_SENTENCE in c.text for c in lexical.retrieved)
+
+
+def test_hybrid_retrieval_fuses_lexical_and_dense_matches(dense_index: ChunkIndex):
+    ingest(ARTICLES, dense_index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    # "Bankman-Fried" is only found lexically; the camera Chunk only via synonyms.
+    question = "Bankman-Fried jury, and smartphone pictures in the dark?"
+
+    hybrid = _retrieval_variant("hybrid", dense_index).answer(question)
+    lexical = _retrieval_variant("bm25", dense_index).answer(question)
+
+    assert lexical.retrieved[0].article_id == FTX.id
+    assert not any(PIXEL_CAMERA_SENTENCE in c.text for c in lexical.retrieved)
+    assert any(c.article_id == FTX.id for c in hybrid.retrieved)
+    assert any(PIXEL_CAMERA_SENTENCE in c.text for c in hybrid.retrieved)
+
+
+def test_dense_variant_without_an_index_embedder_is_rejected():
+    with pytest.raises(ValueError, match="embedder"):
+        VariantConfig(
+            name="dense",
+            index=IndexConfig(collection="c"),
+            retrieval=RetrievalConfig(mode="dense"),
+            generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+        )

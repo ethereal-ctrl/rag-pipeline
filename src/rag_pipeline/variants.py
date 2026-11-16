@@ -11,7 +11,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from rag_pipeline.index import ChunkIndex, RetrievedChunk
-from rag_pipeline.models import GeneratorSpec, ModelProvider
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, ModelProvider
 
 ABSTENTION_TEXT = "Insufficient information."
 
@@ -34,11 +34,13 @@ class _Frozen(BaseModel):
 
 class IndexConfig(_Frozen):
     collection: str
+    embedder: EmbedderSpec | None = None  # must match the embedder used at ingestion
 
 
 class RetrievalConfig(_Frozen):
-    mode: Literal["none", "bm25"]
+    mode: Literal["none", "bm25", "dense", "hybrid"]
     top_k: int = 10
+    candidates: int = 50  # per arm, before Reciprocal Rank Fusion (hybrid only)
 
 
 class GenerationConfig(_Frozen):
@@ -56,6 +58,10 @@ class VariantConfig(_Frozen):
     def _retrieval_needs_an_index(self) -> Self:
         if self.retrieval.mode != "none" and self.index is None:
             raise ValueError(f"retrieval mode {self.retrieval.mode!r} needs an index")
+        if self.retrieval.mode in ("dense", "hybrid") and (
+            self.index is None or self.index.embedder is None
+        ):
+            raise ValueError(f"retrieval mode {self.retrieval.mode!r} needs an index embedder")
         return self
 
     @property
@@ -103,7 +109,17 @@ class PipelineVariant:
     def _retrieve(self, question: str) -> tuple[RetrievedChunk, ...]:
         if self._index is None or not self.config.uses_retrieval:
             return ()
-        return tuple(self._index.search_bm25(question, limit=self.config.retrieval.top_k))
+        top_k = self.config.retrieval.top_k
+        match self.config.retrieval.mode:
+            case "bm25":
+                return tuple(self._index.search_bm25(question, limit=top_k))
+            case "dense":
+                return tuple(self._index.search_dense(question, limit=top_k))
+            case "hybrid":
+                candidates = self.config.retrieval.candidates
+                return tuple(self._index.search_hybrid(question, top_k, candidates))
+            case _:
+                raise ValueError(f"unsupported retrieval mode {self.config.retrieval.mode!r}")
 
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()

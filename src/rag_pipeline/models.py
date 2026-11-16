@@ -25,6 +25,23 @@ class Completion:
     output_tokens: int
 
 
+class EmbedderSpec(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    provider: Literal["ollama"]
+    model: str
+    query_prefix: str = ""  # some embedders (e.g. Qwen3-Embedding) want an instruction
+
+
+class Embedder(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]: ...
+
+    def embed_query(self, text: str) -> list[float]: ...
+
+
 class Generator(Protocol):
     @property
     def name(self) -> str: ...
@@ -82,6 +99,30 @@ class OllamaGenerator:
         )
 
 
+class OllamaEmbedder:
+    def __init__(self, spec: EmbedderSpec, base_url: str = "http://localhost:11434") -> None:
+        self._spec = spec
+        self._http = httpx.Client(base_url=base_url, timeout=600)
+
+    @property
+    def name(self) -> str:
+        return f"ollama:{self._spec.model}"
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        response = self._http.post(
+            "/api/embed", json={"model": self._spec.model, "input": texts, "truncate": True}
+        )
+        response.raise_for_status()
+        embeddings: list[list[float]] = response.json()["embeddings"]
+        return embeddings
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._embed(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed([self._spec.query_prefix + text])[0]
+
+
 class LocalModels:
     """The runtime model provider: everything served locally (ADR 0001)."""
 
@@ -90,3 +131,6 @@ class LocalModels:
 
     def generator_for(self, spec: GeneratorSpec) -> OllamaGenerator:
         return OllamaGenerator(spec, self._ollama_url)
+
+    def embedder_for(self, spec: EmbedderSpec) -> OllamaEmbedder:
+        return OllamaEmbedder(spec, self._ollama_url)

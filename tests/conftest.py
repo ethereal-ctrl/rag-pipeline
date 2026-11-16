@@ -70,3 +70,13 @@ QUERIES = [FTX_QUERY, PIXEL_QUERY, NULL_QUERY]
 @pytest.fixture
 def index() -> ChunkIndex:
     return ChunkIndex(QdrantClient(":memory:"), collection="fixture")
+
+
+@pytest.fixture
+def dense_index() -> ChunkIndex:
+    """BM25 plus dense vectors from a deterministic fake embedder."""
+    from fakes import ConceptFakeEmbedder
+
+    return ChunkIndex(
+        QdrantClient(":memory:"), collection="fixture-dense", embedder=ConceptFakeEmbedder()
+    )
