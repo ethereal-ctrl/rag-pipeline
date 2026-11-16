@@ -1,0 +1,34 @@
+# Committed thresholds for the quality gate (`rag gate`). CI runs the retrieval part on
+# every pull request; `rag gate --answers` adds the answer-level checks locally.
+# Thresholds sit about one query (1/44 = 0.023) below the values measured on 2026-11-16, so
+# float noise between CPU and Apple GPU embeddings passes but a real regression fails.
+split: smoke
+variants:
+  - bm25.yaml
+  - hybrid.yaml
+retrieval:
+  # measured: hits@4 0.773, hits@10 0.886, mrr@10 0.650, map@10 0.317, recall 0.547
+  gate-bm25:
+    hits@4: 0.75
+    hits@10: 0.86
+    mrr@10: 0.62
+    map@10: 0.29
+    evidence_recall@10: 0.52
+  # measured: hits@4 0.682, hits@10 0.932, mrr@10 0.578, map@10 0.280, recall 0.551
+  gate-hybrid:
+    hits@4: 0.65
+    hits@10: 0.90
+    mrr@10: 0.55
+    map@10: 0.25
+    evidence_recall@10: 0.52
+answers:
+  # Local only (`rag gate --answers`, qwen3.5:4b). Two queries of margin (n = 50); per-type
+  # accuracy rests on 6-17 queries each and is too noisy to gate on.
+  # measured: accuracy 0.62, null-query abstention 0.833 (5 of 6)
+  gate-bm25:
+    accuracy: 0.58
+    accuracy[null_query]: 0.66
+  # measured: accuracy 0.56, null-query abstention 0.833 (5 of 6)
+  gate-hybrid:
+    accuracy: 0.52
+    accuracy[null_query]: 0.66

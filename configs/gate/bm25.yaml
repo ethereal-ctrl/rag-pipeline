@@ -1,0 +1,11 @@
+name: gate-bm25
+index:
+  collection: gate-chunks-sent-w200-o1-bge-small
+retrieval:
+  mode: bm25
+  top_k: 10
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5

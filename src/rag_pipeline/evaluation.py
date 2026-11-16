@@ -178,6 +178,24 @@ _RETRIEVAL_METRICS = {
 }
 
 
+class Retrieving(Protocol):
+    """Anything that ranks Chunks for a question like a Pipeline Variant."""
+
+    @property
+    def config(self) -> VariantConfig: ...
+
+    def retrieve(self, question: str) -> tuple[RetrievedChunk, ...]: ...
+
+
+def retrieval_metrics(variant: Retrieving, queries: list[BenchmarkQuery]) -> dict[str, float]:
+    """Retrieval metrics alone, with no generation (Null Queries excluded)."""
+    scored = [_rank_scores(q, variant.retrieve(q.question)) for q in queries if not q.is_null]
+    metrics: dict[str, float] = {"queries": len(scored)}
+    for name, attribute in _RETRIEVAL_METRICS.items():
+        metrics[name] = _mean([float(getattr(s, attribute)) for s in scored])
+    return metrics
+
+
 def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     """Corpus-level metrics from per-query records (Null Queries excluded from retrieval)."""
     metrics: dict[str, float] = {"queries": len(records)}

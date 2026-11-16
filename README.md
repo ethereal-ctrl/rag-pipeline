@@ -35,7 +35,14 @@ the answer, which is stricter than the upstream any-shared-word check.
 uv run pytest        # seam tests with a fixture Corpus and fake models, no network
 uv run ruff check src tests
 uv run pyright
+uv run rag gate      # Smoke Set retrieval metrics vs. committed thresholds
+uv run rag gate --answers   # plus answer-level checks with the local generator
 ```
+
+Every pull request runs lint, type checks and tests, then a retrieval gate: CI builds the
+full index with a small CPU embedder (`BAAI/bge-small-en-v1.5`) in a Qdrant service
+container, scores BM25 and Hybrid retrieval on the Smoke Set with no LLM, and fails if any
+metric falls below the thresholds in `configs/gate/gate.yaml`. No secrets, no paid services.
 
 ## Data
 
