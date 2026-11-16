@@ -2,17 +2,39 @@
 
 from __future__ import annotations
 
+import csv
+import hashlib
 import json
+import math
+import random
 import re
 import subprocess
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from rag_pipeline.corpus import BenchmarkQuery
 from rag_pipeline.index import RetrievedChunk
-from rag_pipeline.variants import PipelineVariant
+from rag_pipeline.models import Generator
+from rag_pipeline.variants import Answer, VariantConfig
+
+RANK_CUTOFF = 10
+BOOTSTRAP_SAMPLES = 1000
+BOOTSTRAP_SEED = 0
+
+
+class Evaluable(Protocol):
+    """Anything that answers like a Pipeline Variant."""
+
+    @property
+    def config(self) -> VariantConfig: ...
+
+    @property
+    def generator(self) -> Generator: ...
+
+    def answer(self, question: str) -> Answer: ...
+
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -28,6 +50,9 @@ class QueryRecord:
     correct: bool
     hit_at_4: bool | None
     hit_at_10: bool | None
+    reciprocal_rank: float | None
+    average_precision: float | None
+    evidence_recall: float | None
     retrieved_chunk_ids: tuple[str, ...]
     input_tokens: int
     output_tokens: int
@@ -39,7 +64,23 @@ class RunResult:
     run_id: str
     meta: dict[str, Any]
     metrics: dict[str, float]
+    intervals: dict[str, tuple[float, float]]
     records: tuple[QueryRecord, ...]
+
+
+@dataclass(frozen=True)
+class MetricDelta:
+    metric: str
+    baseline: float
+    candidate: float
+    delta: float
+    low: float
+    high: float
+
+    @property
+    def significant(self) -> bool:
+        """The 95% interval of the paired difference excludes zero."""
+        return self.low > 0 or self.high < 0
 
 
 def _squash(text: str) -> str:
@@ -47,9 +88,43 @@ def _squash(text: str) -> str:
     return text.replace(" ", "").replace("\n", "")
 
 
-def _evidence_hit(query: BenchmarkQuery, retrieved: tuple[RetrievedChunk, ...], k: int) -> bool:
+@dataclass(frozen=True)
+class _RankScores:
+    hit_at_4: bool
+    hit_at_10: bool
+    reciprocal_rank: float
+    average_precision: float
+    evidence_recall: float
+
+
+def _rank_scores(query: BenchmarkQuery, retrieved: tuple[RetrievedChunk, ...]) -> _RankScores:
+    """Retrieval scores for one query, following the upstream MultiHop-RAG scoring.
+
+    A retrieved Chunk is relevant if it contains any Evidence fact (whitespace-insensitive).
+    Hits@k is per query: at least one relevant Chunk in the top k.  MAP@10 adds, at each
+    relevant rank, the number of not-yet-found facts in that Chunk divided by the rank, and
+    divides by min(#facts, 10).  Evidence Recall is the fraction of facts found in the top 10.
+    """
     facts = [_squash(e.fact) for e in query.evidence]
-    return any(fact in _squash(chunk.text) for chunk in retrieved[:k] for fact in facts)
+    found: set[str] = set()
+    first_rank: int | None = None
+    precision_sum = 0.0
+    for rank, chunk in enumerate(retrieved[:RANK_CUTOFF], start=1):
+        text = _squash(chunk.text)
+        in_chunk = [f for f in facts if f in text]
+        if not in_chunk:
+            continue
+        first_rank = first_rank or rank
+        new = [f for f in in_chunk if f not in found]
+        found.update(new)
+        precision_sum += len(new) / rank
+    return _RankScores(
+        hit_at_4=first_rank is not None and first_rank <= 4,
+        hit_at_10=first_rank is not None,
+        reciprocal_rank=1 / first_rank if first_rank else 0.0,
+        average_precision=precision_sum / min(len(facts), RANK_CUTOFF),
+        evidence_recall=len(found) / len(set(facts)),
+    )
 
 
 def _normalise(text: str) -> str:
@@ -64,9 +139,9 @@ def _is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
     return f" {_normalise(query.answer)} " in f" {_normalise(answer)} "
 
 
-def _score(query: BenchmarkQuery, variant: PipelineVariant) -> QueryRecord:
+def _score(query: BenchmarkQuery, variant: Evaluable) -> QueryRecord:
     answer = variant.answer(query.question)
-    answerable = not query.is_null
+    ranks = None if query.is_null else _rank_scores(query, answer.retrieved)
     return QueryRecord(
         query_id=query.id,
         query_type=query.query_type,
@@ -75,8 +150,11 @@ def _score(query: BenchmarkQuery, variant: PipelineVariant) -> QueryRecord:
         answer=answer.text,
         abstained=answer.abstained,
         correct=_is_correct(query, answer.text, answer.abstained),
-        hit_at_4=_evidence_hit(query, answer.retrieved, 4) if answerable else None,
-        hit_at_10=_evidence_hit(query, answer.retrieved, 10) if answerable else None,
+        hit_at_4=ranks.hit_at_4 if ranks else None,
+        hit_at_10=ranks.hit_at_10 if ranks else None,
+        reciprocal_rank=ranks.reciprocal_rank if ranks else None,
+        average_precision=ranks.average_precision if ranks else None,
+        evidence_recall=ranks.evidence_recall if ranks else None,
         retrieved_chunk_ids=tuple(c.chunk_id for c in answer.retrieved),
         input_tokens=answer.input_tokens,
         output_tokens=answer.output_tokens,
@@ -84,18 +162,95 @@ def _score(query: BenchmarkQuery, variant: PipelineVariant) -> QueryRecord:
     )
 
 
-def _mean(values: list[bool]) -> float:
+def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else float("nan")
 
 
-def _metrics(records: list[QueryRecord]) -> dict[str, float]:
-    answerable = [r for r in records if r.hit_at_4 is not None]
-    return {
-        "queries": len(records),
-        "hits@4": _mean([bool(r.hit_at_4) for r in answerable]),
-        "hits@10": _mean([bool(r.hit_at_10) for r in answerable]),
-        "accuracy": _mean([r.correct for r in records]),
-    }
+_RETRIEVAL_METRICS = {
+    "hits@4": "hit_at_4",
+    "hits@10": "hit_at_10",
+    "mrr@10": "reciprocal_rank",
+    "map@10": "average_precision",
+    "evidence_recall@10": "evidence_recall",
+}
+
+
+def aggregate(records: list[QueryRecord]) -> dict[str, float]:
+    """Corpus-level metrics from per-query records (Null Queries excluded from retrieval)."""
+    metrics: dict[str, float] = {"queries": len(records)}
+    for name, field in _RETRIEVAL_METRICS.items():
+        values = [float(v) for r in records if (v := getattr(r, field)) is not None]
+        metrics[name] = _mean(values)
+    metrics["accuracy"] = _mean([float(r.correct) for r in records])
+    for query_type in sorted({r.query_type for r in records}):
+        typed = [float(r.correct) for r in records if r.query_type == query_type]
+        metrics[f"accuracy[{query_type}]"] = _mean(typed)
+    return metrics
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    position = q * (len(sorted_values) - 1)
+    lower = math.floor(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * (position - lower)
+
+
+def _interval(samples: list[float]) -> tuple[float, float]:
+    finite = sorted(v for v in samples if not math.isnan(v))
+    if not finite:
+        return (math.nan, math.nan)
+    return (_percentile(finite, 0.025), _percentile(finite, 0.975))
+
+
+def bootstrap_intervals(
+    records: list[QueryRecord], samples: int = BOOTSTRAP_SAMPLES, seed: int = BOOTSTRAP_SEED
+) -> dict[str, tuple[float, float]]:
+    """Percentile bootstrap 95% intervals, resampling queries with replacement."""
+    rng = random.Random(seed)
+    draws: dict[str, list[float]] = {}
+    for _ in range(samples):
+        resample = [records[rng.randrange(len(records))] for _ in records]
+        for name, value in aggregate(resample).items():
+            draws.setdefault(name, []).append(value)
+    return {name: _interval(values) for name, values in draws.items() if name != "queries"}
+
+
+def compare_runs(
+    baseline: RunResult,
+    candidate: RunResult,
+    samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> list[MetricDelta]:
+    """Paired bootstrap over the queries both runs share."""
+    base_by_id = {r.query_id: r for r in baseline.records}
+    cand_by_id = {r.query_id: r for r in candidate.records}
+    shared = sorted(base_by_id.keys() & cand_by_id.keys())
+    if not shared:
+        raise ValueError("the two runs share no queries")
+    base_point = aggregate([base_by_id[i] for i in shared])
+    cand_point = aggregate([cand_by_id[i] for i in shared])
+    rng = random.Random(seed)
+    diffs: dict[str, list[float]] = {}
+    for _ in range(samples):
+        ids = [shared[rng.randrange(len(shared))] for _ in shared]
+        base = aggregate([base_by_id[i] for i in ids])
+        cand = aggregate([cand_by_id[i] for i in ids])
+        for name in base.keys() & cand.keys():
+            diffs.setdefault(name, []).append(cand[name] - base[name])
+    deltas: list[MetricDelta] = []
+    for name in sorted(base_point.keys() & cand_point.keys() - {"queries"}):
+        low, high = _interval(diffs.get(name, []))
+        deltas.append(
+            MetricDelta(
+                metric=name,
+                baseline=base_point[name],
+                candidate=cand_point[name],
+                delta=cand_point[name] - base_point[name],
+                low=low,
+                high=high,
+            )
+        )
+    return deltas
 
 
 def _git_commit() -> str:
@@ -109,54 +264,179 @@ def _git_commit() -> str:
         return "unknown"
 
 
+class TestSplitAlreadyScored(Exception):
+    """Raised when a Pipeline Variant would be scored on the Test Split a second time."""
+
+    __test__ = False  # not a pytest test class
+
+
+def _record_from_row(row: dict[str, Any]) -> QueryRecord:
+    row["retrieved_chunk_ids"] = tuple(row["retrieved_chunk_ids"])
+    return QueryRecord(**row)
+
+
 class RunStore:
-    """Append-only store of evaluation runs, one directory per run."""
+    """Append-only store of evaluation runs, one directory per run.
+
+    A run directory holds `meta.json` and a `records.jsonl` written one query at a time, so
+    an interrupted run can resume.  `metrics.json` and `intervals.json` appear only when the
+    run completes; their presence marks a run as finished.
+    """
 
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def save(self, result: RunResult) -> None:
-        run_dir = self.root / result.run_id
+    def _run_dirs(self) -> list[Path]:
+        if not self.root.exists():
+            return []
+        return sorted(d for d in self.root.iterdir() if (d / "meta.json").exists())
+
+    def load_meta(self, run_id: str) -> dict[str, Any]:
+        return self._meta(self.root / run_id)
+
+    @staticmethod
+    def _meta(run_dir: Path) -> dict[str, Any]:
+        meta: dict[str, Any] = json.loads((run_dir / "meta.json").read_text("utf-8"))
+        return meta
+
+    @staticmethod
+    def _is_complete(run_dir: Path) -> bool:
+        return (run_dir / "metrics.json").exists()
+
+    def completed(self, split: str) -> list[dict[str, Any]]:
+        return [
+            self._meta(d)
+            for d in self._run_dirs()
+            if self._is_complete(d) and self._meta(d)["split"] == split
+        ]
+
+    def find_incomplete(self, fingerprint: str) -> str | None:
+        for run_dir in reversed(self._run_dirs()):
+            if not self._is_complete(run_dir) and self._meta(run_dir)["fingerprint"] == fingerprint:
+                return run_dir.name
+        return None
+
+    def begin(self, run_id: str, meta: dict[str, Any]) -> None:
+        run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "meta.json").write_text(json.dumps(meta, indent=1), "utf-8")
+        (run_dir / "records.jsonl").touch()
+
+    def records_so_far(self, run_id: str) -> list[QueryRecord]:
+        lines = (self.root / run_id / "records.jsonl").read_text("utf-8").splitlines()
+        records: list[QueryRecord] = []
+        for line in lines:
+            try:
+                records.append(_record_from_row(json.loads(line)))
+            except json.JSONDecodeError:
+                break  # a torn final line from a crash mid-write
+        return records
+
+    def append(self, run_id: str, record: QueryRecord) -> None:
+        with (self.root / run_id / "records.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(asdict(record)) + "\n")
+            out.flush()
+
+    def finish(self, result: RunResult) -> None:
+        run_dir = self.root / result.run_id
+        records_file = run_dir / "records.jsonl"
+        records_file.write_text(
+            "".join(json.dumps(asdict(r)) + "\n" for r in result.records), "utf-8"
+        )
         (run_dir / "meta.json").write_text(json.dumps(result.meta, indent=1), "utf-8")
+        (run_dir / "intervals.json").write_text(json.dumps(result.intervals, indent=1), "utf-8")
         (run_dir / "metrics.json").write_text(json.dumps(result.metrics, indent=1), "utf-8")
-        with (run_dir / "records.jsonl").open("w", encoding="utf-8") as out:
-            for record in result.records:
-                out.write(json.dumps(asdict(record)) + "\n")
 
     def load(self, run_id: str) -> RunResult:
         run_dir = self.root / run_id
-        lines = (run_dir / "records.jsonl").read_text("utf-8").splitlines()
-        records: list[QueryRecord] = []
-        for line in lines:
-            row = json.loads(line)
-            row["retrieved_chunk_ids"] = tuple(row["retrieved_chunk_ids"])
-            records.append(QueryRecord(**row))
+        intervals = json.loads((run_dir / "intervals.json").read_text("utf-8"))
         return RunResult(
             run_id=run_id,
-            meta=json.loads((run_dir / "meta.json").read_text("utf-8")),
+            meta=self._meta(run_dir),
             metrics=json.loads((run_dir / "metrics.json").read_text("utf-8")),
-            records=tuple(records),
+            intervals={name: (low, high) for name, (low, high) in intervals.items()},
+            records=tuple(self.records_so_far(run_id)),
         )
 
 
+def _fingerprint(config: VariantConfig, split: str, queries: list[BenchmarkQuery]) -> str:
+    payload = json.dumps(
+        {"variant": config.model_dump(), "split": split, "queries": [q.id for q in queries]},
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _guard_test_split(store: RunStore, config: VariantConfig, allow_rescore: bool) -> None:
+    if allow_rescore:
+        return
+    for meta in store.completed("test"):
+        if meta["variant"]["name"] == config.name:
+            raise TestSplitAlreadyScored(
+                f"Pipeline Variant {config.name!r} was already scored on the Test Split "
+                f"(run started {meta['started_at']}). The Test Split is scored once per "
+                "variant (ADR 0005); pass allow_rescore=True only for a documented reason."
+            )
+
+
 def evaluate(
-    variant: PipelineVariant, queries: list[BenchmarkQuery], split: str, store: RunStore
+    variant: Evaluable,
+    queries: list[BenchmarkQuery],
+    split: str,
+    store: RunStore,
+    *,
+    allow_rescore: bool = False,
 ) -> RunResult:
-    started = datetime.now(UTC)
-    records = [_score(query, variant) for query in queries]
-    generator = variant.generator
-    version = getattr(generator, "version", None)
-    meta: dict[str, Any] = {
-        "variant": variant.config.model_dump(),
-        "split": split,
-        "generator": generator.name,
-        "generator_version": version() if callable(version) else generator.name,
-        "commit": _git_commit(),
-        "started_at": started.isoformat(),
-        "finished_at": datetime.now(UTC).isoformat(),
-    }
-    run_id = f"{started:%Y%m%dT%H%M%S%f}-{variant.config.name}-{split}"
-    result = RunResult(run_id=run_id, meta=meta, metrics=_metrics(records), records=tuple(records))
-    store.save(result)
+    """Score a Pipeline Variant on a split, resuming an interrupted identical run if present."""
+    config = variant.config
+    if split == "test":
+        _guard_test_split(store, config, allow_rescore)
+    fingerprint = _fingerprint(config, split, queries)
+    run_id = store.find_incomplete(fingerprint)
+    if run_id is None:
+        started = datetime.now(UTC)
+        run_id = f"{started:%Y%m%dT%H%M%S%f}-{config.name}-{split}"
+        generator = variant.generator
+        version = getattr(generator, "version", None)
+        store.begin(
+            run_id,
+            {
+                "variant": config.model_dump(),
+                "split": split,
+                "fingerprint": fingerprint,
+                "generator": generator.name,
+                "generator_version": version() if callable(version) else generator.name,
+                "commit": _git_commit(),
+                "started_at": started.isoformat(),
+                "rescored": allow_rescore and split == "test",
+            },
+        )
+    done = {r.query_id: r for r in store.records_so_far(run_id)}
+    for query in queries:
+        if query.id not in done:
+            record = _score(query, variant)
+            store.append(run_id, record)
+            done[query.id] = record
+    records = [done[q.id] for q in queries]
+    meta = {**store.load_meta(run_id), "finished_at": datetime.now(UTC).isoformat()}
+    result = RunResult(
+        run_id=run_id,
+        meta=meta,
+        metrics=aggregate(records),
+        intervals=bootstrap_intervals(records),
+        records=tuple(records),
+    )
+    store.finish(result)
     return result
+
+
+def export_records(result: RunResult, path: Path) -> Path:
+    """Write one CSV row per query, for error analysis in a spreadsheet or notebook."""
+    rows = [asdict(r) for r in result.records]
+    for row in rows:
+        row["retrieved_chunk_ids"] = " ".join(row["retrieved_chunk_ids"])
+    with path.open("w", newline="", encoding="utf-8") as out:
+        writer = csv.DictWriter(out, fieldnames=list(rows[0]) if rows else ["query_id"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return path

@@ -2,7 +2,16 @@
 
 from __future__ import annotations
 
+from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Completion, GeneratorSpec
+from rag_pipeline.variants import (
+    Answer,
+    GenerationConfig,
+    IndexConfig,
+    RetrievalConfig,
+    VariantConfig,
+    is_abstention,
+)
 
 ABSTAIN = "Insufficient information."
 
@@ -39,3 +48,39 @@ class FakeModels:
     def generator_for(self, spec: GeneratorSpec) -> GroundedFakeGenerator:
         self.requested.append(spec)
         return self.generator
+
+
+class ScriptedVariant:
+    """A Pipeline Variant whose answer and retrieved Chunk texts are fixed per question.
+
+    Lets Evaluate-seam tests pin exact rankings and hand-compute the expected metrics.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        script: dict[str, tuple[str, list[str]]],
+        config_tag: str = "v1",
+        crash_after: int | None = None,
+    ) -> None:
+        self.config = VariantConfig(
+            name=name,
+            index=IndexConfig(collection=f"scripted-{config_tag}"),
+            retrieval=RetrievalConfig(mode="bm25", top_k=10),
+            generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+        )
+        self.generator = GroundedFakeGenerator({})
+        self._script = script
+        self._crash_after = crash_after
+        self.asked: list[str] = []
+
+    def answer(self, question: str) -> Answer:
+        if self._crash_after is not None and len(self.asked) >= self._crash_after:
+            raise RuntimeError("simulated crash")
+        self.asked.append(question)
+        text, chunk_texts = self._script[question]
+        retrieved = tuple(
+            RetrievedChunk(f"c{i}", "a", "t", "s", "2023-10-01", body, 1.0 / (i + 1))
+            for i, body in enumerate(chunk_texts)
+        )
+        return Answer(text, is_abstention(text), retrieved, 10, 2, 0.5)

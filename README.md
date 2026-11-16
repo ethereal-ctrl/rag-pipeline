@@ -15,8 +15,19 @@ uv run rag ingest             # chunk + index the Corpus
 uv run rag eval configs/variants/bm25.yaml --split smoke
 ```
 
-Runs are stored under `runs/` with their config, split, model version and commit.
-The fixed splits are committed in `data/splits.json` and never regenerated (ADR 0005).
+Every metric comes with a bootstrap 95% confidence interval. Runs are stored under `runs/`
+with their config, split, model version and commit, and resume where they stopped if
+interrupted. Each Pipeline Variant can be scored on the Test Split only once (ADR 0005).
+
+```bash
+uv run rag compare RUN_A RUN_B   # paired bootstrap; '*' marks significant changes
+uv run rag export RUN            # per-query CSV for error analysis
+```
+
+Retrieval metrics (Hits@4/@10, MRR@10, MAP@10) follow the upstream MultiHop-RAG scoring
+exactly and were cross-checked against it; Evidence Recall@10 adds the fraction of all
+Evidence found. Answer accuracy requires the whole normalised reference answer to appear in
+the answer, which is stricter than the upstream any-shared-word check.
 
 ## Development
 
