@@ -75,6 +75,7 @@ class StageTrace:
     input_tokens: int | None = 0
     output_tokens: int = 0
     model: str | None = None
+    cache_hit: bool = False
 
 
 @dataclass
@@ -82,6 +83,9 @@ class StageUsage:
     input_tokens: TokenCount = 0
     output_tokens: int = 0
     chunks: tuple[RetrievedChunk, ...] = ()
+    seconds: float | None = None
+    timing_adjustment: float = 0.0
+    cache_hit: bool = False
 
     def set_input_tokens(self, count: TokenCount) -> None:
         self.input_tokens = count
@@ -137,13 +141,17 @@ class AnswerTrace:
             self.stages.append(
                 StageTrace(
                     name,
-                    ended - started,
+                    ended - started + usage.timing_adjustment
+                    if usage.seconds is None
+                    else usage.seconds,
                     input_tokens,
                     usage.output_tokens,
                     model,
+                    usage.cache_hit,
                 )
             )
             if model is not None:
+                span.set_attribute("rag.cache_hit", usage.cache_hit)
                 if input_tokens is not None:
                     span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                 span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)

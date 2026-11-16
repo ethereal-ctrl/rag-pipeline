@@ -1,0 +1,8 @@
+# Groq Free Plan limits.
+openai/gpt-oss-120b:
+  requests_per_minute: 30
+  requests_per_day: 1000
+  tokens_per_minute: 8000
+  tokens_per_day: 200000
+  source: https://console.groq.com/docs/rate-limits
+  looked_up: "2026-11-16"

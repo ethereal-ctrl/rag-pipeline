@@ -47,3 +47,9 @@ Qwen/Qwen3-Reranker-0.6B:
   usd_per_million_output_tokens: 0.0
   source: https://deepinfra.com/Qwen/Qwen3-Reranker-0.6B
   looked_up: "2026-11-16"
+openai/gpt-oss-120b:
+  reference_model: Groq openai/gpt-oss-120b (standard input and output)
+  usd_per_million_input_tokens: 0.15
+  usd_per_million_output_tokens: 0.60
+  source: https://console.groq.com/docs/model/openai/gpt-oss-120b
+  looked_up: "2026-11-16"

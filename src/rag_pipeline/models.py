@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import math
+import os
+import time
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Literal, Protocol, runtime_checkable
 
 import httpx
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PositiveInt
+
+from rag_pipeline.cache import CACHE_FILE
+from rag_pipeline.rate_limit import RateLimiter, groq_limits
 
 
 class GeneratorSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Literal["ollama"]
+    provider: Literal["ollama", "groq"]
     model: str
     temperature: float = 0.0
-    max_output_tokens: int = 256
+    max_output_tokens: PositiveInt = 256
+    seed: int = 0
+    context_size: PositiveInt = 8192
+    reasoning_effort: Literal["low", "medium", "high"] = "low"
 
 
 @dataclass(frozen=True)
@@ -23,6 +33,7 @@ class Completion:
     text: str
     input_tokens: int
     output_tokens: int
+    call_seconds: float | None = None
 
 
 class EmbedderSpec(BaseModel):
@@ -86,6 +97,22 @@ class ModelProvider(Protocol):
     def reranker_for(self, spec: RerankerSpec) -> Reranker: ...
 
 
+def model_version(model: Generator | Embedder | Reranker) -> str | None:
+    get_version = getattr(model, "cache_version", None) or getattr(model, "version", None)
+    version = get_version() if callable(get_version) else None
+    return version if isinstance(version, str) else None
+
+
+def _ollama_digest(client: httpx.Client, name: str) -> str | None:
+    response = client.get("/api/tags")
+    response.raise_for_status()
+    tag = name if ":" in name.rsplit("/", 1)[-1] else f"{name}:latest"
+    return next(
+        (model["digest"] for model in response.json()["models"] if model["name"] == tag),
+        None,
+    )
+
+
 class OllamaGenerator:
     def __init__(self, spec: GeneratorSpec, base_url: str = "http://localhost:11434") -> None:
         self._spec = spec
@@ -108,9 +135,9 @@ class OllamaGenerator:
                 "think": False,
                 "options": {
                     "temperature": self._spec.temperature,
-                    "seed": 0,
+                    "seed": self._spec.seed,
                     "num_predict": self._spec.max_output_tokens,
-                    "num_ctx": 8192,
+                    "num_ctx": self._spec.context_size,
                 },
             },
         )
@@ -130,6 +157,91 @@ class OllamaGenerator:
             f"{self._spec.model} ({details.get('parameter_size', '?')}, "
             f"{details.get('quantization_level', '?')})"
         )
+
+    @cached_property
+    def _digest(self) -> str | None:
+        return _ollama_digest(self._http, self._spec.model)
+
+    def cache_version(self) -> str | None:
+        return self._digest
+
+
+def estimated_groq_tokens(system: str, prompt: str, max_output_tokens: int) -> int:
+    # Estimate from text length plus chat framing and a full completion allowance.
+    return (
+        math.ceil((len(system.encode("utf-8")) + len(prompt.encode("utf-8"))) / 3)
+        + 32
+        + max_output_tokens
+    )
+
+
+class GroqGenerator:
+    def __init__(
+        self,
+        spec: GeneratorSpec,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        limiter: RateLimiter | None = None,
+    ) -> None:
+        key = os.environ.get("GROQ_API_KEY", "").strip()
+        if not key:
+            raise ValueError("set GROQ_API_KEY to build a Groq Pipeline Variant")
+        self._spec = spec
+        limits = groq_limits(spec.model)
+        self._limiter = limiter if limiter is not None else RateLimiter(CACHE_FILE, limits)
+        self._http = httpx.Client(
+            base_url="https://api.groq.com",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=60,
+            transport=transport,
+        )
+
+    @property
+    def name(self) -> str:
+        return f"groq:{self._spec.model}"
+
+    def complete(self, system: str, prompt: str) -> Completion:
+        payload = {
+            "model": self._spec.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": self._spec.temperature,
+            "max_completion_tokens": self._spec.max_output_tokens,
+            "reasoning_effort": self._spec.reasoning_effort,
+            "include_reasoning": False,
+            "seed": self._spec.seed,
+        }
+        tokens = estimated_groq_tokens(system, prompt, self._spec.max_output_tokens)
+        backoff = 1.0
+        while True:
+            request = self._limiter.reserve(self._spec.model, tokens)
+            started = time.perf_counter()
+            response = self._http.post("/openai/v1/chat/completions", json=payload)
+            seconds = time.perf_counter() - started
+            if response.status_code != 429:
+                response.raise_for_status()
+                body = response.json()
+                usage = body["usage"]
+                self._limiter.record_usage(
+                    request, usage["prompt_tokens"] + usage["completion_tokens"]
+                )
+                return Completion(
+                    (body["choices"][0]["message"]["content"] or "").strip(),
+                    usage["prompt_tokens"],
+                    usage["completion_tokens"],
+                    seconds,
+                )
+            self._limiter.record_usage(request, 0)
+            try:
+                retry_after = float(response.headers.get("retry-after", "0"))
+            except ValueError:
+                retry_after = 0.0
+            self._limiter.clock.sleep(
+                max(backoff, retry_after) if math.isfinite(retry_after) else backoff
+            )
+            backoff = min(backoff * 2, 60)
 
 
 class OllamaEmbedder:
@@ -158,6 +270,13 @@ class OllamaEmbedder:
     def embed_query_with_usage(self, text: str) -> tuple[list[float], int | None]:
         vectors, input_tokens = self._embed([self._spec.query_prefix + text])
         return vectors[0], input_tokens
+
+    @cached_property
+    def _digest(self) -> str | None:
+        return _ollama_digest(self._http, self._spec.model)
+
+    def cache_version(self) -> str | None:
+        return self._digest
 
 
 class SentenceTransformersEmbedder:
@@ -197,6 +316,9 @@ class SentenceTransformersEmbedder:
         )
         return len(encoded["input_ids"])
 
+    def cache_version(self) -> str | None:
+        return _hf_revision(getattr(self._model[0], "auto_model", None))
+
 
 class SentenceTransformersReranker:
     """A cross-encoder run locally (Apple GPU via MPS when available)."""
@@ -231,12 +353,28 @@ class SentenceTransformersReranker:
         pairs: list[list[int]] = encoded["input_ids"]
         return sum(map(len, pairs))
 
+    def cache_version(self) -> str | None:
+        return _hf_revision(self._model.model)
+
+
+def _hf_revision(model: object) -> str | None:
+    revision = getattr(getattr(model, "config", None), "_commit_hash", None)
+    return revision if isinstance(revision, str) else None
+
 
 class LocalModels:
-    """The runtime model provider: everything served locally (ADR 0001)."""
+    """The runtime model provider for local models and the Groq Free Plan (ADR 0001)."""
 
-    def __init__(self, ollama_url: str = "http://localhost:11434") -> None:
+    def __init__(
+        self,
+        ollama_url: str = "http://localhost:11434",
+        *,
+        groq_transport: httpx.BaseTransport | None = None,
+        groq_limiter: RateLimiter | None = None,
+    ) -> None:
         self._ollama_url = ollama_url
+        self._groq_transport = groq_transport
+        self._groq_limiter = groq_limiter
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
         self._embedders: dict[EmbedderSpec, Embedder] = {}
 
@@ -245,7 +383,9 @@ class LocalModels:
             self._rerankers[spec] = SentenceTransformersReranker(spec)
         return self._rerankers[spec]
 
-    def generator_for(self, spec: GeneratorSpec) -> OllamaGenerator:
+    def generator_for(self, spec: GeneratorSpec) -> Generator:
+        if spec.provider == "groq":
+            return GroqGenerator(spec, transport=self._groq_transport, limiter=self._groq_limiter)
         return OllamaGenerator(spec, self._ollama_url)
 
     def embedder_for(self, spec: EmbedderSpec) -> Embedder:

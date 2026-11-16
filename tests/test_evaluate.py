@@ -2,17 +2,20 @@ from pathlib import Path
 
 import pytest
 from conftest import ARTICLES, FTX_QUERY, PIXEL, QUERIES
-from fakes import FakeModels, GroundedFakeGenerator
+from fakes import ConceptFakeEmbedder, FakeModels, GroundedFakeGenerator, PhraseFakeReranker
+from qdrant_client import QdrantClient
 
+from rag_pipeline.cache import ResponseCache
 from rag_pipeline.corpus import BenchmarkQuery, Evidence
 from rag_pipeline.evaluation import RunStore, evaluate
 from rag_pipeline.index import ChunkIndex
 from rag_pipeline.ingest import ChunkingSettings, ingest
-from rag_pipeline.models import EmbedderSpec, GeneratorSpec
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, RerankerSpec
 from rag_pipeline.variants import (
     GenerationConfig,
     IndexConfig,
     PipelineVariant,
+    RerankConfig,
     RetrievalConfig,
     VariantConfig,
     build_variant,
@@ -161,3 +164,90 @@ def test_every_run_records_the_index_version_it_was_scored_on(ingested: ChunkInd
 
     assert result.meta["index_version"] == version
     assert version.startswith("fixture@")
+
+
+def test_repeating_an_evaluation_reuses_the_model_and_its_latency(tmp_path: Path):
+    config = VariantConfig(
+        name="closed-book",
+        retrieval=RetrievalConfig(mode="none"),
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+    )
+    first_generator = GroundedFakeGenerator({})
+    second_generator = GroundedFakeGenerator({})
+    store = RunStore(tmp_path / "runs")
+    cache_path = tmp_path / "responses.sqlite3"
+    first = evaluate(
+        build_variant(
+            config,
+            index=None,
+            models=FakeModels(first_generator),
+            cache=ResponseCache(cache_path),
+        ),
+        [FTX_QUERY],
+        "smoke",
+        store,
+    )
+
+    second = evaluate(
+        build_variant(
+            config,
+            index=None,
+            models=FakeModels(second_generator),
+            cache=ResponseCache(cache_path),
+        ),
+        [FTX_QUERY],
+        "smoke",
+        store,
+    )
+
+    assert len(first_generator.prompts) == 1
+    assert second_generator.prompts == []
+    assert first.records[0].answer == second.records[0].answer
+    assert first.records[0].stage_seconds == second.records[0].stage_seconds
+    assert first.metrics["latency_p50"] == second.metrics["latency_p50"]
+    assert first.metrics["latency_p95"] == second.metrics["latency_p95"]
+    assert not first.records[0].trace[-1].cache_hit
+    assert second.records[0].trace[-1].cache_hit
+
+
+def test_repeating_an_evaluation_reuses_query_embeddings_and_reranker_scores(tmp_path: Path):
+    class CountingEmbedder(ConceptFakeEmbedder):
+        queries = 0
+
+        def embed_query(self, text: str) -> list[float]:
+            self.queries += 1
+            return super().embed_query(text)
+
+    embedder = CountingEmbedder()
+    index = ChunkIndex(QdrantClient(":memory:"), "cached", embedder=embedder)
+    ingest(ARTICLES, index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    reranker = PhraseFakeReranker("The jury will hear")
+    config = VariantConfig(
+        name="hybrid-rerank",
+        index=IndexConfig(
+            collection=index.collection, embedder=EmbedderSpec(provider="ollama", model="bge-m3")
+        ),
+        retrieval=RetrievalConfig(
+            mode="hybrid",
+            rerank=RerankConfig(
+                reranker=RerankerSpec(provider="sentence-transformers", model="fake"),
+            ),
+        ),
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="m")),
+    )
+    variant = build_variant(
+        config,
+        index=index,
+        models=FakeModels(GroundedFakeGenerator({}), reranker),
+        cache=ResponseCache(tmp_path / "responses.sqlite3"),
+    )
+    store = RunStore(tmp_path / "runs")
+
+    first = evaluate(variant, [FTX_QUERY], "smoke", store)
+    second = evaluate(variant, [FTX_QUERY], "smoke", store)
+
+    assert embedder.queries == 1
+    assert len(reranker.calls) == 1
+    assert first.records[0].retrieved_chunk_ids == second.records[0].retrieved_chunk_ids
+    assert all(stage.cache_hit for stage in second.records[0].trace)
+    assert first.records[0].trace[1].seconds == second.records[0].trace[1].seconds

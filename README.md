@@ -50,6 +50,29 @@ and averages the totals in notional USD. It is available when every model used h
 reference price and the run has complete token counts. The runtime costs nothing in API
 fees under [ADR 0001](docs/adr/0001-zero-cost-no-subscription-runtime.md).
 
+## Cached evaluations and the Groq comparison
+
+Evaluations cache completions, query embeddings and Reranker scores in
+`data/cache/models.sqlite3`. Stage traces flag cache hits and reuse the original
+model-call durations. Retrieval still queries the current index, so index timing
+can vary between runs. Pass `--no-cache` to bypass the response cache.
+
+Set `GROQ_API_KEY` with a Groq Free Plan key to run the large-model comparison.
+Start with one Smoke Set query, then use the fixed `test-400` subset for the held-out
+comparison. The score-once rule applies across `test` and `test-400` for each Pipeline
+Variant. The dry run needs no key or model calls.
+
+```bash
+uv run rag eval configs/variants/closed-book-groq.yaml --split test-400 --dry-run
+uv run rag eval configs/variants/closed-book-groq.yaml --split smoke --limit 1
+```
+
+The limiter persists requests and estimated token reservations in SQLite and reconciles
+them with Groq's reported usage. Limits use rolling minute and 24-hour windows. The
+dry run estimates quota days at a fresh allowance and, for retrieval variants, estimates
+the prompt length from the configured number of Chunks. Its cache count includes
+known prompts for the current index version.
+
 ## Development
 
 ```bash

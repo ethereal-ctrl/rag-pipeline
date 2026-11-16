@@ -1,0 +1,9 @@
+name: closed-book-groq
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: groq
+    model: openai/gpt-oss-120b
+    reasoning_effort: low
+    max_output_tokens: 512

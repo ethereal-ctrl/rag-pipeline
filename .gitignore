@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 data/raw/
+data/cache/
 runs/
 .env
 .DS_Store
