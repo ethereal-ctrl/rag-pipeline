@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import BaseModel, ConfigDict
@@ -42,6 +42,16 @@ class Embedder(Protocol):
     def embed_query(self, text: str) -> list[float]: ...
 
 
+@runtime_checkable
+class EmbedderWithUsage(Protocol):
+    def embed_query_with_usage(self, text: str) -> tuple[list[float], int | None]: ...
+
+
+@runtime_checkable
+class QueryTokenCounter(Protocol):
+    def count_query_tokens(self, text: str) -> int | None: ...
+
+
 class RerankerSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -56,6 +66,11 @@ class Reranker(Protocol):
     def name(self) -> str: ...
 
     def score(self, query: str, texts: list[str]) -> list[float]: ...
+
+
+@runtime_checkable
+class RerankTokenCounter(Protocol):
+    def count_input_tokens(self, query: str, texts: list[str]) -> int | None: ...
 
 
 class Generator(Protocol):
@@ -126,19 +141,23 @@ class OllamaEmbedder:
     def name(self) -> str:
         return f"ollama:{self._spec.model}"
 
-    def _embed(self, texts: list[str]) -> list[list[float]]:
+    def _embed(self, texts: list[str]) -> tuple[list[list[float]], int | None]:
         response = self._http.post(
             "/api/embed", json={"model": self._spec.model, "input": texts, "truncate": True}
         )
         response.raise_for_status()
-        embeddings: list[list[float]] = response.json()["embeddings"]
-        return embeddings
+        body = response.json()
+        return body["embeddings"], body.get("prompt_eval_count")
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts)
+        return self._embed(texts)[0]
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed([self._spec.query_prefix + text])[0]
+        return self.embed_query_with_usage(text)[0]
+
+    def embed_query_with_usage(self, text: str) -> tuple[list[float], int | None]:
+        vectors, input_tokens = self._embed([self._spec.query_prefix + text])
+        return vectors[0], input_tokens
 
 
 class SentenceTransformersEmbedder:
@@ -166,6 +185,18 @@ class SentenceTransformersEmbedder:
     def embed_query(self, text: str) -> list[float]:
         return self._embed([self._spec.query_prefix + text])[0]
 
+    def count_query_tokens(self, text: str) -> int | None:
+        tokenizer = self._model.tokenizer
+        if tokenizer is None:
+            return None
+        prompt = self._model.prompts.get(self._model.default_prompt_name or "") or ""
+        encoded = tokenizer(
+            prompt + self._spec.query_prefix + text,
+            truncation=True,
+            max_length=self._model.max_seq_length,
+        )
+        return len(encoded["input_ids"])
+
 
 class SentenceTransformersReranker:
     """A cross-encoder run locally (Apple GPU via MPS when available)."""
@@ -187,6 +218,18 @@ class SentenceTransformersReranker:
             [(query, t) for t in texts], batch_size=self._spec.batch_size, show_progress_bar=False
         )
         return [float(s) for s in scores]
+
+    def count_input_tokens(self, query: str, texts: list[str]) -> int | None:
+        if not texts:
+            return 0
+        tokenizer = self._model.tokenizer
+        if tokenizer is None:
+            return None
+        encoded = tokenizer(
+            [query] * len(texts), texts, truncation=True, max_length=self._spec.max_length
+        )
+        pairs: list[list[int]] = encoded["input_ids"]
+        return sum(map(len, pairs))
 
 
 class LocalModels:

@@ -1,14 +1,14 @@
 from pathlib import Path
 
 import pytest
-from conftest import ARTICLES, PIXEL, QUERIES
+from conftest import ARTICLES, FTX_QUERY, PIXEL, QUERIES
 from fakes import FakeModels, GroundedFakeGenerator
 
 from rag_pipeline.corpus import BenchmarkQuery, Evidence
 from rag_pipeline.evaluation import RunStore, evaluate
 from rag_pipeline.index import ChunkIndex
 from rag_pipeline.ingest import ChunkingSettings, ingest
-from rag_pipeline.models import GeneratorSpec
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec
 from rag_pipeline.variants import (
     GenerationConfig,
     IndexConfig,
@@ -45,6 +45,63 @@ def test_scores_retrieval_hits_and_answer_containment(ingested: ChunkIndex, tmp_
     # FTX answered correctly, Null Query correctly abstained, Pixel wrongly abstained.
     assert result.metrics["accuracy"] == pytest.approx(2 / 3)
     assert result.metrics["queries"] == 3
+
+
+@pytest.mark.parametrize("retrieval_only", [False, True])
+def test_evaluation_reports_notional_cost_and_persists_stage_usage(
+    dense_index: ChunkIndex, tmp_path: Path, retrieval_only: bool
+):
+    ingest(ARTICLES, dense_index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    config = VariantConfig(
+        name="dense",
+        index=IndexConfig(
+            collection=dense_index.collection,
+            embedder=EmbedderSpec(provider="ollama", model="bge-m3"),
+        ),
+        retrieval=RetrievalConfig(mode="dense"),
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="qwen3.5:4b")),
+    )
+    variant = build_variant(config, index=dense_index, models=FakeModels(GroundedFakeGenerator({})))
+    store = RunStore(tmp_path)
+
+    result = evaluate(variant, [FTX_QUERY], "smoke", store, retrieval_only=retrieval_only)
+
+    record = result.records[0]
+    retrieval_tokens = len(FTX_QUERY.question.split())
+    assert record.trace[0].input_tokens == retrieval_tokens
+    assert [stage.name for stage in record.trace] == (
+        ["retrieve"] if retrieval_only else ["retrieve", "generate"]
+    )
+    expected = (
+        retrieval_tokens * 0.010 + record.input_tokens * 0.10 + record.output_tokens * 0.20
+    ) / 1_000_000
+    assert result.metrics["cost_per_question"] == pytest.approx(expected)
+    assert result.intervals["cost_per_question"] == pytest.approx((expected, expected))
+    assert result.metrics["input_tokens_per_question"] == retrieval_tokens + record.input_tokens
+    assert result.metrics["output_tokens_per_question"] == record.output_tokens
+    assert store.load(result.run_id).records == result.records
+
+
+def test_evaluation_omits_cost_if_one_model_has_no_reference_price(
+    dense_index: ChunkIndex, tmp_path: Path
+):
+    ingest(ARTICLES, dense_index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    config = VariantConfig(
+        name="dense",
+        index=IndexConfig(
+            collection=dense_index.collection,
+            embedder=EmbedderSpec(provider="ollama", model="unpriced"),
+        ),
+        retrieval=RetrievalConfig(mode="dense"),
+        generation=GenerationConfig(generator=GeneratorSpec(provider="ollama", model="qwen3.5:4b")),
+    )
+    variant = build_variant(config, index=dense_index, models=FakeModels(GroundedFakeGenerator({})))
+
+    result = evaluate(variant, [FTX_QUERY], "smoke", RunStore(tmp_path))
+
+    assert "cost_per_question" not in result.metrics
+    assert "cost_per_question" not in result.intervals
+    assert result.metrics["input_tokens_per_question"] > 0
 
 
 UPDATES_QUERY = BenchmarkQuery(

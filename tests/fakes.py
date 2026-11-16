@@ -145,6 +145,9 @@ class ConceptFakeEmbedder:
     def embed_query(self, text: str) -> list[float]:
         return self._vector(text)
 
+    def count_query_tokens(self, text: str) -> int:
+        return len(text.split())
+
 
 class PhraseFakeReranker:
     """Scores a Chunk 1.0 if it contains the preferred phrase, else 0.0."""
@@ -160,3 +163,7 @@ class PhraseFakeReranker:
     def score(self, query: str, texts: list[str]) -> list[float]:
         self.calls.append((query, len(texts)))
         return [1.0 if self._phrase in t else 0.0 for t in texts]
+
+    def count_input_tokens(self, query: str, texts: list[str]) -> int:
+        query_tokens = len(query.split())
+        return sum(query_tokens + len(text.split()) for text in texts)

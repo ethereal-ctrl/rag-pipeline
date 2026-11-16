@@ -6,5 +6,16 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  phoenix:
+    image: arizephoenix/phoenix:version-12.0.0
+    ports:
+      - "127.0.0.1:6006:6006"
+      - "127.0.0.1:4317:4317"
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+    volumes:
+      - phoenix_data:/mnt/data
+
 volumes:
   qdrant_data:
+  phoenix_data:

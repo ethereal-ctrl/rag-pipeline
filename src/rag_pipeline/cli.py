@@ -27,8 +27,9 @@ from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.models import EmbedderSpec, LocalModels
-from rag_pipeline.report import results_table
+from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.splits import DEFAULT_SEED, DEFAULT_SIZES, SPLIT_NAMES, Splits, make_splits
+from rag_pipeline.tracing import cli_tracer
 from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant
 
 RAW_DIR = Path("data/raw")
@@ -102,6 +103,7 @@ def ingest_command(
 
 @app.command("eval")
 def eval_command(
+    ctx: typer.Context,
     variant_file: Path,
     split: str = "smoke",
     limit: Annotated[int | None, typer.Option(help="Only the first N queries (debugging).")] = None,
@@ -114,6 +116,7 @@ def eval_command(
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
+    tracer = ctx.with_resource(cli_tracer())
     if split not in SPLIT_NAMES:
         raise typer.BadParameter(f"split must be one of {SPLIT_NAMES}")
     if split == "test" and limit is not None:
@@ -121,7 +124,9 @@ def eval_command(
     config = VariantConfig.from_yaml(variant_file)
     queries = _split_queries(split)[:limit]
     models = LocalModels()
-    variant = build_variant(config, index=_index_for(config, models, qdrant_url), models=models)
+    variant = build_variant(
+        config, index=_index_for(config, models, qdrant_url), models=models, tracer=tracer
+    )
     try:
         result = evaluate(
             variant,
@@ -156,7 +161,8 @@ def _print_metrics(metrics: dict[str, float], intervals: dict[str, tuple[float, 
             typer.echo(f"  {name:<34} {int(value)}")
             continue
         low, high = intervals.get(name, (float("nan"), float("nan")))
-        typer.echo(f"  {name:<34} {value:.3f}  [{low:.3f}, {high:.3f}]")
+        estimate, lower, upper = (metric_number(name, number) for number in (value, low, high))
+        typer.echo(f"  {metric_label(name):<34} {estimate}  [{lower}, {upper}]")
 
 
 @app.command("compare")
@@ -167,18 +173,29 @@ def compare_command(baseline_run: str, candidate_run: str) -> None:
     typer.echo(f"  {'metric':<34} {'base':>6} {'cand':>6} {'delta':>7}  95% interval")
     for d in deltas:
         mark = "*" if d.significant else " "
+        base, candidate, low, high = (
+            metric_number(d.metric, value, signed=signed)
+            for value, signed in (
+                (d.baseline, False),
+                (d.candidate, False),
+                (d.low, True),
+                (d.high, True),
+            )
+        )
+        delta = metric_number(d.metric, d.delta, signed=True)
         typer.echo(
-            f"{mark} {d.metric:<34} {d.baseline:6.3f} {d.candidate:6.3f} {d.delta:+7.3f}"
-            f"  [{d.low:+.3f}, {d.high:+.3f}]"
+            f"{mark} {metric_label(d.metric):<34} {base:>6} {candidate:>6} {delta:>7}"
+            f"  [{low}, {high}]"
         )
 
 
 @app.command("table")
 def table_command(
     run_ids: list[str],
-    metrics: Annotated[
-        str, typer.Option(help="Comma-separated metric names, in column order.")
-    ] = "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,latency_p50,latency_p95",
+    metrics: Annotated[str, typer.Option(help="Comma-separated metric names, in column order.")] = (
+        "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,"
+        "latency_p50,latency_p95,cost_per_question"
+    ),
     output: Annotated[Path | None, typer.Option(help="Also write the table here.")] = None,
 ) -> None:
     """Markdown table of runs with 95% intervals, for the report."""
@@ -220,6 +237,7 @@ def _report_gate(title: str, report: GateReport) -> None:
 
 @app.command("gate")
 def gate_command(
+    ctx: typer.Context,
     gate_file: Path = GATE_FILE,
     answers: Annotated[
         bool, typer.Option(help="Also run the generator and check answer-level metrics.")
@@ -227,6 +245,7 @@ def gate_command(
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
     """Check Smoke Set metrics against the committed thresholds; exit 1 on any drop."""
+    tracer = ctx.with_resource(cli_tracer()) if answers else None
     gate = GateConfig.from_yaml(gate_file)
     configs = [VariantConfig.from_yaml(path) for path in gate.variants]
     models = LocalModels()
@@ -246,7 +265,9 @@ def gate_command(
         # Every variant on a collection queries it with the embedder it was built with.
         built = by_collection[config.index.collection] if config.index else config
         variants.append(
-            build_variant(config, index=_index_for(built, models, qdrant_url), models=models)
+            build_variant(
+                config, index=_index_for(built, models, qdrant_url), models=models, tracer=tracer
+            )
         )
     queries = _split_queries(gate.split)
     retrieval = retrieval_gate(variants, queries, gate.retrieval)

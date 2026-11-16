@@ -8,7 +8,7 @@ See `GLOSSARY.md` for the vocabulary and `docs/adr/` for the design decisions.
 
 ```bash
 uv sync
-docker compose up -d          # Qdrant
+docker compose up -d          # Qdrant and Phoenix
 ollama pull qwen3.5:4b        # local generator
 uv run rag data fetch         # pinned MultiHop-RAG files, checksum-verified
 uv run rag ingest             # chunk + index the Corpus (incremental)
@@ -33,6 +33,22 @@ Retrieval metrics (Hits@4/@10, MRR@10, MAP@10) follow the upstream MultiHop-RAG 
 exactly and were cross-checked against it; Evidence Recall@10 adds the fraction of all
 Evidence found. Answer accuracy requires the whole normalised reference answer to appear in
 the answer, which is stricter than the upstream any-shared-word check.
+
+## Tracing and notional cost
+
+Start Phoenix with `docker compose up -d phoenix`. After running an evaluation, open
+[Phoenix](http://localhost:6006) and select the `rag-pipeline` project to inspect an
+answer's retrieval, optional Reranker, and generation spans. Spans carry the Pipeline
+Variant, Chunk IDs and available model token counts. Prompts and Chunk text stay out of
+the spans. The CLI checks the collector at startup and exports over OTLP/HTTP when it is
+reachable. Set `RAG_TRACING_ENDPOINT` to override
+`http://127.0.0.1:6006/v1/traces` or set `RAG_TRACING=0` to disable export.
+
+Evaluation stores timings and token counts by stage. The `cost_per_question` metric sums
+each stage's token counts at the [hosted reference list prices](src/rag_pipeline/prices.yaml)
+and averages the totals in notional USD. It is available when every model used has a
+reference price and the run has complete token counts. The runtime costs nothing in API
+fees under [ADR 0001](docs/adr/0001-zero-cost-no-subscription-runtime.md).
 
 ## Development
 

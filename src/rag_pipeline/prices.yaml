@@ -1,0 +1,49 @@
+# Notional hosted reference list prices in USD. Local and free-tier runtime costs zero.
+qwen3.5:4b:
+  reference_model: Featherless Qwen/Qwen3.5-4B
+  usd_per_million_input_tokens: 0.10
+  usd_per_million_output_tokens: 0.20
+  source: https://featherless.ai/models/Qwen/Qwen3.5-4B
+  looked_up: "2026-11-16"
+qwen3.5:9b:
+  reference_model: DeepInfra Qwen/Qwen3.5-9B
+  usd_per_million_input_tokens: 0.10
+  usd_per_million_output_tokens: 0.15
+  source: https://deepinfra.com/Qwen/Qwen3.5-9B
+  looked_up: "2026-11-16"
+bge-m3:
+  reference_model: DeepInfra BAAI/bge-m3
+  usd_per_million_input_tokens: 0.010
+  usd_per_million_output_tokens: 0.0
+  source: https://deepinfra.com/BAAI/bge-m3
+  looked_up: "2026-11-16"
+qwen3-embedding:0.6b:
+  reference_model: DeepInfra Qwen/Qwen3-Embedding-0.6B
+  usd_per_million_input_tokens: 0.010
+  usd_per_million_output_tokens: 0.0
+  source: https://deepinfra.com/Qwen/Qwen3-Embedding-0.6B
+  looked_up: "2026-11-16"
+qwen3-embedding:4b:
+  reference_model: DeepInfra Qwen/Qwen3-Embedding-4B
+  usd_per_million_input_tokens: 0.020
+  usd_per_million_output_tokens: 0.0
+  source: https://deepinfra.com/Qwen/Qwen3-Embedding-4B
+  looked_up: "2026-11-16"
+BAAI/bge-small-en-v1.5:
+  reference_model: Node bge-small-en-v1.5
+  usd_per_million_input_tokens: 0.020
+  usd_per_million_output_tokens: 0.0
+  source: https://node.uk/ai/models/bge-small-en-v1.5/
+  looked_up: "2026-11-16"
+BAAI/bge-reranker-v2-m3:
+  reference_model: FPT Cloud bge-reranker-v2-m3 (international)
+  usd_per_million_input_tokens: 0.020
+  usd_per_million_output_tokens: 0.0
+  source: https://ai.fptcloud.com/pricing/
+  looked_up: "2026-11-16"
+Qwen/Qwen3-Reranker-0.6B:
+  reference_model: DeepInfra Qwen/Qwen3-Reranker-0.6B
+  usd_per_million_input_tokens: 0.010
+  usd_per_million_output_tokens: 0.0
+  source: https://deepinfra.com/Qwen/Qwen3-Reranker-0.6B
+  looked_up: "2026-11-16"
