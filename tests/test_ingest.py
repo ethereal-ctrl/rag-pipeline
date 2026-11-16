@@ -144,3 +144,12 @@ def test_two_index_versions_coexist_and_a_variant_config_picks_one():
 
     assert top_chunk(SMALL_CHUNKS) != top_chunk(wide)
     assert top_chunk(wide) == PIXEL.body  # the whole Article fits one wide Chunk
+
+
+def test_collection_names_stay_safe_for_model_names_with_tags_and_namespaces():
+    assert index_collection(SMALL_CHUNKS, "qwen3-embedding:0.6b") == (
+        "chunks-sent-w20-o0-qwen3-embedding-0.6b"
+    )
+    assert index_collection(SMALL_CHUNKS, "BAAI/bge-small-en-v1.5") == (
+        "chunks-sent-w20-o0-bge-small-en-v1.5"
+    )

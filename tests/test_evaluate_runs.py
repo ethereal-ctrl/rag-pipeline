@@ -91,3 +91,40 @@ def test_closed_book_runs_report_accuracy_but_no_retrieval_metrics(tmp_path: Pat
     assert not any(name.startswith(("hits", "mrr", "map", "evidence")) for name in result.metrics)
     assert all(r.hit_at_10 is None for r in result.records)
     assert "hits@10" not in result.intervals
+
+
+def test_a_retrieval_only_run_scores_retrieval_without_generating(tmp_path: Path):
+    variant = ScriptedVariant("bm25", SCRIPT)
+    store = RunStore(tmp_path)
+
+    result = evaluate(variant, QUERIES, "dev", store, retrieval_only=True)
+
+    assert variant.asked == []  # the generator path was never taken
+    assert result.metrics["hits@10"] == 1.0
+    assert "accuracy" not in result.metrics
+    assert all(r.correct is None for r in result.records)
+    assert result.meta["retrieval_only"] is True
+    # A later full run of the same variant is a different run, not a resumed one.
+    assert evaluate(variant, QUERIES, "dev", store).run_id != result.run_id
+
+
+def test_retrieval_only_runs_are_refused_on_the_test_split(tmp_path: Path):
+    with pytest.raises(ValueError, match="Test Split"):
+        evaluate(
+            ScriptedVariant("bm25", SCRIPT),
+            QUERIES,
+            "test",
+            RunStore(tmp_path),
+            retrieval_only=True,
+        )
+
+
+def test_runs_report_median_and_95th_percentile_latency(tmp_path: Path):
+    latencies = {q.question: float(n) for n, q in enumerate(QUERIES, start=1)}  # 1 s .. 6 s
+    variant = ScriptedVariant("bm25", SCRIPT, latencies=latencies)
+
+    result = evaluate(variant, QUERIES, "dev", RunStore(tmp_path))
+
+    assert result.metrics["latency_p50"] == pytest.approx(3.5)
+    assert result.metrics["latency_p95"] == pytest.approx(5.75)  # linear interpolation
+    assert "latency_p50" in result.intervals

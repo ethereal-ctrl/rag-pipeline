@@ -154,9 +154,14 @@ class PipelineVariant:
     def index_version(self) -> str | None:
         return self._index.version() if self._index is not None else None
 
-    def retrieve(self, question: str) -> tuple[RetrievedChunk, ...]:
-        """The ranked Chunks this variant would show the generator, without generating."""
-        return self._retrieve_timed(question, {})
+    def retrieve(
+        self, question: str, stages: dict[str, float] | None = None
+    ) -> tuple[RetrievedChunk, ...]:
+        """The ranked Chunks this variant would show the generator, without generating.
+
+        Stage timings (retrieve, rerank) are written into `stages` when it is given.
+        """
+        return self._retrieve_timed(question, {} if stages is None else stages)
 
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()
