@@ -9,6 +9,7 @@ import math
 import random
 import re
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,6 +36,10 @@ class Evaluable(Protocol):
 
     def answer(self, question: str) -> Answer: ...
 
+    def retrieve(
+        self, question: str, stages: dict[str, float] | None = None
+    ) -> tuple[RetrievedChunk, ...]: ...
+
     def index_version(self) -> str | None: ...
 
 
@@ -49,7 +54,7 @@ class QueryRecord:
     reference_answer: str
     answer: str
     abstained: bool
-    correct: bool
+    correct: bool | None  # None in retrieval-only runs
     hit_at_4: bool | None
     hit_at_10: bool | None
     reciprocal_rank: float | None
@@ -142,8 +147,18 @@ def _is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
     return f" {_normalise(query.answer)} " in f" {_normalise(answer)} "
 
 
-def _score(query: BenchmarkQuery, variant: Evaluable) -> QueryRecord:
-    answer = variant.answer(query.question)
+def _retrieve_only(variant: Evaluable, question: str) -> Answer:
+    stages: dict[str, float] = {}
+    started = time.perf_counter()
+    retrieved = variant.retrieve(question, stages)
+    return Answer("", False, retrieved, 0, 0, time.perf_counter() - started, stages)
+
+
+def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> QueryRecord:
+    if retrieval_only:
+        answer = _retrieve_only(variant, query.question)
+    else:
+        answer = variant.answer(query.question)
     scored = variant.config.uses_retrieval and not query.is_null
     ranks = _rank_scores(query, answer.retrieved) if scored else None
     return QueryRecord(
@@ -153,7 +168,7 @@ def _score(query: BenchmarkQuery, variant: Evaluable) -> QueryRecord:
         reference_answer=query.answer,
         answer=answer.text,
         abstained=answer.abstained,
-        correct=_is_correct(query, answer.text, answer.abstained),
+        correct=None if retrieval_only else _is_correct(query, answer.text, answer.abstained),
         hit_at_4=ranks.hit_at_4 if ranks else None,
         hit_at_10=ranks.hit_at_10 if ranks else None,
         reciprocal_rank=ranks.reciprocal_rank if ranks else None,
@@ -205,10 +220,16 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
         values = [float(v) for r in records if (v := getattr(r, attribute)) is not None]
         if values:  # absent for Closed-Book runs and Null-Query-only samples
             metrics[name] = _mean(values)
-    metrics["accuracy"] = _mean([float(r.correct) for r in records])
-    for query_type in sorted({r.query_type for r in records}):
-        typed = [float(r.correct) for r in records if r.query_type == query_type]
-        metrics[f"accuracy[{query_type}]"] = _mean(typed)
+    judged = [r for r in records if r.correct is not None]
+    if judged:  # absent for retrieval-only runs
+        metrics["accuracy"] = _mean([float(bool(r.correct)) for r in judged])
+        for query_type in sorted({r.query_type for r in judged}):
+            typed = [float(bool(r.correct)) for r in judged if r.query_type == query_type]
+            metrics[f"accuracy[{query_type}]"] = _mean(typed)
+    seconds = sorted(r.seconds for r in records)
+    if seconds:
+        metrics["latency_p50"] = _percentile(seconds, 0.50)
+        metrics["latency_p95"] = _percentile(seconds, 0.95)
     return metrics
 
 
@@ -384,12 +405,17 @@ class RunStore:
 
 
 def _fingerprint(
-    config: VariantConfig, index_version: str | None, split: str, queries: list[BenchmarkQuery]
+    config: VariantConfig,
+    index_version: str | None,
+    split: str,
+    queries: list[BenchmarkQuery],
+    retrieval_only: bool,
 ) -> str:
     payload = json.dumps(
         {
             "variant": config.model_dump(),
             "index_version": index_version,
+            "retrieval_only": retrieval_only,
             "split": split,
             "queries": [q.id for q in queries],
         },
@@ -417,17 +443,25 @@ def evaluate(
     store: RunStore,
     *,
     allow_rescore: bool = False,
+    retrieval_only: bool = False,
 ) -> RunResult:
-    """Score a Pipeline Variant on a split, resuming an interrupted identical run if present."""
+    """Score a Pipeline Variant on a split, resuming an interrupted identical run if present.
+
+    `retrieval_only` skips generation and scores retrieval alone (for bake-offs on the Dev
+    Split); it is refused on the Test Split, which is scored once with the whole pipeline.
+    """
     config = variant.config
+    if retrieval_only and split == "test":
+        raise ValueError("retrieval-only runs are not allowed on the Test Split (ADR 0005)")
     if split == "test":
         _guard_test_split(store, config, allow_rescore)
     index_version = variant.index_version()
-    fingerprint = _fingerprint(config, index_version, split, queries)
+    fingerprint = _fingerprint(config, index_version, split, queries, retrieval_only)
     run_id = store.find_incomplete(fingerprint)
     if run_id is None:
         started = datetime.now(UTC)
-        run_id = f"{started:%Y%m%dT%H%M%S%f}-{config.name}-{split}"
+        suffix = "-retrieval" if retrieval_only else ""
+        run_id = f"{started:%Y%m%dT%H%M%S%f}-{config.name}-{split}{suffix}"
         generator = variant.generator
         version = getattr(generator, "version", None)
         store.begin(
@@ -442,12 +476,13 @@ def evaluate(
                 "commit": _git_commit(),
                 "started_at": started.isoformat(),
                 "rescored": allow_rescore and split == "test",
+                "retrieval_only": retrieval_only,
             },
         )
     done = {r.query_id: r for r in store.records_so_far(run_id)}
     for query in queries:
         if query.id not in done:
-            record = _score(query, variant)
+            record = _score(query, variant, retrieval_only)
             store.append(run_id, record)
             done[query.id] = record
     records = [done[q.id] for q in queries]

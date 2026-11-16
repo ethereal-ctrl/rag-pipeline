@@ -1,0 +1,17 @@
+# Model bake-off (Ticket 10), Dev Split. Differs from its reference in one role only.
+name: bakeoff-embed-qwen3-emb-4b
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-4b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:4b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+retrieval:
+  mode: hybrid
+  top_k: 10
+  candidates: 50
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5

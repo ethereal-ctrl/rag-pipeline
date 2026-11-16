@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -34,7 +35,8 @@ def index_collection(settings: ChunkingSettings, embedder_model: str | None) -> 
     """
     name = f"chunks-{settings.label}"
     if embedder_model:
-        name += "-" + embedder_model.rsplit("/", 1)[-1].lower()
+        model = embedder_model.rsplit("/", 1)[-1].lower()
+        name += "-" + re.sub(r"[^a-z0-9.]+", "-", model).strip("-")
     return name
 
 

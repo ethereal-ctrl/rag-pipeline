@@ -27,6 +27,7 @@ from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.models import EmbedderSpec, LocalModels
+from rag_pipeline.report import results_table
 from rag_pipeline.splits import DEFAULT_SEED, DEFAULT_SIZES, SPLIT_NAMES, Splits, make_splits
 from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant
 
@@ -107,6 +108,9 @@ def eval_command(
     allow_rescore: Annotated[
         bool, typer.Option(help="Re-score a variant on the Test Split (ADR 0005).")
     ] = False,
+    retrieval_only: Annotated[
+        bool, typer.Option(help="Score retrieval alone, without generating (not on test).")
+    ] = False,
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
@@ -119,8 +123,15 @@ def eval_command(
     models = LocalModels()
     variant = build_variant(config, index=_index_for(config, models, qdrant_url), models=models)
     try:
-        result = evaluate(variant, queries, split, RunStore(RUNS_DIR), allow_rescore=allow_rescore)
-    except TestSplitAlreadyScored as error:
+        result = evaluate(
+            variant,
+            queries,
+            split,
+            RunStore(RUNS_DIR),
+            allow_rescore=allow_rescore,
+            retrieval_only=retrieval_only,
+        )
+    except (TestSplitAlreadyScored, ValueError) as error:
         typer.echo(str(error), err=True)
         raise typer.Exit(code=1) from error
     typer.echo(f"Run {result.run_id}")
@@ -160,6 +171,23 @@ def compare_command(baseline_run: str, candidate_run: str) -> None:
             f"{mark} {d.metric:<34} {d.baseline:6.3f} {d.candidate:6.3f} {d.delta:+7.3f}"
             f"  [{d.low:+.3f}, {d.high:+.3f}]"
         )
+
+
+@app.command("table")
+def table_command(
+    run_ids: list[str],
+    metrics: Annotated[
+        str, typer.Option(help="Comma-separated metric names, in column order.")
+    ] = "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,latency_p50,latency_p95",
+    output: Annotated[Path | None, typer.Option(help="Also write the table here.")] = None,
+) -> None:
+    """Markdown table of runs with 95% intervals, for the report."""
+    store = RunStore(RUNS_DIR)
+    table = results_table([store.load(r) for r in run_ids], metrics.split(","))
+    typer.echo(table)
+    if output:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(table + "\n", "utf-8")
 
 
 @app.command("export")

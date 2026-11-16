@@ -76,6 +76,7 @@ class ScriptedVariant:
         config_tag: str = "v1",
         crash_after: int | None = None,
         retrieval_mode: Literal["none", "bm25"] = "bm25",
+        latencies: dict[str, float] | None = None,
     ) -> None:
         self.config = VariantConfig(
             name=name,
@@ -86,23 +87,30 @@ class ScriptedVariant:
         self.generator = GroundedFakeGenerator({})
         self._script = script
         self._crash_after = crash_after
+        self._latencies = latencies or {}
         self.asked: list[str] = []
 
     def index_version(self) -> str | None:
         return None if self.config.index is None else f"{self.config.index.collection}@fixed"
 
+    def retrieve(
+        self, question: str, stages: dict[str, float] | None = None
+    ) -> tuple[RetrievedChunk, ...]:
+        _, chunk_texts = self._script[question]
+        if not self.config.uses_retrieval:
+            return ()
+        return tuple(
+            RetrievedChunk(f"c{i}", "a", "t", "s", "2023-10-01", body, 1.0 / (i + 1))
+            for i, body in enumerate(chunk_texts)
+        )
+
     def answer(self, question: str) -> Answer:
         if self._crash_after is not None and len(self.asked) >= self._crash_after:
             raise RuntimeError("simulated crash")
         self.asked.append(question)
-        text, chunk_texts = self._script[question]
-        if not self.config.uses_retrieval:
-            chunk_texts = []
-        retrieved = tuple(
-            RetrievedChunk(f"c{i}", "a", "t", "s", "2023-10-01", body, 1.0 / (i + 1))
-            for i, body in enumerate(chunk_texts)
-        )
-        return Answer(text, is_abstention(text), retrieved, 10, 2, 0.5)
+        text, _ = self._script[question]
+        seconds = self._latencies.get(question, 0.5)
+        return Answer(text, is_abstention(text), self.retrieve(question), 10, 2, seconds)
 
 
 class ConceptFakeEmbedder:
