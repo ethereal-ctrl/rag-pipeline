@@ -19,6 +19,7 @@ from rag_pipeline.evaluation import (
 )
 from rag_pipeline.judge_evaluation import with_judge_metrics, write_text
 from rag_pipeline.ladder import HeldOutSplit, Ladder, LadderRung, ladder_status
+from rag_pipeline.rate_limit import RemoteProvider
 from rag_pipeline.report import metric_cell, metric_number
 from rag_pipeline.variants import ABSTENTION_TEXT, VariantConfig
 
@@ -216,12 +217,15 @@ def write_ladder_report(
     dev_ids: tuple[str, ...],
     test_ids: tuple[str, ...],
     subset_ids: tuple[str, ...],
+    provider: RemoteProvider | None = None,
 ) -> Path:
     from rag_pipeline.ladder_charts import write_charts
 
     full = _completed(store, ladder.rungs, "test")
     subset = _completed(store, ladder.rungs, "test-400")
-    remote = _completed(store, tuple(pair.remote for pair in ladder.large_model), "test-400")
+    pairs = ladder.large_pairs(provider)
+    provider_name = (provider or ladder.large_model_provider).title()
+    remote = _completed(store, tuple(pair.remote for pair in pairs), "test-400")
     fixed_subset = set(subset_ids)
     local_runs: dict[str, RunResult | None] = {}
     if split == "test":
@@ -301,35 +305,36 @@ def write_ladder_report(
                 ],
             ),
             "## Large-model comparison · test-400",
-            "Local estimates use the same saved queries as Groq. Completed full Test Split runs "
-            "supply the matching local answers. A positive difference means Groq minus local.",
+            f"Local estimates use the same saved queries as {provider_name}. Completed full Test "
+            "Split runs supply the matching local answers. The paired step subtracts the local "
+            "estimate from the remote estimate.",
         ]
     )
     large_rows: list[list[str]] = []
     comparison_sources: list[tuple[LadderRung, RunResult | None]] = []
-    for pair in ladder.large_model:
+    for pair in pairs:
         local = subset.get(pair.local.config.name) or full.get(pair.local.config.name)
-        groq = remote.get(pair.remote.config.name)
+        remote_run = remote.get(pair.remote.config.name)
         if local is not None:
             comparison_sources.append((pair.local, local))
-        comparison_sources.append((pair.remote, groq))
+        comparison_sources.append((pair.remote, remote_run))
         shared: set[str] = (
             fixed_subset
             & {row.query_id for row in local.records}
-            & {row.query_id for row in groq.records}
-            if local is not None and groq is not None
+            & {row.query_id for row in remote_run.records}
+            if local is not None and remote_run is not None
             else set()
         )
         left = _select_rows(local, shared) if local else None
-        right = _select_rows(groq, shared) if groq else None
+        right = _select_rows(remote_run, shared) if remote_run else None
         compatible = (local is None or _compatible(pair.local, local)) and (
-            groq is None or _compatible(pair.remote, groq)
+            remote_run is None or _compatible(pair.remote, remote_run)
         )
         large_rows.append(
             [
                 pair.local.label,
                 _run_id(local),
-                _run_id(groq),
+                _run_id(remote_run),
                 str(len(shared)) if shared else "—",
                 *_cells(left, _LARGE_METRICS),
                 *_cells(right, _LARGE_METRICS),
@@ -341,10 +346,10 @@ def write_ladder_report(
             [
                 "Rung",
                 "Local run",
-                "Groq run",
+                f"{provider_name} run",
                 "Shared n",
                 *(f"Local {METRICS[key]}" for key in _LARGE_METRICS),
-                *(f"Groq {METRICS[key]}" for key in _LARGE_METRICS),
+                *(f"{provider_name} {METRICS[key]}" for key in _LARGE_METRICS),
                 "Paired step",
             ],
             large_rows,

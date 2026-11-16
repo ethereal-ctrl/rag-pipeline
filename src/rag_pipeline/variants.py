@@ -53,7 +53,7 @@ from rag_pipeline.models import (
     model_version,
     query_embedding,
 )
-from rag_pipeline.rate_limit import groq_limits, quota_days
+from rag_pipeline.rate_limit import quota_days, remote_limits
 from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids, span_trace_id
 
@@ -183,10 +183,12 @@ class VariantConfig(_Frozen):
     def uses_retrieval(self) -> bool:
         return self.retrieval.mode != "none"
 
-    def uses_groq(self, *, retrieval_only: bool = False) -> bool:
+    def remote_generators(self, *, retrieval_only: bool = False) -> tuple[GeneratorSpec, ...]:
         hyde = self.retrieval.hyde_generator
-        return (hyde is not None and hyde.provider == "groq") or (
-            not retrieval_only and self.generation.generator.provider == "groq"
+        return tuple(
+            spec
+            for spec in (hyde, None if retrieval_only else self.generation.generator)
+            if spec is not None and spec.remote_provider is not None
         )
 
     def run_config(self) -> dict[str, Any]:
@@ -326,9 +328,9 @@ def plan_remote_run(
         return RemoteRunPlan(calls, 0, max(plan.days for plan in plans), upper_bound=bool(calls))
     spec = config.generation.generator
     hyde = config.retrieval.hyde_generator
-    if hyde is not None and hyde.provider != "groq":
+    if hyde is not None and hyde.remote_provider is None:
         hyde = None
-    remote_answer = spec.provider == "groq" and not retrieval_only
+    remote_answer = spec.remote_provider is not None and not retrieval_only
     if not remote_answer and hyde is None:
         return RemoteRunPlan(0, 0, 0)
     agentic = None if retrieval_only else config.agentic
@@ -349,7 +351,7 @@ def plan_remote_run(
         cached_calls = 0
         if cache is not None and stages:
             if not config.uses_retrieval:
-                key = _generation_key(spec, f"groq:{spec.model}", None, system, prompt)
+                key = _generation_key(spec, f"{spec.provider}:{spec.model}", None, system, prompt)
                 cached_calls += cache.contains(key)
             elif index_version is not None:
                 plan_key = _generation_plan_key(config, index_version, query.question)
@@ -369,25 +371,30 @@ def plan_remote_run(
         answer_tokens += call_tokens * (len(stages) - cached_calls)
         if hyde is not None:
             prompt = _hyde_prompt(query.question)
-            key = _generation_key(hyde, f"groq:{hyde.model}", None, HYDE_SYSTEM_PROMPT, prompt)
+            key = _generation_key(
+                hyde, f"{hyde.provider}:{hyde.model}", None, HYDE_SYSTEM_PROMPT, prompt
+            )
             if cache is not None and cache.contains(key):
                 hyde_cached += 1
             else:
                 hyde_tokens += estimate_tokens(HYDE_SYSTEM_PROMPT, prompt, hyde.max_output_tokens)
     answer_calls = len(queries) * len(stages)
     expansion_calls = len(queries) * hyde_calls
-    pending: dict[str, tuple[int, int]] = {}
+    pending: dict[tuple[str, str], tuple[int, int]] = {}
+    answer_model = (spec.provider, spec.model)
     if remote_answer:
-        pending[spec.model] = (answer_calls - answer_cached, answer_tokens)
+        pending[answer_model] = (answer_calls - answer_cached, answer_tokens)
     if hyde is not None:
-        previous_calls, previous_tokens = pending.get(hyde.model, (0, 0))
+        hyde_model = (hyde.provider, hyde.model)
+        previous_calls, previous_tokens = pending.get(hyde_model, (0, 0))
         tokens = previous_tokens + hyde_tokens
-        if agentic is not None and remote_answer and spec.model == hyde.model:
+        if agentic is not None and remote_answer and answer_model == hyde_model:
             # The LLM stages share the cap for an Agentic Search answer.
             tokens = hyde_tokens
-        pending[hyde.model] = (previous_calls + expansion_calls - hyde_cached, tokens)
+        pending[hyde_model] = (previous_calls + expansion_calls - hyde_cached, tokens)
     days = max(
-        quota_days(groq_limits(model), calls, tokens) for model, (calls, tokens) in pending.items()
+        quota_days(remote_limits(provider, model), calls, tokens)
+        for (provider, model), (calls, tokens) in pending.items()
     )
     return RemoteRunPlan(
         answer_calls + expansion_calls,
@@ -716,7 +723,7 @@ class PipelineVariant:
             stage.cache_hit = response.cache_hit
             completion = response.value
             if (
-                spec.provider == "groq"
+                spec.remote_provider is not None
                 and not stage_name.startswith("hyde")
                 and self.config.uses_retrieval
                 and (version := self._plan_index_version) is not None
@@ -950,7 +957,7 @@ class PipelineVariant:
                 output_tokens=sum(stage.output_tokens for stage in generator_stages),
                 seconds=(
                     sum(stage.seconds for stage in trace.stages)
-                    if self._cache is not None or self.config.uses_groq()
+                    if self._cache is not None or self.config.remote_generators()
                     else time.perf_counter() - started - trace.accounting_seconds
                 ),
                 stage_seconds={stage.name: stage.seconds for stage in trace.stages},

@@ -50,6 +50,11 @@ services:
       PHOENIX_URL: ${PHOENIX_URL:-http://localhost:6006}
       RAG_DEMO_VARIANT: ${RAG_DEMO_VARIANT:-hybrid-rerank-cited}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      MISTRAL_REQUESTS_PER_SECOND: ${MISTRAL_REQUESTS_PER_SECOND:-}
+      MISTRAL_TOKENS_PER_MINUTE: ${MISTRAL_TOKENS_PER_MINUTE:-}
+      MISTRAL_TOKENS_PER_MONTH: ${MISTRAL_TOKENS_PER_MONTH:-}
+      MISTRAL_REQUESTS_PER_MONTH: ${MISTRAL_REQUESTS_PER_MONTH:-}
     volumes:
       - huggingface_cache:/home/rag/.cache/huggingface
       - api_data:/app/data

@@ -1,4 +1,4 @@
-"""Export Dev cases for manual labelling and measure agreement with the Groq Judge."""
+"""Export Dev cases for manual labelling and measure agreement with the Judge."""
 
 from __future__ import annotations
 
@@ -13,8 +13,14 @@ from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from rag_pipeline.cache import cache_key
 from rag_pipeline.evaluation import RunStore, bootstrap_metric_intervals
-from rag_pipeline.judge_evaluation import CitedChunkLookup, judge_cases, load_answer_run, write_text
-from rag_pipeline.judge_model import JUDGE_SPEC, Judge, JudgeRequest, JudgeVerdict
+from rag_pipeline.judge_evaluation import (
+    CitedChunkLookup,
+    generator_models,
+    judge_cases,
+    load_answer_run,
+    write_text,
+)
+from rag_pipeline.judge_model import Judge, JudgeRequest, JudgeVerdict, check_judge_family
 from rag_pipeline.splits import DEFAULT_SEED
 
 CALIBRATION_SIZE = 200
@@ -68,6 +74,7 @@ class CalibrationCase(_Row):
     kind: CaseKind
     statement_index: int | None
     request: JudgeRequest
+    generator_models: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def _validate_target(self) -> Self:
@@ -100,6 +107,7 @@ def export_calibration(
     lookup = chunks if chunks is not None else CitedChunkLookup(Path("data/raw"))
     by_kind: dict[CaseKind, dict[str, CalibrationCase]] = {"correctness": {}, "support": {}}
     for run in runs:
+        models = generator_models(run)
         for case in judge_cases(run, None, lookup):
             if (request := case.request) is None:
                 continue
@@ -118,6 +126,7 @@ def export_calibration(
                         kind=kind,
                         statement_index=index,
                         request=request,
+                        generator_models=models,
                     ),
                 )
 
@@ -177,6 +186,7 @@ class Agreement:
 @dataclass(frozen=True)
 class CalibrationReport:
     model: str
+    provider: str
     cases: int
     author_checks: int
     malformed_responses: int
@@ -247,10 +257,24 @@ def calibration_report(folder: Path, report_dir: Path, judge: Judge) -> Calibrat
     if len({case.case_id for case in cases}) != len(cases):
         raise ValueError("cases.jsonl contains duplicate case IDs.")
     labels = load_labels(folder / "labels.jsonl", cases)
+    sources: dict[str, tuple[str, ...]] = {}
+    for case in cases:
+        models = case.generator_models
+        if not models:
+            if case.run_id not in sources:
+                try:
+                    run = load_answer_run(RunStore(report_dir.parent), case.run_id, dev_only=True)
+                except FileNotFoundError as error:
+                    raise ValueError(
+                        f"Restore Dev run {case.run_id} to identify the generator for its cases."
+                    ) from error
+                sources[case.run_id] = generator_models(run)
+            models = sources[case.run_id]
+        check_judge_family(judge.spec, models, case.run_id)
     verdicts: dict[str, JudgeVerdict] = {}
     predicted: dict[str, bool] = {}
     for case in cases:
-        key = case.request.cache_key()
+        key = case.request.cache_key(judge.spec)
         if key not in verdicts:
             verdicts[key] = judge.judge(case.request)
         verdict = verdicts[key]
@@ -269,7 +293,8 @@ def calibration_report(folder: Path, report_dir: Path, judge: Judge) -> Calibrat
             "subscription_vs_author": _agreement(ids, subscription, author),
         }
     report = CalibrationReport(
-        JUDGE_SPEC.model,
+        judge.spec.model,
+        judge.spec.provider,
         len(cases),
         len(labels["author"]),
         sum(verdict.malformed for verdict in verdicts.values()),

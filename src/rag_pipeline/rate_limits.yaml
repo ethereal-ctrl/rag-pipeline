@@ -1,8 +1,17 @@
-# Groq Free Plan limits.
+# Remote provider limits and sources.
 openai/gpt-oss-120b:
   requests_per_minute: 30
   requests_per_day: 1000
   tokens_per_minute: 8000
   tokens_per_day: 200000
   source: https://console.groq.com/docs/rate-limits
+  looked_up: "2026-11-16"
+
+mistral-large-4-0:
+  provider: mistral
+  # Free API access and quota values could not be verified. Use the organization limits.
+  requests_per_second: null
+  tokens_per_minute: null
+  tokens_per_month: null
+  source: https://docs.mistral.ai/admin/billing-usage/usage-limits
   looked_up: "2026-11-16"

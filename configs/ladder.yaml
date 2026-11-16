@@ -21,12 +21,21 @@ rungs:
 
 large_model:
   split: test-400
-  reason: The Groq free tier allows about 100 RAG questions per day.
+  provider: mistral
+  reason: Three rungs on the fixed subset keep the comparison bounded. Mistral access and quotas depend on the organization.
   pairs:
     - local: configs/variants/closed-book.yaml
-      config: configs/variants/closed-book-groq.yaml
+      config: configs/variants/closed-book-mistral.yaml
     - local: configs/variants/hybrid-rerank.yaml
-      config: configs/variants/hybrid-rerank-groq.yaml
+      config: configs/variants/hybrid-rerank-mistral.yaml
     # Agentic Search is the final direct generation rung. The Router has no shared generator.
     - local: configs/variants/agentic.yaml
-      config: configs/variants/agentic-groq.yaml
+      config: configs/variants/agentic-mistral.yaml
+  alternatives:
+    groq:
+      - local: configs/variants/closed-book.yaml
+        config: configs/variants/closed-book-groq.yaml
+      - local: configs/variants/hybrid-rerank.yaml
+        config: configs/variants/hybrid-rerank-groq.yaml
+      - local: configs/variants/agentic.yaml
+        config: configs/variants/agentic-groq.yaml

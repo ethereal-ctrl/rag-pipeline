@@ -53,12 +53,14 @@ from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.judge_calibration import calibration_report, export_calibration
 from rag_pipeline.judge_evaluation import (
     CitedChunkLookup,
+    generator_models,
     judge_cases,
     judge_run,
     load_answer_run,
     plan_judging,
     with_judge_metrics,
 )
+from rag_pipeline.judge_model import JUDGE_CONFIG, check_judge_family, load_judge_spec
 from rag_pipeline.ladder import (
     HeldOutSplit,
     Ladder,
@@ -68,7 +70,8 @@ from rag_pipeline.ladder import (
     run_ladder,
 )
 from rag_pipeline.ladder_report import write_ladder_report
-from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels
+from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels, missing_remote_keys
+from rag_pipeline.rate_limit import remote_limits
 from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.router_training import RouterTrainingConfig, train_router
 from rag_pipeline.splits import (
@@ -356,7 +359,8 @@ def eval_command(
         if dry_run:
             candidates = (config,) if config.router is None else router_candidates(config.router)
             remote = any(
-                candidate.uses_groq(retrieval_only=retrieval_only) for candidate in candidates
+                candidate.remote_generators(retrieval_only=retrieval_only)
+                for candidate in candidates
             )
             queries = _split_queries(split)[:limit] if remote else []
             _print_remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
@@ -398,13 +402,13 @@ def _remote_plan(
     retrieval_only: bool,
     no_cache: bool,
 ) -> RemoteRunPlan:
-    remote = config.router is None and config.uses_groq(retrieval_only=retrieval_only)
+    remote = config.router is None and config.remote_generators(retrieval_only=retrieval_only)
     cache = ResponseCache() if remote and not no_cache and CACHE_FILE.exists() else None
     version = None
     if (
         cache is not None
         and not retrieval_only
-        and config.generation.generator.provider == "groq"
+        and config.generation.generator.remote_provider is not None
         and config.uses_retrieval
         and config.index is not None
     ):
@@ -517,25 +521,29 @@ def _judge_sample() -> tuple[str, ...]:
 def judge_command(
     run_id: str,
     dry_run: Annotated[
-        bool, typer.Option(help="Estimate the Groq workload without calls.")
+        bool, typer.Option(help="Estimate the Judge workload without calls.")
     ] = False,
     shared_tokens: Annotated[
-        int, typer.Option(min=0, help="Other planned Groq tokens sharing the daily budget.")
+        int, typer.Option(min=0, help="Other planned tokens sharing the provider's quota.")
     ] = 0,
     shared_calls: Annotated[
-        int, typer.Option(min=0, help="Other planned Groq calls sharing the daily budget.")
+        int, typer.Option(min=0, help="Other planned calls sharing the provider's quota.")
     ] = 0,
+    judge_config: Path = JUDGE_CONFIG,
 ) -> None:
     """Grade the fixed Judge sample in a completed run."""
     store = RunStore(RUNS_DIR)
     lookup = CitedChunkLookup(RAW_DIR)
     try:
         sample = _judge_sample()
+        spec = load_judge_spec(judge_config)
         if dry_run:
-            cases = judge_cases(load_answer_run(store, run_id), sample, lookup)
+            saved_run = load_answer_run(store, run_id)
+            check_judge_family(spec, generator_models(saved_run), run_id)
+            cases = judge_cases(saved_run, sample, lookup)
             cache = ResponseCache(CACHE_FILE) if CACHE_FILE.exists() else None
             plan = plan_judging(
-                cases, cache, shared_tokens=shared_tokens, shared_calls=shared_calls
+                cases, cache, spec, shared_tokens=shared_tokens, shared_calls=shared_calls
             )
             typer.echo(f"Sampled answers              {plan.sampled}")
             typer.echo(f"Calls before cache           {plan.calls}")
@@ -546,13 +554,14 @@ def judge_command(
             typer.echo(f"Estimated tokens needed      {plan.estimated_tokens - plan.cached_tokens}")
             typer.echo(f"Estimated Judge quota days  {plan.days}")
             typer.echo(f"Estimated shared quota days  {plan.shared_days}")
-            typer.echo(
-                f"Judge and GPT-OSS-120B test-400 runs share {plan.tokens_per_day:,} tokens/day."
-            )
+            if plan.tokens_per_day is not None:
+                typer.echo(f"{spec.provider.title()} token quota  {plan.tokens_per_day:,}/day")
+            if plan.tokens_per_month is not None:
+                typer.echo(f"{spec.provider.title()} token quota  {plan.tokens_per_month:,}/month")
             return
         if shared_tokens or shared_calls:
             raise ValueError("--shared-tokens and --shared-calls are only used with --dry-run.")
-        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE))
+        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE), spec)
         report = judge_run(store, run_id, sample, judge, chunks=lookup)
     except (OSError, ValueError, HTTPError) as error:
         typer.echo(str(error), err=True)
@@ -579,10 +588,10 @@ def judge_calibration_export(run_ids: list[str] | None = None) -> None:
 
 
 @calibration_app.command("report")
-def judge_calibration_report() -> None:
-    """Measure Groq Judge agreement against the exported Dev labels."""
+def judge_calibration_report(judge_config: Path = JUDGE_CONFIG) -> None:
+    """Measure Judge agreement against the exported Dev labels."""
     try:
-        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE))
+        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE), load_judge_spec(judge_config))
         report = calibration_report(CALIBRATION_DIR, RUNS_DIR / "judge", judge)
     except (OSError, ValueError, HTTPError) as error:
         typer.echo(str(error), err=True)
@@ -623,11 +632,15 @@ def _ladder_gaps(
     if (router := rung.config.router) is not None and not router.artifact.is_file():
         gaps.append(f"missing Router artifact {router.artifact}")
     candidates = answer_variants(rung.config)
-    if (
-        any(candidate.uses_groq() for candidate in candidates)
-        and not os.getenv("GROQ_API_KEY", "").strip()
-    ):
-        gaps.append("missing GROQ_API_KEY")
+    remote = [spec for candidate in candidates for spec in candidate.remote_generators()]
+    keys = missing_remote_keys(remote)
+    gaps.extend(f"missing {key}" for key in keys)
+    if not keys:
+        for provider, model in sorted({(spec.provider, spec.model) for spec in remote}):
+            try:
+                remote_limits(provider, model)
+            except ValueError as error:
+                gaps.append(str(error))
     for candidate in candidates:
         if not candidate.uses_retrieval or candidate.index is None:
             continue
@@ -648,11 +661,13 @@ def _ladder_gaps(
 
 @ladder_app.command("status")
 def ladder_status_command(
-    split: HeldOutSplit = "test", qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL
+    split: HeldOutSplit = "test",
+    qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
+    provider: Literal["groq", "mistral"] | None = None,
 ) -> None:
     """Show saved runs and check collections required by pending rungs."""
     try:
-        rungs = Ladder.load(LADDER_FILE).for_split(split)
+        rungs = Ladder.load(LADDER_FILE).for_split(split, provider)
         client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
         collections: dict[str, str | None] = {}
         try:
@@ -717,14 +732,15 @@ def _print_ladder_estimate(
             quota_days += plan.days
             upper = " upper bound" if plan.upper_bound else ""
             typer.echo(
-                f"  Groq  {plan.calls - plan.cached} calls after cache, "
+                f"  {status.rung.config.generation.generator.provider.title()}  "
+                f"{plan.calls - plan.cached} calls after cache, "
                 f"{plan.days} quota day(s){upper}"
             )
     typer.echo(f"Estimated wall time  {total:.1f} s across {pending - unknown} rung(s)")
     if unknown:
         typer.echo(f"Rungs without a Dev estimate  {unknown}")
     if split == "test-400":
-        typer.echo(f"Sum of per-rung Groq quota day estimates  {quota_days}")
+        typer.echo(f"Sum of per-rung remote quota day estimates  {quota_days}")
 
 
 @ladder_app.command("run")
@@ -733,10 +749,11 @@ def ladder_run_command(
     split: HeldOutSplit = "test",
     dry_run: bool = False,
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
+    provider: Literal["groq", "mistral"] | None = None,
 ) -> None:
     """Run unfinished rungs in order using the normal held-out score guard."""
     try:
-        rungs = Ladder.load(LADDER_FILE).for_split(split)
+        rungs = Ladder.load(LADDER_FILE).for_split(split, provider)
         store = RunStore(RUNS_DIR)
         if dry_run:
             _print_ladder_estimate(rungs, split, store, qdrant_url)
@@ -770,6 +787,7 @@ def ladder_run_command(
 def ladder_report_command(
     split: HeldOutSplit = "test",
     output: Path = LADDER_REPORT_DIR,
+    provider: Literal["groq", "mistral"] | None = None,
 ) -> None:
     """Render Markdown and SVGs from saved evaluations."""
     try:
@@ -782,6 +800,7 @@ def ladder_report_command(
             dev_ids=splits.dev,
             test_ids=splits.test,
             subset_ids=load_test_subset(TEST_SUBSET_FILE, splits),
+            provider=provider,
         )
     except (OSError, ValueError) as error:
         typer.echo(str(error), err=True)
