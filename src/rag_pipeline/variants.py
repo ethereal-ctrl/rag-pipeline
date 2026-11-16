@@ -7,6 +7,7 @@ import math
 import time
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
+from itertools import chain, islice, zip_longest
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -158,6 +159,14 @@ class Answer:
     shown_chunk_ids: tuple[str, ...] = ()
     search_steps: int | None = None
     stop_reason: StopReason | None = None
+
+
+@dataclass(frozen=True)
+class _SearchResult:
+    retrieved: tuple[RetrievedChunk, ...]
+    answer_context: tuple[RetrievedChunk, ...]
+    steps: int
+    stop_reason: StopReason
 
 
 def is_abstention(text: str) -> bool:
@@ -539,7 +548,7 @@ class PipelineVariant:
 
     def _search(
         self, question: str, config: AgenticConfig, trace: AnswerTrace, budget: TokenBudget
-    ) -> tuple[tuple[RetrievedChunk, ...], int, StopReason]:
+    ) -> _SearchResult:
         model = self.config.generation.generator.model
         with trace.stage("plan", "LLM", model=model, operation="chat") as stage:
             plan = self._complete(
@@ -552,11 +561,14 @@ class PipelineVariant:
                 budget=budget,
             )
         if plan is None:
-            return (), 0, "max_tokens"
+            return _SearchResult((), (), 0, "max_tokens")
 
         sub_query, *remaining = planned_queries(plan.text, question)
-        evidence: dict[str, RetrievedChunk] = {}
-        pool: tuple[RetrievedChunk, ...] = ()
+        retrieved: dict[str, RetrievedChunk] = {}
+        evidence_by_step: list[list[RetrievedChunk]] = []
+        evidence_ids: set[str] = set()
+        steps = 0
+        stop_reason: StopReason = "max_steps"
         context = ""
         for step in range(1, config.max_steps + 1):
             remaining = [query for query in remaining if query != sub_query]
@@ -566,10 +578,20 @@ class PipelineVariant:
             )
             prefix = "<context>\n"
             if not budget.fits(DECISION_SYSTEM_PROMPT, prefix + context + suffix):
-                return pool, step - 1, "max_tokens"
+                stop_reason = "max_tokens"
+                break
+            contribution: list[RetrievedChunk] = []
             for chunk in self._retrieve(sub_query, trace, step=step):
-                evidence.setdefault(chunk.chunk_id, chunk)
-            pool = tuple(evidence.values())
+                retrieved.setdefault(chunk.chunk_id, chunk)
+                if (
+                    len(contribution) < config.chunks_per_step
+                    and chunk.chunk_id not in evidence_ids
+                ):
+                    contribution.append(chunk)
+                    evidence_ids.add(chunk.chunk_id)
+            steps = step
+            evidence_by_step.append(contribution)
+            pool = tuple(chain.from_iterable(evidence_by_step))
             context = _format_context(pool)
             prompt = prefix + context + suffix
             name = f"decide.{step}"
@@ -587,12 +609,18 @@ class PipelineVariant:
                     budget=budget,
                 )
             if result is None:
-                return pool, step, "max_tokens"
+                stop_reason = "max_tokens"
+                break
             follow_up = next_query(result.text)
             if follow_up is None:
-                return pool, step, "sufficient"
+                stop_reason = "sufficient"
+                break
             sub_query = follow_up
-        return pool, config.max_steps, "max_steps"
+        by_rank = (
+            chunk for rank in zip_longest(*evidence_by_step) for chunk in rank if chunk is not None
+        )
+        answer_context = tuple(islice(by_rank, config.max_context_chunks))
+        return _SearchResult(tuple(retrieved.values()), answer_context, steps, stop_reason)
 
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()
@@ -604,26 +632,22 @@ class PipelineVariant:
             search_steps = stop_reason = None
             if agentic is None:
                 retrieved = self._retrieve(question, trace)
+                answer_context = retrieved[: self.config.generation.context_chunks]
             else:
                 budget = TokenBudget(
                     agentic.max_tokens,
                     spec.max_output_tokens,
                     spec.context_size if spec.provider == "ollama" else agentic.max_tokens,
                 )
-                retrieved, search_steps, stop_reason = self._search(
-                    question, agentic, trace, budget
-                )
+                search = self._search(question, agentic, trace, budget)
+                retrieved, answer_context = search.retrieved, search.answer_context
+                search_steps, stop_reason = search.steps, search.stop_reason
             set_chunk_ids(root, retrieved)
             cited = self.config.generation.citations.enabled
             shown: tuple[RetrievedChunk, ...] = ()
             with trace.stage("generate", "LLM", model=spec.model, operation="chat") as stage:
                 if self.config.uses_retrieval:
-                    max_chunks = (
-                        agentic.max_context_chunks
-                        if agentic
-                        else self.config.generation.context_chunks
-                    )
-                    shown = stage.chunks = retrieved[:max_chunks]
+                    shown = stage.chunks = answer_context
                     context = _format_context(shown)
                     system = CITATION_SYSTEM_PROMPT if cited else SYSTEM_PROMPT
                     prompt = f"<context>\n{context}\n</context>\n\nQuestion: {question}"

@@ -96,12 +96,15 @@ uv run rag eval configs/variants/hybrid-rerank-cited.yaml --split smoke
 
 Compare [Agentic Search](configs/variants/agentic.yaml) with the
 [cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml).
-Agentic Search plans sub-queries, reuses retrieval and reranking for each search,
-and checks whether the Evidence is sufficient. It caps the final answer's context
-and uses the same Citation and support check as the comparison variant.
+Agentic Search plans sub-queries and reuses retrieval and reranking for each search.
+Each step contributes up to `chunks_per_step` new Chunks to the Evidence shown to
+the sufficiency check. Final generation takes the highest-ranked contribution
+from each step, then the next rank from each step, until it reaches
+`max_context_chunks`. It uses the same Citation and support check as the
+comparison variant.
 
-For Hits, MRR, MAP and Evidence Recall, the ranking is the deduplicated Evidence
-pool in order of first appearance across searches. Evaluation also reports mean
+For Hits, MRR, MAP and Evidence Recall, the ranking uses all retrieved Chunks,
+deduplicated in order of first appearance across searches. Evaluation also reports mean
 search steps and the shares that stop on sufficiency, the step limit or the token
 limit, with bootstrap intervals.
 

@@ -24,4 +24,5 @@ generation:
 agentic:
   max_steps: 3
   max_tokens: 16000
-  max_context_chunks: 3
+  max_context_chunks: 6
+  chunks_per_step: 2

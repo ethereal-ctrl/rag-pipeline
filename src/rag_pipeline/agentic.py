@@ -18,6 +18,7 @@ class AgenticConfig(BaseModel):
     max_steps: PositiveInt
     max_tokens: PositiveInt
     max_context_chunks: PositiveInt
+    chunks_per_step: PositiveInt = 3
 
 
 @dataclass

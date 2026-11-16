@@ -45,7 +45,7 @@ def agentic_config(
     support_check: str = "llm",
 ) -> VariantConfig:
     data = cited_config(support_check=support_check).model_dump()
-    data["retrieval"]["top_k"] = 1
+    data["retrieval"]["top_k"] = 5
     data["agentic"] = {
         "max_steps": max_steps,
         "max_tokens": max_tokens,
@@ -153,6 +153,35 @@ def test_two_hops_add_evidence_and_answer_with_citations(index: ChunkIndex, tmp_
     assert SECOND.body in model.inputs["decide"][1]
 
 
+def test_later_hop_reaches_the_answer_after_a_full_first_retrieval(index: ChunkIndex):
+    distractors = [
+        replace(
+            FIRST,
+            id=f"a_amber_archive_{i}",
+            body="Amber battery archives. " + "The records describe earlier designs. " * 8,
+        )
+        for i in range(4)
+    ]
+    ingest([FIRST, SECOND, *distractors], index, ChunkingSettings(max_words=100))
+    model = SearchGenerator()
+    variant = build_variant(agentic_config(), index=index, models=FakeModels(model))
+
+    answer = variant.answer(QUESTION.question)
+
+    first_id, second_id = (f"{article.id}#000" for article in (FIRST, SECOND))
+    assert {chunk.article_id for chunk in answer.retrieved[:5]} == {
+        FIRST.id,
+        *(article.id for article in distractors),
+    }
+    assert answer.retrieved[5].chunk_id == second_id
+    assert answer.shown_chunk_ids == (first_id, second_id)
+    assert answer.citations[0].chunk_ids == (first_id, second_id)
+    assert answer.text == "Northbank"
+    decision_ids = [re.findall(r'<chunk id="([^"]+)"', prompt) for prompt in model.inputs["decide"]]
+    assert len(decision_ids[0]) == 3  # the default per-step contribution
+    assert decision_ids[1] == [*decision_ids[0], second_id]
+
+
 def test_cited_defaults_preserve_the_single_search_and_fingerprint(
     index: ChunkIndex, tmp_path: Path
 ):
@@ -221,15 +250,33 @@ def test_search_budget_can_stop_a_decision_and_still_leave_room_for_the_answer(
     assert model.calls == ["plan", "decide", "generate", "check"]
 
 
-def test_example_budget_allows_two_searches_with_full_retrieval_context(index: ChunkIndex):
+@pytest.mark.parametrize("final_cap", [None, 4], ids=["example-config", "truncated"])
+def test_example_budget_and_rank_interleaving_cover_three_hops(
+    index: ChunkIndex, final_cap: int | None
+):
+    class RankedReranker(PhraseFakeReranker):
+        def score(self, query: str, texts: list[str]) -> list[float]:
+            self.calls.append((query, len(texts)))
+            return [-float(text.split()[0]) for text in texts]
+
+    class MeasuredGenerator(SearchGenerator):
+        def complete_structured(
+            self, system: str, prompt: str, schema: dict[str, Any]
+        ) -> Completion:
+            completion = super().complete_structured(system, prompt, schema)
+            tokens = (len((system + prompt).encode("utf-8")) + 2) // 3 + 32
+            return replace(completion, input_tokens=tokens)
+
+    queries = ("ambercell", "museumledger", "districtmap")
     articles = [
         replace(
             FIRST,
-            id=f"a_agentic_{i}",
-            title=f"Amber battery museum {i}",
-            body=FIRST.body + " The inventor Lena Vale founded the Northbank museum." * 18,
+            id=f"a_agentic_{query}_{rank}",
+            title=f"{query} article {rank}",
+            body=f"{rank} {query}. " + "The inventor Lena Vale founded the Northbank museum. " * 19,
         )
-        for i in range(10)
+        for query in queries
+        for rank in range(10)
     ]
     ingest(articles, index, ChunkingSettings(max_words=200, overlap_sentences=0))
     settings = VariantConfig.from_yaml(Path("configs/variants/agentic.yaml"))
@@ -237,20 +284,46 @@ def test_example_budget_allows_two_searches_with_full_retrieval_context(index: C
     data["index"] = {"collection": "fixture"}
     data["retrieval"]["mode"] = "bm25"
     data["retrieval"]["rerank"]["candidates"] = 10
+    if final_cap is not None:
+        data["agentic"]["max_context_chunks"] = final_cap
     config = VariantConfig.model_validate(data)
-    model = SearchGenerator(required_chunks=3)
-    reranker = PhraseFakeReranker("Northbank")
+    model = MeasuredGenerator(
+        plan=json.dumps({"sub_queries": queries}),
+        decisions=(
+            json.dumps({"status": "insufficient", "next_query": queries[1]}),
+            json.dumps({"status": "insufficient", "next_query": queries[2]}),
+            '{"status":"sufficient","next_query":null}',
+        ),
+        required_chunks=final_cap if final_cap is not None else 6,
+    )
+    reranker = RankedReranker("Northbank")
     variant = build_variant(config, index=index, models=FakeModels(model, reranker))
 
     answer = variant.answer(QUESTION.question)
 
-    assert model.calls == ["plan", "decide", "decide", "generate", "check"]
-    assert len(answer.retrieved) == 10
-    assert len(answer.shown_chunk_ids) == 3
-    assert reranker.calls == [(FIRST_QUERY, 10), (SECOND_QUERY, 10)]
+    assert model.calls == ["plan", "decide", "decide", "decide", "generate", "check"]
+    assert answer.search_steps == 3 and answer.stop_reason == "sufficient"
+    assert answer.input_tokens + answer.output_tokens <= 16000
+    assert all(
+        stage.input_tokens + stage.output_tokens <= 8192
+        for stage in answer.trace
+        if stage.input_tokens is not None
+    )
+    assert tuple(chunk.article_id for chunk in answer.retrieved) == tuple(
+        article.id for article in articles
+    )
+    expected = tuple(f"a_agentic_{query}_{rank}#000" for rank in range(2) for query in queries)
+    assert answer.shown_chunk_ids == expected[:final_cap]
+    assert answer.citations[0].chunk_ids == expected[:final_cap]
+    for step, prompt in enumerate(model.inputs["decide"], 1):
+        assert re.findall(r'<chunk id="([^"]+)"', prompt) == [
+            f"a_agentic_{query}_{rank}#000" for query in queries[:step] for rank in range(2)
+        ]
+    assert reranker.calls == [(query, 10) for query in queries]
     assert [stage.name for stage in answer.trace if stage.name.startswith("rerank")] == [
         "rerank.1",
         "rerank.2",
+        "rerank.3",
     ]
 
 
