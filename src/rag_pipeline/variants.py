@@ -6,7 +6,6 @@ import math
 import time
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
-from html import escape
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -146,13 +145,18 @@ def is_abstention(text: str) -> bool:
 
 
 def _format_context(chunks: tuple[RetrievedChunk, ...]) -> str:
+    def delimiters(value: str) -> str:
+        return value.replace("<", "&lt;").replace(">", "&gt;")
+
     def attribute(value: str) -> str:
-        return escape(value).replace("\r", "&#13;").replace("\n", "&#10;")
+        return (
+            delimiters(value).replace('"', "&quot;").replace("\r", "&#13;").replace("\n", "&#10;")
+        )
 
     blocks = [
         f'<chunk id="{attribute(c.chunk_id)}" title="{attribute(c.title)}" '
         f'source="{attribute(c.source)}" published="{attribute(c.published_at[:10])}">\n'
-        f"{escape(c.text, quote=False)}\n</chunk>"
+        f"{delimiters(c.text)}\n</chunk>"
         for c in chunks
     ]
     return "\n".join(blocks)
@@ -165,8 +169,8 @@ def _generation_key(
 
 
 def _generation_plan_key(config: VariantConfig, index_version: str, question: str) -> str:
-    # A retrieval plan from before delimiter escaping may refer to a different prompt.
-    return cache_key("generation-plan-v2", config.run_config(), index_version, question)
+    # Older plans can refer to prompts with different escaping or a different output schema.
+    return cache_key("generation-plan-v3", config.run_config(), index_version, question)
 
 
 @dataclass(frozen=True)
@@ -502,16 +506,16 @@ class PipelineVariant:
                 stage.input_tokens = completion.input_tokens
                 stage.output_tokens = completion.output_tokens
             shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited else ()
-            citations, removed = parse_citations(completion.text, shown_ids) if cited else ((), ())
-            citations, rejected = self._check_citations(question, citations, shown, trace)
-            answer_text = (
-                (" ".join(citation.statement for citation in citations) or ABSTENTION_TEXT)
-                if cited
-                else completion.text
+            answer_text, citations, removed = (
+                parse_citations(completion.text, shown_ids) if cited else (completion.text, (), ())
             )
+            citations, rejected = self._check_citations(question, citations, shown, trace)
+            abstained = is_abstention(answer_text) or (cited and (not answer_text or not citations))
+            if cited and abstained:
+                answer_text = ABSTENTION_TEXT
             return Answer(
                 text=answer_text,
-                abstained=not citations if cited else is_abstention(answer_text),
+                abstained=abstained,
                 retrieved=retrieved,
                 input_tokens=sum(
                     stage.input_tokens or 0

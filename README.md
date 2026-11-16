@@ -76,10 +76,11 @@ known prompts for the current index version.
 ## Citations and Abstention
 
 The [cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml) asks
-for structured statements with Chunk IDs. Its support check evaluates the statements
-in one call using the cited Chunk text. The answer keeps supported statements and
-abstains if all are removed. Per-query records include shown Chunk IDs, the retained
-Citations, and the removed statements with rejection reasons.
+for a short answer and separate statements with Chunk IDs. Its support check evaluates
+the statements in one call using the cited Chunk text. Evaluation scores the short
+answer when at least one statement is supported and the short answer is present and
+usable. Per-query records include shown Chunk IDs, the retained Citations, and the
+removed statements with rejection reasons.
 
 Evaluation reports Abstention on Null Queries and False Abstention on answerable
 queries. Citation validity measures the share of proposed IDs actually shown to the

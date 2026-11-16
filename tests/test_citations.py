@@ -38,10 +38,17 @@ def _config(*, support_check: str = "none", context_chunks: int = 1) -> VariantC
 
 
 class CitationGenerator(GroundedFakeGenerator):
-    def __init__(self, statements: list[tuple[str, list[str]]], malformed: str | None = None):
+    def __init__(
+        self,
+        statements: list[tuple[str, list[str]]],
+        malformed: str | None = None,
+        *,
+        short_answer: str | None = "Sam Bankman-Fried.",
+    ):
         super().__init__({})
         self.statements = statements
         self.malformed = malformed
+        self.short_answer = short_answer
         self.schemas: list[dict[str, Any]] = []
 
     def complete_structured(self, system: str, prompt: str, schema: dict[str, Any]) -> Completion:
@@ -50,17 +57,18 @@ class CitationGenerator(GroundedFakeGenerator):
         shown = re.findall(r'<chunk id="([^"]+)"', prompt)
         text = self.malformed
         if text is None:
-            text = json.dumps(
-                {
-                    "statements": [
-                        {
-                            "statement": statement,
-                            "chunk_ids": [shown[0] if id_ == "shown" else id_ for id_ in ids],
-                        }
-                        for statement, ids in self.statements
-                    ]
-                }
-            )
+            payload: dict[str, object] = {
+                "statements": [
+                    {
+                        "statement": statement,
+                        "chunk_ids": [shown[0] if id_ == "shown" else id_ for id_ in ids],
+                    }
+                    for statement, ids in self.statements
+                ]
+            }
+            if self.short_answer is not None:
+                payload["answer"] = self.short_answer
+            text = json.dumps(payload)
         return Completion(text, 12, 8)
 
 
@@ -114,6 +122,51 @@ def test_malformed_or_empty_citation_output_leads_to_abstention(index: ChunkInde
     assert answer.text == "Insufficient information."
     assert answer.abstained
     assert answer.citations == ()
+
+
+@pytest.mark.parametrize(
+    ("reference", "short_answer", "statement", "correct"),
+    [
+        ("No", "Yes", "Yes. The article says no evidence was found.", False),
+        ("Sam Bankman-Fried", "Sam Bankman-Fried", "The former FTX chief stood trial.", True),
+    ],
+)
+def test_evaluation_scores_only_the_short_answer(
+    index: ChunkIndex,
+    tmp_path: Path,
+    reference: str,
+    short_answer: str,
+    statement: str,
+    correct: bool,
+):
+    ingest([FTX], index, ChunkingSettings(max_words=100, overlap_sentences=0))
+    model = CitationGenerator([(statement, ["shown"])], short_answer=short_answer)
+    variant = build_variant(_config(), index=index, models=FakeModels(model))
+
+    result = evaluate(variant, [replace(FTX_QUERY, answer=reference)], "smoke", RunStore(tmp_path))
+
+    (record,) = result.records
+    assert record.correct is correct
+    assert record.answer == short_answer
+    assert record.citations[0].statement == statement
+
+
+@pytest.mark.parametrize("short_answer", [None, "  ", "Insufficient information."])
+def test_cited_answer_abstains_without_a_usable_short_answer(
+    index: ChunkIndex, short_answer: str | None
+):
+    ingest([FTX], index, ChunkingSettings(max_words=100, overlap_sentences=0))
+    model = CitationGenerator(
+        [("The FTX chief stood trial.", ["shown"])], short_answer=short_answer
+    )
+
+    answer = build_variant(_config(), index=index, models=FakeModels(model)).answer(
+        FTX_QUERY.question
+    )
+
+    assert answer.abstained
+    assert answer.text == "Insufficient information."
+    assert answer.citations[0].statement == "The FTX chief stood trial."
 
 
 def test_support_check_removes_a_statement_and_records_cached_usage(
@@ -219,6 +272,26 @@ def test_a_chunk_cannot_forge_a_delimiter_and_inject_an_instruction(index: Chunk
     assert "&lt;/chunk&gt;" in prompt
 
 
+def test_ampersands_in_chunk_text_and_attributes_reach_the_generator(index: ChunkIndex):
+    article = replace(
+        FTX,
+        title='FTX on AT&T "News"',
+        source="AT&T <Wire>",
+        body="AT&T covered the FTX trial.",
+    )
+    ingest([article], index, ChunkingSettings(max_words=100, overlap_sentences=0))
+    config = VariantConfig.from_yaml(Path("configs/variants/bm25.yaml"))
+    model = GroundedFakeGenerator({"AT&T covered the FTX trial.": "AT&T"})
+
+    answer = build_variant(config, index=index, models=FakeModels(model)).answer(FTX_QUERY.question)
+
+    assert answer.text == "AT&T"
+    (prompt,) = model.prompts
+    assert 'title="FTX on AT&T &quot;News&quot;"' in prompt
+    assert 'source="AT&T &lt;Wire&gt;"' in prompt
+    assert "AT&amp;T" not in prompt
+
+
 def test_default_closed_book_preserves_its_prompt_and_run_fingerprint(tmp_path: Path):
     class CapturesSystem(GroundedFakeGenerator):
         systems: list[str]
@@ -260,6 +333,7 @@ def test_evaluation_counts_abstentions_and_scores_attempted_citations(
         def complete_structured(
             self, system: str, prompt: str, schema: dict[str, Any]
         ) -> Completion:
+            self.short_answer = "Sam Bankman-Fried."
             if FTX_QUERY.question in prompt:
                 self.statements = [
                     ("Sam Bankman-Fried.", ["shown"]),
@@ -267,6 +341,7 @@ def test_evaluation_counts_abstentions_and_scores_attempted_citations(
                 ]
             elif PIXEL_QUERY.question in prompt:
                 self.statements = [("Seven years.", ["shown"])]
+                self.short_answer = "Seven years."
             elif NULL_QUERY.question in prompt:
                 self.statements = []
             else:
@@ -338,7 +413,10 @@ def test_structured_model_requests_and_cached_remote_plan(
             prompt: str = payload["messages"][1]["content"]
             chunk_id = re.findall(r'<chunk id="([^"]+)"', prompt)[0]
             text = json.dumps(
-                {"statements": [{"statement": "Sam Bankman-Fried.", "chunk_ids": [chunk_id]}]}
+                {
+                    "answer": "Sam Bankman-Fried.",
+                    "statements": [{"statement": "Sam Bankman-Fried.", "chunk_ids": [chunk_id]}],
+                }
             )
         else:
             text = '{"verdicts":[{"statement_index":0,"supported":true}]}'
@@ -371,7 +449,10 @@ def test_structured_model_requests_and_cached_remote_plan(
     answer = variant.answer(FTX_QUERY.question)
 
     assert answer.text == "Sam Bankman-Fried."
-    assert [set(schema["properties"]) for schema in schemas] == [{"statements"}, {"verdicts"}]
+    assert [set(schema["properties"]) for schema in schemas] == [
+        {"answer", "statements"},
+        {"verdicts"},
+    ]
     if provider == "groq":
         plan = plan_remote_run(config, [FTX_QUERY], cache, index_version=variant.index_version())
         assert (plan.calls, plan.cached, plan.days) == (2, 2, 0)

@@ -516,7 +516,7 @@ def _fingerprint(
         for name, default in (("seed", 0), ("context_size", 8192), ("reasoning_effort", "low")):
             if generator[name] == default:
                 del generator[name]
-    identity = {
+    identity: dict[str, object] = {
         "variant": variant,
         "index_version": index_version,
         "retrieval_only": retrieval_only,
@@ -525,6 +525,9 @@ def _fingerprint(
     }
     if cache_enabled:
         identity["cache_enabled"] = True
+    if config.generation.citations.enabled:
+        # Resuming a cited run must not mix statement-based and short-answer scores.
+        identity["citation_schema_version"] = 2
     payload = json.dumps(identity, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
