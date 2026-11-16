@@ -10,8 +10,11 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from httpx import HTTPError
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import ResponseHandlingException
+from typer._click.core import Context as ClickContext
+from typer.core import TyperGroup
 
 from rag_pipeline.cache import CACHE_FILE, ResponseCache
 from rag_pipeline.chunk_context import (
@@ -37,6 +40,15 @@ from rag_pipeline.evaluation import (
 from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_gate
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
+from rag_pipeline.judge_calibration import calibration_report, export_calibration
+from rag_pipeline.judge_evaluation import (
+    CitedChunkLookup,
+    judge_cases,
+    judge_run,
+    load_answer_run,
+    plan_judging,
+    with_judge_metrics,
+)
 from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels
 from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.router_training import RouterTrainingConfig, train_router
@@ -46,6 +58,7 @@ from rag_pipeline.splits import (
     SPLIT_NAMES,
     TEST_SPLITS,
     Splits,
+    load_judge_sample,
     load_test_subset,
     make_splits,
 )
@@ -61,6 +74,8 @@ from rag_pipeline.variants import (
 RAW_DIR = Path("data/raw")
 SPLITS_FILE = Path("data/splits.json")
 TEST_SUBSET_FILE = Path("data/test-400.json")
+JUDGE_SAMPLE_FILE = Path("data/judge-300.json")
+CALIBRATION_DIR = Path("data/judge-calibration")
 RUNS_DIR = Path("runs")
 GATE_FILE = Path("configs/gate/gate.yaml")
 
@@ -69,6 +84,20 @@ data_app = typer.Typer(no_args_is_help=True)
 app.add_typer(data_app, name="data", help="Fetch the pinned dataset and build splits.")
 router_app = typer.Typer(no_args_is_help=True)
 app.add_typer(router_app, name="router", help="Train the Router from saved Dev Split runs.")
+
+
+class _JudgeGroup(TyperGroup):
+    def parse_args(self, ctx: ClickContext, args: list[str]) -> list[str]:
+        # Let the user pass a run ID directly while keeping calibration as a subcommand.
+        if args and args[0] not in {"calibration", "run", "--help", "-h"}:
+            args = ["run", *args]
+        return super().parse_args(ctx, args)
+
+
+judge_app = typer.Typer(cls=_JudgeGroup, no_args_is_help=True)
+calibration_app = typer.Typer(no_args_is_help=True)
+app.add_typer(judge_app, name="judge", help="Grade a stored run with `rag judge RUN`.")
+judge_app.add_typer(calibration_app, name="calibration", help="Calibrate the Judge on Dev cases.")
 
 QdrantUrl = Annotated[str, typer.Option(envvar="QDRANT_URL")]
 
@@ -340,6 +369,88 @@ def router_train(router_config: Path) -> None:
         typer.echo(f"Wrote {path}")
 
 
+def _judge_sample() -> tuple[str, ...]:
+    test_subset = load_test_subset(TEST_SUBSET_FILE, Splits.load(SPLITS_FILE))
+    return load_judge_sample(JUDGE_SAMPLE_FILE, test_subset)
+
+
+@judge_app.command("run")
+def judge_command(
+    run_id: str,
+    dry_run: Annotated[
+        bool, typer.Option(help="Estimate the Groq workload without calls.")
+    ] = False,
+    shared_tokens: Annotated[
+        int, typer.Option(min=0, help="Other planned Groq tokens sharing the daily budget.")
+    ] = 0,
+    shared_calls: Annotated[
+        int, typer.Option(min=0, help="Other planned Groq calls sharing the daily budget.")
+    ] = 0,
+) -> None:
+    """Grade the fixed Judge sample in a completed run."""
+    store = RunStore(RUNS_DIR)
+    lookup = CitedChunkLookup(RAW_DIR)
+    try:
+        sample = _judge_sample()
+        if dry_run:
+            cases = judge_cases(load_answer_run(store, run_id), sample, lookup)
+            cache = ResponseCache(CACHE_FILE) if CACHE_FILE.exists() else None
+            plan = plan_judging(
+                cases, cache, shared_tokens=shared_tokens, shared_calls=shared_calls
+            )
+            typer.echo(f"Sampled answers              {plan.sampled}")
+            typer.echo(f"Calls before cache           {plan.calls}")
+            typer.echo(f"Already cached               {plan.cached}")
+            typer.echo(f"Calls needed                 {plan.calls - plan.cached}")
+            typer.echo(f"Estimated tokens before cache  {plan.estimated_tokens}")
+            typer.echo(f"Estimated cached tokens      {plan.cached_tokens}")
+            typer.echo(f"Estimated tokens needed      {plan.estimated_tokens - plan.cached_tokens}")
+            typer.echo(f"Estimated Judge quota days  {plan.days}")
+            typer.echo(f"Estimated shared quota days  {plan.shared_days}")
+            typer.echo(
+                f"Judge and GPT-OSS-120B test-400 runs share {plan.tokens_per_day:,} tokens/day."
+            )
+            return
+        if shared_tokens or shared_calls:
+            raise ValueError("--shared-tokens and --shared-calls are only used with --dry-run.")
+        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE))
+        report = judge_run(store, run_id, sample, judge, chunks=lookup)
+    except (OSError, ValueError, HTTPError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Graded {report.sampled} stored answers. Malformed verdicts {report.malformed}.")
+    _print_metrics(report.metrics, report.intervals)
+
+
+@calibration_app.command("export")
+def judge_calibration_export(run_ids: list[str] | None = None) -> None:
+    """Export cases from completed Dev Split runs for manual labelling."""
+    store = RunStore(RUNS_DIR)
+    try:
+        cases = export_calibration(
+            store,
+            run_ids if run_ids is not None else store.completed_answer_ids("dev"),
+            CALIBRATION_DIR,
+            chunks=CitedChunkLookup(RAW_DIR),
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Exported {len(cases)} Dev cases and LABELLING.md to {CALIBRATION_DIR}.")
+
+
+@calibration_app.command("report")
+def judge_calibration_report() -> None:
+    """Measure Groq Judge agreement against the exported Dev labels."""
+    try:
+        judge = LocalModels().judge_for(ResponseCache(CACHE_FILE))
+        report = calibration_report(CALIBRATION_DIR, RUNS_DIR / "judge", judge)
+    except (OSError, ValueError, HTTPError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Reported agreement for {report.cases} Dev cases in {RUNS_DIR / 'judge'}.")
+
+
 @app.command("compare")
 def compare_command(baseline_run: str, candidate_run: str) -> None:
     """Paired comparison of two runs; '*' marks a significant change (95% interval)."""
@@ -375,7 +486,8 @@ def table_command(
 ) -> None:
     """Markdown table of runs with 95% intervals, for the report."""
     store = RunStore(RUNS_DIR)
-    table = results_table([store.load(r) for r in run_ids], metrics.split(","))
+    runs = [with_judge_metrics(store.load(run_id), store) for run_id in run_ids]
+    table = results_table(runs, metrics.split(","))
     typer.echo(table)
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)

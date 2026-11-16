@@ -7,13 +7,16 @@ import os
 import time
 from dataclasses import dataclass
 from functools import cached_property, partial
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import httpx
 from pydantic import BaseModel, ConfigDict, PositiveInt, TypeAdapter
 
 from rag_pipeline.cache import CACHE_FILE, ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.rate_limit import RateLimiter, groq_limits
+
+if TYPE_CHECKING:
+    from rag_pipeline.judge_model import Judge
 
 
 class GeneratorSpec(BaseModel):
@@ -441,6 +444,16 @@ class LocalModels:
         if spec.provider == "groq":
             return GroqGenerator(spec, transport=self._groq_transport, limiter=self._groq_limiter)
         return OllamaGenerator(spec, self._ollama_url, transport=self._ollama_transport)
+
+    def judge_for(self, cache: ResponseCache) -> Judge:
+        from rag_pipeline.judge_model import JUDGE_SPEC, GroqJudge
+
+        return GroqJudge(
+            lambda: GroqGenerator(
+                JUDGE_SPEC, transport=self._groq_transport, limiter=self._groq_limiter
+            ),
+            cache,
+        )
 
     def embedder_for(self, spec: EmbedderSpec) -> Embedder:
         if spec not in self._embedders:

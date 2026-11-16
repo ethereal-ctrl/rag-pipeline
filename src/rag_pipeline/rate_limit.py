@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import time
 from contextlib import closing
@@ -40,6 +41,19 @@ def groq_limits(model: str) -> _PublishedLimits:
     if model not in limits or limits[model].tokens_per_day is None:
         raise ValueError(f"no verified Groq Free Plan limits for {model!r}")
     return limits[model]
+
+
+def quota_days(limits: RateLimits, calls: int, tokens: int) -> int:
+    """Estimate whole quota days for an uncached workload."""
+    minutes_per_day = DAY // MINUTE
+    return math.ceil(
+        max(
+            calls / limits.requests_per_day,
+            calls / (limits.requests_per_minute * minutes_per_day),
+            tokens / (limits.tokens_per_day or math.inf),
+            tokens / (limits.tokens_per_minute * minutes_per_day),
+        )
+    )
 
 
 def _wait(
