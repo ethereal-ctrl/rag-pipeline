@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Literal, Self
 
@@ -17,7 +18,7 @@ from rag_pipeline.models import (
     GeneratorSpec,
     ModelProvider,
     RerankerSpec,
-    RerankerWithUsage,
+    RerankTokenCounter,
 )
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids
 
@@ -163,11 +164,13 @@ class PipelineVariant:
     ) -> tuple[RetrievedChunk, ...]:
         assert self.reranker is not None
         texts = [c.text for c in candidates]
-        if isinstance(self.reranker, RerankerWithUsage):
-            scores, stage.input_tokens = self.reranker.score_with_usage(question, texts)
-        else:
-            scores = self.reranker.score(question, texts)
-            stage.input_tokens = None if texts else 0
+        scores = self.reranker.score(question, texts)
+        if texts:
+            stage.input_tokens = (
+                partial(self.reranker.count_input_tokens, question, texts)
+                if isinstance(self.reranker, RerankTokenCounter)
+                else None
+            )
         ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0])
         return tuple(replace(chunk, score=score) for score, chunk in ranked)
 
@@ -216,7 +219,7 @@ class PipelineVariant:
             retrieved,
             0,
             0,
-            time.perf_counter() - started,
+            time.perf_counter() - started - trace.accounting_seconds,
             stage_seconds={stage.name: stage.seconds for stage in trace.stages},
             trace=tuple(trace.stages),
         )
@@ -246,7 +249,7 @@ class PipelineVariant:
                 retrieved=retrieved,
                 input_tokens=completion.input_tokens,
                 output_tokens=completion.output_tokens,
-                seconds=time.perf_counter() - started,
+                seconds=time.perf_counter() - started - trace.accounting_seconds,
                 stage_seconds={stage.name: stage.seconds for stage in trace.stages},
                 trace=tuple(trace.stages),
             )

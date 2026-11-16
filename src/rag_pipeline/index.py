@@ -7,6 +7,7 @@ import re
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from qdrant_client import QdrantClient, models
@@ -14,7 +15,9 @@ from qdrant_client import QdrantClient, models
 from rag_pipeline import bm25
 from rag_pipeline.chunking import Chunk, ChunkingSettings
 from rag_pipeline.corpus import article_hash
-from rag_pipeline.models import Embedder, EmbedderWithUsage
+from rag_pipeline.models import Embedder, EmbedderWithUsage, QueryTokenCounter
+
+type TokenCount = int | Callable[[], int | None] | None
 
 BM25_VECTOR = "bm25"
 DENSE_VECTOR = "dense"
@@ -193,7 +196,7 @@ class ChunkIndex:
         return [_to_retrieved(p.payload or {}, p.score) for p in response.points]
 
     def _query_embedding(
-        self, query: str, on_input_tokens: Callable[[int | None], None] | None
+        self, query: str, on_input_tokens: Callable[[TokenCount], None] | None
     ) -> list[float]:
         if self._embedder is None:
             raise ValueError(f"index {self.collection!r} has no embedder for dense search")
@@ -202,7 +205,12 @@ class ChunkIndex:
                 vector, input_tokens = self._embedder.embed_query_with_usage(query)
                 on_input_tokens(input_tokens)
                 return vector
-            on_input_tokens(None)
+            counter = self._embedder
+            on_input_tokens(
+                partial(counter.count_query_tokens, query)
+                if isinstance(counter, QueryTokenCounter)
+                else None
+            )
         return self._embedder.embed_query(query)
 
     def search_hybrid(
@@ -211,7 +219,7 @@ class ChunkIndex:
         limit: int,
         candidates: int,
         *,
-        on_input_tokens: Callable[[int | None], None] | None = None,
+        on_input_tokens: Callable[[TokenCount], None] | None = None,
     ) -> list[RetrievedChunk]:
         """BM25 and dense candidates fused with Reciprocal Rank Fusion inside one Qdrant query."""
         response = self._client.query_points(
@@ -237,7 +245,7 @@ class ChunkIndex:
         query: str,
         limit: int,
         *,
-        on_input_tokens: Callable[[int | None], None] | None = None,
+        on_input_tokens: Callable[[TokenCount], None] | None = None,
     ) -> list[RetrievedChunk]:
         response = self._client.query_points(
             self.collection,

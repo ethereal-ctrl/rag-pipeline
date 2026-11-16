@@ -16,7 +16,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace import Span, StatusCode, Tracer
 
-from rag_pipeline.index import RetrievedChunk
+from rag_pipeline.index import RetrievedChunk, TokenCount
 
 DEFAULT_ENDPOINT = "http://127.0.0.1:6006/v1/traces"
 PROBE_TIMEOUT = 0.5
@@ -79,11 +79,11 @@ class StageTrace:
 
 @dataclass
 class StageUsage:
-    input_tokens: int | None = 0
+    input_tokens: TokenCount = 0
     output_tokens: int = 0
     chunks: tuple[RetrievedChunk, ...] = ()
 
-    def set_input_tokens(self, count: int | None) -> None:
+    def set_input_tokens(self, count: TokenCount) -> None:
         self.input_tokens = count
 
 
@@ -97,6 +97,7 @@ class AnswerTrace:
         self._tracer = tracer
         self._variant = variant
         self.stages: list[StageTrace] = []
+        self.accounting_seconds = 0.0
 
     @contextmanager
     def span(self, name: str, kind: str) -> Generator[Span]:
@@ -128,17 +129,22 @@ class AnswerTrace:
             usage = StageUsage()
             started = time.perf_counter()
             yield usage
+            ended = time.perf_counter()
+            input_tokens = usage.input_tokens
+            if callable(input_tokens):
+                input_tokens = input_tokens()
+                self.accounting_seconds += time.perf_counter() - ended
             self.stages.append(
                 StageTrace(
                     name,
-                    time.perf_counter() - started,
-                    usage.input_tokens,
+                    ended - started,
+                    input_tokens,
                     usage.output_tokens,
                     model,
                 )
             )
             if model is not None:
-                if usage.input_tokens is not None:
-                    span.set_attribute("gen_ai.usage.input_tokens", usage.input_tokens)
+                if input_tokens is not None:
+                    span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                 span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
             set_chunk_ids(span, usage.chunks)

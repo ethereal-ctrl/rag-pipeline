@@ -1,3 +1,4 @@
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -349,3 +350,37 @@ def test_closed_book_answer_still_works_without_a_collector(
     assert tracer is None
     assert answer.text == "Sam Bankman-Fried"
     assert answer.trace[-1].name == "generate"
+
+
+def test_rerank_latency_excludes_counting_tokens(index: ChunkIndex, bm25_config: VariantConfig):
+    ingest(ARTICLES, index, ChunkingSettings(max_words=20, overlap_sentences=0))
+    config = VariantConfig.model_validate(
+        {
+            **bm25_config.model_dump(),
+            "retrieval": {
+                **bm25_config.retrieval.model_dump(),
+                "rerank": {"reranker": {"provider": "sentence-transformers", "model": "fake"}},
+            },
+        }
+    )
+
+    class SlowTokenCounter(PhraseFakeReranker):
+        counting_seconds = 0.0
+
+        def count_input_tokens(self, query: str, texts: list[str]) -> int:
+            started = time.perf_counter()
+            time.sleep(0.1)
+            self.counting_seconds = time.perf_counter() - started
+            return sum(len(query.split()) + len(text.split()) for text in texts)
+
+    reranker = SlowTokenCounter("The jury will hear")
+    variant = build_variant(
+        config, index=index, models=FakeModels(GroundedFakeGenerator({}), reranker)
+    )
+
+    answer = variant.answer(FTX_QUERY.question)
+
+    assert reranker.counting_seconds >= 0.1
+    assert answer.stage_seconds["rerank"] < reranker.counting_seconds
+    rerank = next(stage for stage in answer.trace if stage.name == "rerank")
+    assert rerank.input_tokens is not None and rerank.input_tokens > 0
