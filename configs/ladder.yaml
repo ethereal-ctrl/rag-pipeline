@@ -1,0 +1,32 @@
+rungs:
+  - label: Closed-Book
+    config: configs/variants/closed-book.yaml
+  - label: BM25
+    config: configs/variants/bm25.yaml
+  - label: Dense
+    config: configs/variants/dense.yaml
+  - label: Hybrid (RRF)
+    config: configs/variants/hybrid.yaml
+  - label: + Reranker
+    config: configs/variants/hybrid-rerank.yaml
+  - label: + Chunk Context
+    config: configs/variants/hybrid-rerank-context.yaml
+  - label: + Citations & support check
+    config: configs/variants/hybrid-rerank-context-cited.yaml
+  - label: + Agentic Search
+    config: configs/variants/agentic.yaml
+  - label: + Router
+    config: configs/variants/router.yaml
+    exception: The Router delegates retrieval and generation to multiple rungs and owns its question embedder.
+
+large_model:
+  split: test-400
+  reason: The Groq free tier allows about 100 RAG questions per day.
+  pairs:
+    - local: configs/variants/closed-book.yaml
+      config: configs/variants/closed-book-groq.yaml
+    - local: configs/variants/hybrid-rerank.yaml
+      config: configs/variants/hybrid-rerank-groq.yaml
+    # Agentic Search is the final direct generation rung. The Router has no shared generator.
+    - local: configs/variants/agentic.yaml
+      config: configs/variants/agentic-groq.yaml

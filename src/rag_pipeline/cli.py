@@ -11,8 +11,9 @@ from typing import Annotated, Literal
 
 import typer
 from httpx import HTTPError
+from opentelemetry.trace import Tracer
 from qdrant_client import QdrantClient
-from qdrant_client.http.exceptions import ResponseHandlingException
+from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
 from typer._click.core import Context as ClickContext
 from typer.core import TyperGroup
 
@@ -58,6 +59,15 @@ from rag_pipeline.judge_evaluation import (
     plan_judging,
     with_judge_metrics,
 )
+from rag_pipeline.ladder import (
+    HeldOutSplit,
+    Ladder,
+    LadderRung,
+    estimate_ladder,
+    ladder_status,
+    run_ladder,
+)
+from rag_pipeline.ladder_report import write_ladder_report
 from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels
 from rag_pipeline.report import metric_label, metric_number, results_table
 from rag_pipeline.router_training import RouterTrainingConfig, train_router
@@ -74,6 +84,7 @@ from rag_pipeline.splits import (
 from rag_pipeline.tracing import cli_tracer
 from rag_pipeline.variants import (
     PipelineVariant,
+    RemoteRunPlan,
     VariantConfig,
     build_variant,
     plan_remote_run,
@@ -87,12 +98,16 @@ JUDGE_SAMPLE_FILE = Path("data/judge-300.json")
 CALIBRATION_DIR = Path("data/judge-calibration")
 RUNS_DIR = Path("runs")
 GATE_FILE = Path("configs/gate/gate.yaml")
+LADDER_FILE = Path("configs/ladder.yaml")
+LADDER_REPORT_DIR = Path("docs/report/ladder")
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 data_app = typer.Typer(no_args_is_help=True)
 app.add_typer(data_app, name="data", help="Fetch the pinned dataset and build splits.")
 router_app = typer.Typer(no_args_is_help=True)
 app.add_typer(router_app, name="router", help="Train the Router from saved Dev Split runs.")
+ladder_app = typer.Typer(no_args_is_help=True)
+app.add_typer(ladder_app, name="ladder", help="Plan, run and report the Ablation Ladder.")
 
 
 class _JudgeGroup(TyperGroup):
@@ -277,7 +292,7 @@ def bootstrap_command(qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL) -> None:
         builds = {
             IndexBuild.for_variant(candidate)
             for candidate in answer_variants(config)
-            if candidate.index is not None
+            if candidate.uses_retrieval and candidate.index is not None
         }
         fetch_dataset(RAW_DIR)
         if not builds:
@@ -348,19 +363,8 @@ def eval_command(
             return
         queries = _split_queries(split)[:limit]
         tracer = ctx.with_resource(cli_tracer())
-        models = LocalModels()
-        router_embedder = None
-        if config.router is not None:
-            assert config.index is not None and config.index.embedder is not None
-            router_embedder = models.embedder_for(config.index.embedder)
-        variant = build_variant(
-            config,
-            index=_index_for(config, models, qdrant_url) if config.router is None else None,
-            models=models,
-            tracer=tracer,
-            cache=None if no_cache else ResponseCache(),
-            router_embedder=router_embedder,
-            index_for=lambda candidate: _index_for(candidate, models, qdrant_url),
+        variant = _evaluation_variant(
+            config, LocalModels(), qdrant_url, tracer, None if no_cache else ResponseCache()
         )
         result = evaluate(
             variant,
@@ -377,20 +381,23 @@ def eval_command(
     _print_metrics(result.metrics, result.intervals)
 
 
-def _split_queries(split: str):
-    by_id = {q.id: q for q in load_queries(RAW_DIR)}
+def _split_ids(split: str) -> tuple[str, ...]:
     splits = Splits.load(SPLITS_FILE)
-    ids = load_test_subset(TEST_SUBSET_FILE, splits) if split == "test-400" else splits.ids(split)
-    return [by_id[i] for i in ids]
+    return load_test_subset(TEST_SUBSET_FILE, splits) if split == "test-400" else splits.ids(split)
 
 
-def _print_remote_plan(
+def _split_queries(split: str) -> list[BenchmarkQuery]:
+    by_id = {q.id: q for q in load_queries(RAW_DIR)}
+    return [by_id[i] for i in _split_ids(split)]
+
+
+def _remote_plan(
     config: VariantConfig,
     queries: list[BenchmarkQuery],
     qdrant_url: str,
     retrieval_only: bool,
     no_cache: bool,
-) -> None:
+) -> RemoteRunPlan:
     remote = config.router is None and config.uses_groq(retrieval_only=retrieval_only)
     cache = ResponseCache() if remote and not no_cache and CACHE_FILE.exists() else None
     version = None
@@ -404,13 +411,23 @@ def _print_remote_plan(
         client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
         try:
             version = ChunkIndex(client, config.index.collection).version()
-        except ResponseHandlingException:
+        except (ResponseHandlingException, UnexpectedResponse):
             typer.echo("Index version unavailable. Cached retrieval prompts could not be checked.")
         finally:
             client.close()
-    plan = plan_remote_run(
+    return plan_remote_run(
         config, queries, cache, retrieval_only=retrieval_only, index_version=version
     )
+
+
+def _print_remote_plan(
+    config: VariantConfig,
+    queries: list[BenchmarkQuery],
+    qdrant_url: str,
+    retrieval_only: bool,
+    no_cache: bool,
+) -> None:
+    plan = _remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
     label = "Remote calls before cache"
     if plan.upper_bound:
         bound = "across Router candidates" if config.router is not None else "at max_steps"
@@ -422,10 +439,32 @@ def _print_remote_plan(
 
 
 def _index_for(config: VariantConfig, models: LocalModels, qdrant_url: str) -> ChunkIndex | None:
-    if config.index is None:
+    if config.index is None or not config.uses_retrieval:
         return None
     embedder = models.embedder_for(config.index.embedder) if config.index.embedder else None
     return ChunkIndex(QdrantClient(url=qdrant_url), config.index.collection, embedder)
+
+
+def _evaluation_variant(
+    config: VariantConfig,
+    models: LocalModels,
+    qdrant_url: str,
+    tracer: Tracer | None,
+    cache: ResponseCache | None,
+) -> PipelineVariant:
+    router_embedder = None
+    if config.router is not None:
+        assert config.index is not None and config.index.embedder is not None
+        router_embedder = models.embedder_for(config.index.embedder)
+    return build_variant(
+        config,
+        index=_index_for(config, models, qdrant_url),
+        models=models,
+        tracer=tracer,
+        cache=cache,
+        router_embedder=router_embedder,
+        index_for=lambda candidate: _index_for(candidate, models, qdrant_url),
+    )
 
 
 def _print_metrics(metrics: dict[str, float], intervals: dict[str, tuple[float, float]]) -> None:
@@ -573,6 +612,181 @@ def compare_command(baseline_run: str, candidate_run: str) -> None:
             f"{mark} {metric_label(d.metric):<34} {base:>6} {candidate:>6} {delta:>7}"
             f"  [{low}, {high}]"
         )
+
+
+def _ladder_gaps(
+    rung: LadderRung,
+    client: QdrantClient,
+    collections: dict[str, str | None],
+) -> tuple[str, ...]:
+    gaps: list[str] = []
+    if (router := rung.config.router) is not None and not router.artifact.is_file():
+        gaps.append(f"missing Router artifact {router.artifact}")
+    candidates = answer_variants(rung.config)
+    if (
+        any(candidate.uses_groq() for candidate in candidates)
+        and not os.getenv("GROQ_API_KEY", "").strip()
+    ):
+        gaps.append("missing GROQ_API_KEY")
+    for candidate in candidates:
+        if not candidate.uses_retrieval or candidate.index is None:
+            continue
+        collection = candidate.index.collection
+        if collection not in collections:
+            try:
+                collections[collection] = (
+                    None
+                    if client.collection_exists(collection)
+                    else f"missing collection {collection}"
+                )
+            except (ResponseHandlingException, UnexpectedResponse):
+                collections[collection] = f"could not check collection {collection}"
+        if (gap := collections[collection]) is not None and gap not in gaps:
+            gaps.append(gap)
+    return tuple(gaps)
+
+
+@ladder_app.command("status")
+def ladder_status_command(
+    split: HeldOutSplit = "test", qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL
+) -> None:
+    """Show saved runs and check collections required by pending rungs."""
+    try:
+        rungs = Ladder.load(LADDER_FILE).for_split(split)
+        client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
+        collections: dict[str, str | None] = {}
+        try:
+            rows = ladder_status(
+                rungs,
+                split,
+                RunStore(RUNS_DIR),
+                missing=lambda rung: _ladder_gaps(rung, client, collections),
+            )
+        finally:
+            client.close()
+    except (OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo("| Rung | Status | Run | Commit | Index version | Date (UTC) | Missing |")
+    typer.echo("| --- | --- | --- | --- | --- | --- | --- |")
+    for row in rows:
+        run = row.run
+        meta = run.meta if run else {}
+        date = str(meta.get("finished_at") or meta.get("started_at") or "—")
+        cells = [
+            row.rung.label,
+            row.state,
+            run.run_id if run else "—",
+            str(meta.get("commit") or "—"),
+            str(meta.get("index_version") or "—"),
+            date,
+            ", ".join(row.missing) or "—",
+        ]
+        typer.echo("| " + " | ".join(cells) + " |")
+
+
+def _print_ladder_estimate(
+    rungs: tuple[LadderRung, ...], split: HeldOutSplit, store: RunStore, qdrant_url: str
+) -> None:
+    count = len(_split_ids(split))
+    estimates = estimate_ladder(rungs, split, store, count)
+    total = 0.0
+    pending = unknown = quota_days = 0
+    queries: list[BenchmarkQuery] | None = None
+    for estimate in estimates:
+        status = estimate.status
+        name = status.rung.label
+        if status.state == "complete":
+            assert status.run is not None
+            typer.echo(f"{name}  complete  {status.run.run_id}")
+            continue
+        if status.state == "blocked":
+            typer.echo(f"{name}  blocked  {', '.join(status.missing)}")
+            continue
+        pending += 1
+        if estimate.seconds is None:
+            unknown += 1
+            typer.echo(f"{name}  no completed Dev latency estimate")
+        else:
+            total += estimate.seconds
+            typer.echo(f"{name}  {estimate.seconds:.1f} s  Dev run {estimate.dev_run_id}")
+        if split == "test-400":
+            if queries is None:
+                queries = _split_queries(split)
+            plan = _remote_plan(status.rung.config, queries, qdrant_url, False, False)
+            quota_days += plan.days
+            upper = " upper bound" if plan.upper_bound else ""
+            typer.echo(
+                f"  Groq  {plan.calls - plan.cached} calls after cache, "
+                f"{plan.days} quota day(s){upper}"
+            )
+    typer.echo(f"Estimated wall time  {total:.1f} s across {pending - unknown} rung(s)")
+    if unknown:
+        typer.echo(f"Rungs without a Dev estimate  {unknown}")
+    if split == "test-400":
+        typer.echo(f"Sum of per-rung Groq quota day estimates  {quota_days}")
+
+
+@ladder_app.command("run")
+def ladder_run_command(
+    ctx: typer.Context,
+    split: HeldOutSplit = "test",
+    dry_run: bool = False,
+    qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
+) -> None:
+    """Run unfinished rungs in order using the normal held-out score guard."""
+    try:
+        rungs = Ladder.load(LADDER_FILE).for_split(split)
+        store = RunStore(RUNS_DIR)
+        if dry_run:
+            _print_ladder_estimate(rungs, split, store, qdrant_url)
+            return
+        statuses = ladder_status(rungs, split, store)
+        if all(row.state == "complete" for row in statuses):
+            typer.echo(f"All {split} rungs are complete.")
+            return
+        queries = _split_queries(split)
+        client = QdrantClient(url=qdrant_url, timeout=2, check_compatibility=False)
+        ctx.call_on_close(client.close)
+        tracer = ctx.with_resource(cli_tracer())
+        models = LocalModels()
+        cache = ResponseCache()
+        collections: dict[str, str | None] = {}
+
+        def build(rung: LadderRung) -> PipelineVariant:
+            if gaps := _ladder_gaps(rung, client, collections):
+                raise ValueError(", ".join(gaps))
+            typer.echo(f"Evaluating {rung.label} ({rung.config.name}) on {split}.")
+            return _evaluation_variant(rung.config, models, qdrant_url, tracer, cache)
+
+        for result in run_ladder(rungs, split, store, queries, build):
+            typer.echo(f"Completed {result.run_id}")
+    except (OSError, ValueError, RuntimeError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+
+
+@ladder_app.command("report")
+def ladder_report_command(
+    split: HeldOutSplit = "test",
+    output: Path = LADDER_REPORT_DIR,
+) -> None:
+    """Render Markdown and SVGs from saved evaluations."""
+    try:
+        splits = Splits.load(SPLITS_FILE)
+        path = write_ladder_report(
+            Ladder.load(LADDER_FILE),
+            RunStore(RUNS_DIR),
+            split,
+            output,
+            dev_ids=splits.dev,
+            test_ids=splits.test,
+            subset_ids=load_test_subset(TEST_SUBSET_FILE, splits),
+        )
+    except (OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    typer.echo(f"Wrote {path} and its three SVG charts.")
 
 
 @app.command("table")

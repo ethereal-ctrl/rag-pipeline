@@ -1,5 +1,11 @@
-# Memorisation baseline: the same generator with no retrieval (ADR 0002).
+# Closed-Book uses the shared index declaration for ladder comparisons.
 name: closed-book
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
 retrieval:
   mode: none
 generation:

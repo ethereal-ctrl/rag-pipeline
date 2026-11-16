@@ -106,6 +106,13 @@ class RunResult:
 
 
 @dataclass(frozen=True)
+class StoredRun:
+    run_id: str
+    meta: dict[str, Any]
+    complete: bool
+
+
+@dataclass(frozen=True)
 class MetricDelta:
     metric: str
     baseline: float
@@ -172,7 +179,7 @@ def _normalise(text: str) -> str:
     return " ".join(_NON_ALNUM.sub(" ", text.lower()).split())
 
 
-def _is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
+def answer_is_correct(query: BenchmarkQuery, answer: str, abstained: bool) -> bool:
     if query.is_null:
         return abstained
     if abstained:
@@ -228,7 +235,7 @@ def _score(query: BenchmarkQuery, variant: Evaluable, retrieval_only: bool) -> Q
         reference_answer=query.answer,
         answer=answer.text,
         abstained=answer.abstained,
-        correct=None if retrieval_only else _is_correct(query, answer.text, answer.abstained),
+        correct=None if retrieval_only else answer_is_correct(query, answer.text, answer.abstained),
         hit_at_4=ranks.hit_at_4 if ranks else None,
         hit_at_10=ranks.hit_at_10 if ranks else None,
         reciprocal_rank=ranks.reciprocal_rank if ranks else None,
@@ -487,6 +494,9 @@ class RunStore:
 
     def load_meta(self, run_id: str) -> dict[str, Any]:
         return self._meta(self.root / run_id)
+
+    def runs(self) -> list[StoredRun]:
+        return [StoredRun(d.name, self._meta(d), self._is_complete(d)) for d in self._run_dirs()]
 
     @staticmethod
     def _meta(run_dir: Path) -> dict[str, Any]:

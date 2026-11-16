@@ -124,7 +124,7 @@ class _Runtime:
 
     def _index(self, config: VariantConfig) -> ChunkIndex | None:
         index = config.index
-        if index is None:
+        if index is None or not config.uses_retrieval:
             return None
         embedder = self.models.embedder_for(index.embedder) if index.embedder is not None else None
         return ChunkIndex(self.qdrant, index.collection, embedder)
@@ -143,8 +143,10 @@ class _Runtime:
 
         with self.lock:
             for candidate in candidates:
-                if candidate.index and not self.qdrant.collection_exists(
-                    candidate.index.collection
+                if (
+                    candidate.uses_retrieval
+                    and candidate.index
+                    and not self.qdrant.collection_exists(candidate.index.collection)
                 ):
                     index = IndexBuild.for_variant(candidate)
                     raise HTTPException(

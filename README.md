@@ -52,9 +52,9 @@ The local demo page, API docs and reachability checks are available at `/`, `/do
 ```bash
 uv sync
 docker compose up -d qdrant phoenix
-ollama pull qwen3.5:4b        # local generator
+ollama pull qwen3.5:4b && ollama pull qwen3-embedding:0.6b
 uv run rag data fetch         # pinned MultiHop-RAG files, checksum-verified
-uv run rag ingest             # chunk + index the Corpus (incremental)
+uv run rag ingest --variant-file configs/variants/bm25.yaml
 uv run rag eval configs/variants/bm25.yaml --split smoke
 ```
 
@@ -163,7 +163,7 @@ uv run rag eval configs/variants/hybrid-rerank-cited.yaml --split smoke
 ## Agentic Search
 
 Compare [Agentic Search](configs/variants/agentic.yaml) with the
-[cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-cited.yaml).
+[contextualized, cited Hybrid + Reranker variant](configs/variants/hybrid-rerank-context-cited.yaml).
 Agentic Search plans sub-queries and reuses retrieval and reranking for each search.
 Each step contributes up to `chunks_per_step` new Chunks to the Evidence shown to
 the sufficiency check. Final generation takes the highest-ranked contribution
@@ -302,6 +302,44 @@ Chunks as Evidence. The `hyde` stage records the extra generation time and token
 
 The [Side Ablations report](docs/report/side-ablations.md) has slots for the measured
 comparisons and conclusions.
+
+## Final Ablation Ladder
+
+The [ladder definition](configs/ladder.yaml) records the order and checks each
+adjacent config change. The early retrieval rungs share the plain dense index.
+Chunk Context, Citations, and Agentic Search share the contextualized index.
+The Router delegates to existing variants and needs its artifact fitted on Dev.
+
+After locking the bake-off winners, build the plain and contextualized indexes
+using their final configs. Enter the matching completed Dev run IDs in
+`configs/router/router.yaml` before training the Router.
+
+```bash
+uv run --no-env-file rag ingest --variant-file configs/variants/hybrid-rerank.yaml
+uv run --no-env-file rag ingest --variant-file configs/variants/hybrid-rerank-context.yaml
+uv run --no-env-file rag router train configs/router/router.yaml
+```
+
+The status command shows completed runs, interruptions, and missing collections.
+The local time estimate uses the latest saved Dev p50 for each rung. The runner
+uses the normal Test Split guard and resumes a matching interrupted run.
+
+```bash
+uv run --no-env-file rag ladder status --split test
+uv run --no-env-file rag ladder run --split test --dry-run
+uv run --no-env-file rag ladder run --split test
+uv run --env-file .env rag ladder status --split test-400
+uv run --env-file .env rag ladder run --split test-400 --dry-run
+uv run --env-file .env rag ladder run --split test-400
+uv run --no-env-file rag ladder report --split test --output docs/report/ladder
+```
+
+The large-model comparison uses saved local answers on the same queries as Groq.
+Agentic Search is the deepest rung with a direct generator to swap. Estimate its
+quota separately since it can call Groq multiple times per question.
+The report includes pending rows, source run IDs, and the Dev majority baseline
+once saved runs cover all fixed Dev and Test queries. After grading completed
+runs with `rag judge RUN_ID`, regenerate the report to include their Judge metrics.
 
 ## Development
 

@@ -14,7 +14,7 @@ def metric_number(metric: str, value: float, *, signed: bool = False) -> str:
     return format(value, ("+" if signed else "") + precision)
 
 
-def _cell(run: RunResult, metric: str) -> str:
+def metric_cell(run: RunResult, metric: str) -> str:
     if metric not in run.metrics:
         return "n/a"
     low, high = run.intervals.get(metric, (float("nan"), float("nan")))
@@ -31,7 +31,7 @@ def results_table(runs: list[RunResult], metrics: list[str]) -> str:
         "|---|---|---:|" + "---:|" * len(metrics),
     ]
     for run in runs:
-        cells = [_cell(run, m) for m in metrics]
+        cells = [metric_cell(run, m) for m in metrics]
         variant = run.meta["variant"]["name"]
         lines.append(
             f"| {variant} | {run.meta['split']} | {int(run.metrics['queries'])} | "

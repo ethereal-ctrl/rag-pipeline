@@ -191,7 +191,9 @@ class VariantConfig(_Frozen):
 
     def run_config(self) -> dict[str, Any]:
         config = self.model_dump(mode="json", exclude={"index": {"chunk_context"}})
-        if self.index is not None and self.index.chunking is None:
+        if not self.uses_retrieval and self.router is None:
+            config["index"] = None
+        elif self.index is not None and self.index.chunking is None:
             del config["index"]["chunking"]
         if self.retrieval.active_hyde is None:
             del config["retrieval"]["hyde"]
@@ -410,7 +412,7 @@ class PipelineVariant:
         if config.uses_retrieval and index is None:
             raise ValueError(f"variant {config.name!r} retrieves but no index was given")
         self.config = config
-        self._index = index
+        self._index = index if config.uses_retrieval else None
         self._tracer = tracer if tracer is not None else NoOpTracer()
         self._cache = cache
         self._routing: _Routing | None = None
