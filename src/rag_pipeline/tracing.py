@@ -124,12 +124,15 @@ class AnswerTrace:
         *,
         model: str | None = None,
         operation: str | None = None,
+        sub_query: str | None = None,
     ) -> Generator[StageUsage]:
         with self.span(name, kind) as span:
             if operation is not None:
                 span.set_attribute("gen_ai.operation.name", operation)
             if model is not None:
                 span.set_attribute("gen_ai.request.model", model)
+            if sub_query is not None:
+                span.set_attribute("rag.sub_query", sub_query)
             usage = StageUsage()
             started = time.perf_counter()
             yield usage

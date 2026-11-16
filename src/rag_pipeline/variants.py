@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass, field, replace
@@ -13,6 +14,17 @@ import yaml
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
+from rag_pipeline.agentic import (
+    DECISION_SCHEMA,
+    DECISION_SYSTEM_PROMPT,
+    PLAN_SCHEMA,
+    PLAN_SYSTEM_PROMPT,
+    AgenticConfig,
+    StopReason,
+    TokenBudget,
+    next_query,
+    planned_queries,
+)
 from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.citations import (
     CITATION_SCHEMA,
@@ -33,7 +45,7 @@ from rag_pipeline.models import (
     RerankerSpec,
     RerankTokenCounter,
     StructuredGenerator,
-    estimated_groq_tokens,
+    estimate_tokens,
     model_version,
 )
 from rag_pipeline.rate_limit import DAY, MINUTE, groq_limits
@@ -98,6 +110,7 @@ class VariantConfig(_Frozen):
     index: IndexConfig | None = None
     retrieval: RetrievalConfig
     generation: GenerationConfig
+    agentic: AgenticConfig | None = None
 
     @model_validator(mode="after")
     def _retrieval_needs_an_index(self) -> Self:
@@ -109,6 +122,8 @@ class VariantConfig(_Frozen):
             raise ValueError(f"retrieval mode {self.retrieval.mode!r} needs an index embedder")
         if self.generation.citations.enabled and not self.uses_retrieval:
             raise ValueError("Citations require retrieval")
+        if self.agentic is not None and not self.generation.citations.enabled:
+            raise ValueError("Agentic Search requires Citations")
         return self
 
     @property
@@ -116,9 +131,12 @@ class VariantConfig(_Frozen):
         return self.retrieval.mode != "none"
 
     def run_config(self) -> dict[str, Any]:
-        if self.generation.citations.enabled:
-            return self.model_dump()
-        return self.model_dump(exclude={"generation": {"citations"}})
+        config = self.model_dump()
+        if not self.generation.citations.enabled:
+            del config["generation"]["citations"]
+        if self.agentic is None:
+            del config["agentic"]
+        return config
 
     @classmethod
     def from_yaml(cls, path: Path) -> VariantConfig:
@@ -138,6 +156,8 @@ class Answer:
     citations: tuple[Citation, ...] = ()
     removed_statements: tuple[RemovedStatement, ...] = ()
     shown_chunk_ids: tuple[str, ...] = ()
+    search_steps: int | None = None
+    stop_reason: StopReason | None = None
 
 
 def is_abstention(text: str) -> bool:
@@ -173,11 +193,16 @@ def _generation_plan_key(config: VariantConfig, index_version: str, question: st
     return cache_key("generation-plan-v3", config.run_config(), index_version, question)
 
 
+def _stage_plan_key(plan_key: str, stage: str) -> str:
+    return plan_key if stage == "generate" else cache_key(stage, plan_key)
+
+
 @dataclass(frozen=True)
 class RemoteRunPlan:
     calls: int
     cached: int
     days: int
+    upper_bound: bool = False
 
 
 def plan_remote_run(
@@ -194,9 +219,13 @@ def plan_remote_run(
         return RemoteRunPlan(0, 0, 0)
     limits = groq_limits(spec.model)
     assert limits.tokens_per_day is not None
-    checking = config.generation.citations.checks_support
-    calls_per_query = 2 if checking else 1
-    calls = len(queries) * calls_per_query
+    agentic = config.agentic
+    stages = ["generate"]
+    if config.generation.citations.checks_support:
+        stages.append("check")
+    if agentic is not None:
+        stages = ["plan", *(f"decide.{step}" for step in range(1, agentic.max_steps + 1)), *stages]
+    calls = len(queries) * len(stages)
     cached = tokens = 0
     system = SYSTEM_PROMPT if config.uses_retrieval else CLOSED_BOOK_SYSTEM_PROMPT
     if config.generation.citations.enabled:
@@ -210,14 +239,18 @@ def plan_remote_run(
                 cached_calls += cache.contains(key)
             elif index_version is not None:
                 plan_key = _generation_plan_key(config, index_version, query.question)
-                cached_calls += cache.contains_plan(plan_key)
-                if checking:
-                    cached_calls += cache.contains_plan(cache_key("check", plan_key))
+                cached_calls = sum(
+                    cache.contains_plan(_stage_plan_key(plan_key, stage)) for stage in stages
+                )
         cached += cached_calls
-        call_tokens = estimated_groq_tokens(system, prompt, spec.max_output_tokens)
+        if agentic is not None:
+            if cached_calls < len(stages):
+                tokens += agentic.max_tokens
+            continue
+        call_tokens = estimate_tokens(system, prompt, spec.max_output_tokens)
         if config.uses_retrieval:
             call_tokens += ESTIMATED_TOKENS_PER_CHUNK * config.generation.context_chunks
-        tokens += call_tokens * (calls_per_query - cached_calls)
+        tokens += call_tokens * (len(stages) - cached_calls)
     remaining = calls - cached
     minutes_per_day = DAY // MINUTE
     days = math.ceil(
@@ -228,7 +261,7 @@ def plan_remote_run(
             tokens / (limits.tokens_per_minute * minutes_per_day),
         )
     )
-    return RemoteRunPlan(calls, cached, days)
+    return RemoteRunPlan(calls, cached, days, upper_bound=agentic is not None)
 
 
 class PipelineVariant:
@@ -334,16 +367,21 @@ class PipelineVariant:
         ranked = sorted(zip(scores, candidates, strict=True), key=lambda pair: -pair[0])
         return tuple(replace(chunk, score=score) for score, chunk in ranked)
 
-    def _retrieve(self, question: str, trace: AnswerTrace) -> tuple[RetrievedChunk, ...]:
+    def _retrieve(
+        self, question: str, trace: AnswerTrace, *, step: int | None = None
+    ) -> tuple[RetrievedChunk, ...]:
         index = self.config.index
         embedder = (
             index.embedder if index and self.config.retrieval.mode in ("dense", "hybrid") else None
         )
+        suffix = f".{step}" if step is not None else ""
+        sub_query = question if step is not None else None
         with trace.stage(
-            "retrieve",
+            f"retrieve{suffix}",
             "RETRIEVER",
             model=embedder.model if embedder else None,
             operation="embeddings" if embedder else None,
+            sub_query=sub_query,
         ) as stage:
             retrieved = stage.chunks = self._first_stage(question, stage)
             if not self.config.uses_retrieval and self._cache is not None:
@@ -351,7 +389,11 @@ class PipelineVariant:
         rerank = self.config.retrieval.rerank
         if rerank is not None:
             with trace.stage(
-                "rerank", "RERANKER", model=rerank.reranker.model, operation="rerank"
+                f"rerank{suffix}",
+                "RERANKER",
+                model=rerank.reranker.model,
+                operation="rerank",
+                sub_query=sub_query,
             ) as stage:
                 retrieved = stage.chunks = self._rerank(question, retrieved, stage)
         return retrieved[: self.config.retrieval.top_k]
@@ -405,8 +447,13 @@ class PipelineVariant:
         stage: StageUsage,
         *,
         schema: dict[str, Any] | None = None,
-        checking: bool = False,
-    ) -> Completion:
+        stage_name: str = "generate",
+        budget: TokenBudget | None = None,
+    ) -> Completion | None:
+        if budget is not None and not budget.fits(system, prompt):
+            stage.chunks = ()
+            stage.seconds = 0.0
+            return None
         generator = self.generator
         if schema is None:
             call = partial(generator.complete, system, prompt)
@@ -418,31 +465,30 @@ class PipelineVariant:
             completion = call()
             if completion.call_seconds is not None:
                 stage.timing_adjustment = completion.call_seconds - (time.perf_counter() - started)
-            return completion
+        else:
+            spec = self.config.generation.generator
+            key = _generation_key(spec, generator.name, model_version(generator), system, prompt)
+            if schema is not None:
+                key = cache_key(key, schema)
 
-        spec = self.config.generation.generator
-        key = _generation_key(
-            spec, self.generator.name, model_version(self.generator), system, prompt
-        )
-        if schema is not None:
-            key = cache_key(key, schema)
+            def generate() -> ModelResponse[Completion]:
+                result = measure_call(call)
+                seconds = result.value.call_seconds
+                return result if seconds is None else ModelResponse(result.value, seconds)
 
-        def generate() -> ModelResponse[Completion]:
-            result = measure_call(call)
-            seconds = result.value.call_seconds
-            return result if seconds is None else ModelResponse(result.value, seconds)
-
-        response = self._cache.get_or_call(key, _COMPLETION_ADAPTER, generate)
-        stage.seconds = response.seconds
-        stage.cache_hit = response.cache_hit
-        if (
-            spec.provider == "groq"
-            and self.config.uses_retrieval
-            and (version := self._plan_index_version) is not None
-        ):
-            plan_key = _generation_plan_key(self.config, version, question)
-            self._cache.remember_plan(cache_key("check", plan_key) if checking else plan_key, key)
-        return response.value
+            response = self._cache.get_or_call(key, _COMPLETION_ADAPTER, generate)
+            stage.seconds = response.seconds
+            stage.cache_hit = response.cache_hit
+            completion = response.value
+            if (
+                spec.provider == "groq"
+                and self.config.uses_retrieval
+                and (version := self._plan_index_version) is not None
+            ):
+                plan_key = _generation_plan_key(self.config, version, question)
+                self._cache.remember_plan(_stage_plan_key(plan_key, stage_name), key)
+        stage.input_tokens, stage.output_tokens = completion.input_tokens, completion.output_tokens
+        return completion if budget is None or budget.debit(completion, system, prompt) else None
 
     def _check_citations(
         self,
@@ -450,29 +496,37 @@ class PipelineVariant:
         citations: tuple[Citation, ...],
         shown: tuple[RetrievedChunk, ...],
         trace: AnswerTrace,
+        budget: TokenBudget | None,
     ) -> tuple[tuple[Citation, ...], tuple[RemovedStatement, ...]]:
         checker = self._support_checker
         if checker is None or not citations:
             return citations, ()
         cited_ids = {id_ for citation in citations for id_ in citation.chunk_ids}
+        unavailable = False
         with trace.stage(
             "check", "LLM", model=self.config.generation.generator.model, operation="chat"
         ) as stage:
             stage.chunks = tuple(chunk for chunk in shown if chunk.chunk_id in cited_ids)
 
             def complete(system: str, prompt: str, schema: dict[str, Any]) -> str:
+                nonlocal unavailable
                 result = self._complete(
-                    question, system, prompt, stage, schema=schema, checking=True
+                    question,
+                    system,
+                    prompt,
+                    stage,
+                    schema=schema,
+                    stage_name="check",
+                    budget=budget,
                 )
-                stage.input_tokens = result.input_tokens
-                stage.output_tokens = result.output_tokens
-                return result.text
+                unavailable = result is None
+                return "" if result is None else result.text
 
             verdicts = checker.check(citations, stage.chunks, complete)
         if verdicts is None:
+            reason = "max_tokens" if unavailable else "invalid_support_verdict"
             return (), tuple(
-                RemovedStatement(cite.statement, cite.chunk_ids, "invalid_support_verdict")
-                for cite in citations
+                RemovedStatement(cite.statement, cite.chunk_ids, reason) for cite in citations
             )
         supported: list[Citation] = []
         removed: list[RemovedStatement] = []
@@ -483,50 +537,131 @@ class PipelineVariant:
                 removed.append(RemovedStatement(cite.statement, cite.chunk_ids, "unsupported"))
         return tuple(supported), tuple(removed)
 
+    def _search(
+        self, question: str, config: AgenticConfig, trace: AnswerTrace, budget: TokenBudget
+    ) -> tuple[tuple[RetrievedChunk, ...], int, StopReason]:
+        model = self.config.generation.generator.model
+        with trace.stage("plan", "LLM", model=model, operation="chat") as stage:
+            plan = self._complete(
+                question,
+                PLAN_SYSTEM_PROMPT,
+                question,
+                stage,
+                schema=PLAN_SCHEMA,
+                stage_name="plan",
+                budget=budget,
+            )
+        if plan is None:
+            return (), 0, "max_tokens"
+
+        sub_query, *remaining = planned_queries(plan.text, question)
+        evidence: dict[str, RetrievedChunk] = {}
+        pool: tuple[RetrievedChunk, ...] = ()
+        context = ""
+        for step in range(1, config.max_steps + 1):
+            remaining = [query for query in remaining if query != sub_query]
+            unused = json.dumps(remaining).replace("<", "\\u003c").replace(">", "\\u003e")
+            suffix = (
+                f"\n</context>\n\nQuestion: {question}\nRemaining planned sub-queries: {unused}"
+            )
+            prefix = "<context>\n"
+            if not budget.fits(DECISION_SYSTEM_PROMPT, prefix + context + suffix):
+                return pool, step - 1, "max_tokens"
+            for chunk in self._retrieve(sub_query, trace, step=step):
+                evidence.setdefault(chunk.chunk_id, chunk)
+            pool = tuple(evidence.values())
+            context = _format_context(pool)
+            prompt = prefix + context + suffix
+            name = f"decide.{step}"
+            with trace.stage(
+                name, "LLM", model=model, operation="chat", sub_query=sub_query
+            ) as stage:
+                stage.chunks = pool
+                result = self._complete(
+                    question,
+                    DECISION_SYSTEM_PROMPT,
+                    prompt,
+                    stage,
+                    schema=DECISION_SCHEMA,
+                    stage_name=name,
+                    budget=budget,
+                )
+            if result is None:
+                return pool, step, "max_tokens"
+            follow_up = next_query(result.text)
+            if follow_up is None:
+                return pool, step, "sufficient"
+            sub_query = follow_up
+        return pool, config.max_steps, "max_steps"
+
     def answer(self, question: str) -> Answer:
         started = time.perf_counter()
         trace = AnswerTrace(self._tracer, self.config.name)
         with trace.span("answer", "CHAIN") as root:
-            retrieved = self._retrieve(question, trace)
-            set_chunk_ids(root, retrieved)
+            agentic = self.config.agentic
             spec = self.config.generation.generator
+            budget = None
+            search_steps = stop_reason = None
+            if agentic is None:
+                retrieved = self._retrieve(question, trace)
+            else:
+                budget = TokenBudget(
+                    agentic.max_tokens,
+                    spec.max_output_tokens,
+                    spec.context_size if spec.provider == "ollama" else agentic.max_tokens,
+                )
+                retrieved, search_steps, stop_reason = self._search(
+                    question, agentic, trace, budget
+                )
+            set_chunk_ids(root, retrieved)
             cited = self.config.generation.citations.enabled
             shown: tuple[RetrievedChunk, ...] = ()
             with trace.stage("generate", "LLM", model=spec.model, operation="chat") as stage:
                 if self.config.uses_retrieval:
-                    shown = stage.chunks = retrieved[: self.config.generation.context_chunks]
+                    max_chunks = (
+                        agentic.max_context_chunks
+                        if agentic
+                        else self.config.generation.context_chunks
+                    )
+                    shown = stage.chunks = retrieved[:max_chunks]
                     context = _format_context(shown)
                     system = CITATION_SYSTEM_PROMPT if cited else SYSTEM_PROMPT
                     prompt = f"<context>\n{context}\n</context>\n\nQuestion: {question}"
                 else:
                     system, prompt = CLOSED_BOOK_SYSTEM_PROMPT, f"Question: {question}"
                 completion = self._complete(
-                    question, system, prompt, stage, schema=CITATION_SCHEMA if cited else None
+                    question,
+                    system,
+                    prompt,
+                    stage,
+                    schema=CITATION_SCHEMA if cited else None,
+                    budget=budget,
                 )
-                stage.input_tokens = completion.input_tokens
-                stage.output_tokens = completion.output_tokens
-            shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited else ()
-            answer_text, citations, removed = (
-                parse_citations(completion.text, shown_ids) if cited else (completion.text, (), ())
-            )
-            citations, rejected = self._check_citations(question, citations, shown, trace)
+            shown_ids = tuple(chunk.chunk_id for chunk in shown) if cited and completion else ()
+            if completion is None:
+                stop_reason = "max_tokens"
+                answer_text, citations, removed = ABSTENTION_TEXT, (), ()
+            elif cited:
+                answer_text, citations, removed = parse_citations(completion.text, shown_ids)
+            else:
+                answer_text, citations, removed = completion.text, (), ()
+            citations, rejected = self._check_citations(question, citations, shown, trace, budget)
+            if any(item.reason == "max_tokens" for item in rejected):
+                stop_reason = "max_tokens"
             abstained = is_abstention(answer_text) or (cited and (not answer_text or not citations))
             if cited and abstained:
                 answer_text = ABSTENTION_TEXT
+            generator_stages = [
+                stage
+                for stage in trace.stages
+                if stage.name in ("plan", "generate", "check") or stage.name.startswith("decide.")
+            ]
             return Answer(
                 text=answer_text,
                 abstained=abstained,
                 retrieved=retrieved,
-                input_tokens=sum(
-                    stage.input_tokens or 0
-                    for stage in trace.stages
-                    if stage.name in ("generate", "check")
-                ),
-                output_tokens=sum(
-                    stage.output_tokens
-                    for stage in trace.stages
-                    if stage.name in ("generate", "check")
-                ),
+                input_tokens=sum(stage.input_tokens or 0 for stage in generator_stages),
+                output_tokens=sum(stage.output_tokens for stage in generator_stages),
                 seconds=(
                     sum(stage.seconds for stage in trace.stages)
                     if self._cache is not None or spec.provider == "groq"
@@ -537,6 +672,8 @@ class PipelineVariant:
                 citations=citations,
                 removed_statements=removed + rejected,
                 shown_chunk_ids=shown_ids,
+                search_steps=search_steps,
+                stop_reason=stop_reason,
             )
 
 

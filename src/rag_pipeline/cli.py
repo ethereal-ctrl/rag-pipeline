@@ -201,7 +201,12 @@ def _print_remote_plan(
     plan = plan_remote_run(
         config, queries, cache, retrieval_only=retrieval_only, index_version=version
     )
-    typer.echo(f"Remote calls before cache  {plan.calls}")
+    label = (
+        "Remote calls before cache (upper bound at max_steps)"
+        if plan.upper_bound
+        else ("Remote calls before cache")
+    )
+    typer.echo(f"{label}  {plan.calls}")
     typer.echo(f"Already cached             {plan.cached}")
     typer.echo(f"Remote calls needed       {plan.calls - plan.cached}")
     typer.echo(f"Estimated quota days       {plan.days}")
