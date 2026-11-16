@@ -1,0 +1,45 @@
+[project]
+name = "rag-pipeline"
+version = "0.1.0"
+description = "A measured RAG Ablation Ladder on MultiHop-RAG, running fully locally."
+authors = [{ name = "Safak Top" }]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28",
+    "pydantic>=2.10",
+    "pyyaml>=6.0",
+    "qdrant-client>=1.15",
+    "typer>=0.15",
+]
+
+[project.scripts]
+rag = "rag_pipeline.cli:app"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.400",
+    "pytest>=8.3",
+    "ruff>=0.11",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs running Qdrant/Ollama; excluded by default"]
+addopts = "-m 'not integration'"
