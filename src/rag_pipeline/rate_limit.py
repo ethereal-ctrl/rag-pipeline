@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import sqlite3
 import time
 from contextlib import closing
@@ -17,7 +16,7 @@ from pydantic import BaseModel, PositiveInt, TypeAdapter
 MINUTE = 60
 DAY = 86400
 MONTH = 31 * DAY  # Conservative rolling window across calendar months.
-type RemoteProvider = Literal["groq", "mistral"]
+type RemoteProvider = Literal["groq", "gemini"]
 
 
 class Clock(Protocol):
@@ -54,31 +53,13 @@ class _PublishedLimits(RateLimits):
     looked_up: str
 
 
-_MISTRAL_REQUIRED = ("requests_per_second", "tokens_per_minute", "tokens_per_month")
-
-
 def remote_limits(provider: str, model: str) -> _PublishedLimits:
     data = yaml.safe_load(files("rag_pipeline").joinpath("rate_limits.yaml").read_text("utf-8"))
     limits = TypeAdapter(dict[str, _PublishedLimits]).validate_python(data)
     selected = limits.get(model)
     if selected is None or selected.provider != provider:
         raise ValueError(f"no verified {provider.title()} limits for {model!r}")
-    if provider == "mistral":
-        fields = selected.model_dump()
-        for field in (*_MISTRAL_REQUIRED, "requests_per_month"):
-            setting = f"MISTRAL_{field.upper()}"
-            if value := os.getenv(setting, "").strip():
-                fields[field] = value
-        missing = [
-            f"MISTRAL_{field.upper()}" for field in _MISTRAL_REQUIRED if fields[field] is None
-        ]
-        if missing:
-            raise ValueError(
-                f"no verified Mistral limits for {model!r}. "
-                f"Confirm API access and set {', '.join(missing)} from your organization limits."
-            )
-        return _PublishedLimits.model_validate(fields)
-    if selected.tokens_per_day is None:
+    if provider == "groq" and selected.tokens_per_day is None:
         raise ValueError(f"no verified Groq Free Plan limits for {model!r}")
     return selected
 
@@ -87,18 +68,16 @@ def groq_limits(model: str) -> _PublishedLimits:
     return remote_limits("groq", model)
 
 
-def quota_days(limits: RateLimits, calls: int, tokens: int) -> int:
-    """Estimate whole quota days for an uncached workload."""
-    return math.ceil(
-        max(
-            (
-                seconds
-                / DAY
-                * max(calls / (request_limit or math.inf), tokens / (token_limit or math.inf))
-                for seconds, request_limit, token_limit in limits.windows()
-            ),
-            default=0.0,
-        )
+def quota_hours(limits: RateLimits, calls: int, tokens: int) -> float:
+    """Estimate hours of allowance for an uncached workload at sustained throughput."""
+    return max(
+        (
+            seconds
+            / 3600
+            * max(calls / (request_limit or math.inf), tokens / (token_limit or math.inf))
+            for seconds, request_limit, token_limit in limits.windows()
+        ),
+        default=0.0,
     )
 
 

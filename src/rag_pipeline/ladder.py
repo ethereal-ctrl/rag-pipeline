@@ -13,10 +13,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rag_pipeline.corpus import BenchmarkQuery
 from rag_pipeline.evaluation import Evaluable, RunResult, RunStore, StoredRun, evaluate
-from rag_pipeline.rate_limit import RemoteProvider
 from rag_pipeline.variants import VariantConfig
 
 type HeldOutSplit = Literal["test", "test-400"]
+type LadderProvider = Literal["groq", "gemma"]
 
 
 class _Definition(BaseModel):
@@ -36,11 +36,11 @@ class _PairDefinition(_Definition):
 
 class _LargeModelDefinition(_Definition):
     split: Literal["test-400"]
-    provider: RemoteProvider = "groq"  # Compatibility with older ladder configs.
+    provider: LadderProvider = "groq"  # Compatibility with older ladder configs.
     reason: str = Field(min_length=1)
     pairs: tuple[_PairDefinition, ...]
-    alternatives: dict[RemoteProvider, tuple[_PairDefinition, ...]] = Field(
-        default_factory=dict[RemoteProvider, tuple[_PairDefinition, ...]]
+    alternatives: dict[LadderProvider, tuple[_PairDefinition, ...]] = Field(
+        default_factory=dict[LadderProvider, tuple[_PairDefinition, ...]]
     )
 
 
@@ -68,9 +68,9 @@ class Ladder:
     rungs: tuple[LadderRung, ...]
     large_model: tuple[LargeModelPair, ...] = ()
     large_model_reason: str = ""
-    large_model_provider: RemoteProvider = "groq"
-    alternatives: dict[RemoteProvider, tuple[LargeModelPair, ...]] = field(
-        default_factory=dict[RemoteProvider, tuple[LargeModelPair, ...]]
+    large_model_provider: LadderProvider = "groq"
+    alternatives: dict[LadderProvider, tuple[LargeModelPair, ...]] = field(
+        default_factory=dict[LadderProvider, tuple[LargeModelPair, ...]]
     )
 
     @classmethod
@@ -88,7 +88,7 @@ class Ladder:
 
         def load_pairs(
             items: tuple[_PairDefinition, ...],
-            provider: RemoteProvider,
+            provider: LadderProvider,
         ) -> tuple[LargeModelPair, ...]:
             pairs: list[LargeModelPair] = []
             for item in items:
@@ -104,7 +104,7 @@ class Ladder:
                 spec = config.generation.generator
                 if (
                     local.config.router is not None
-                    or spec.provider != provider
+                    or spec.provider != ("gemini" if provider == "gemma" else provider)
                     or spec.model.endswith("-latest")
                     or config.model_copy(
                         update={
@@ -137,7 +137,7 @@ class Ladder:
             },
         )
 
-    def large_pairs(self, provider: RemoteProvider | None = None) -> tuple[LargeModelPair, ...]:
+    def large_pairs(self, provider: LadderProvider | None = None) -> tuple[LargeModelPair, ...]:
         if provider is None or provider == self.large_model_provider:
             return self.large_model
         if provider not in self.alternatives:
@@ -147,7 +147,7 @@ class Ladder:
     def for_split(
         self,
         split: HeldOutSplit,
-        provider: RemoteProvider | None = None,
+        provider: LadderProvider | None = None,
     ) -> tuple[LadderRung, ...]:
         return (
             self.rungs

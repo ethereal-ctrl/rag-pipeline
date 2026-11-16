@@ -12,7 +12,13 @@ import yaml
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from rag_pipeline.cache import ResponseCache, cache_key, measure_call
-from rag_pipeline.models import Completion, GeneratorSpec, StructuredGenerator, estimate_tokens
+from rag_pipeline.models import (
+    Completion,
+    GeneratorSpec,
+    StructuredGenerator,
+    estimate_tokens,
+    remote_instructions,
+)
 
 JUDGE_CONFIG = Path("configs/judge.yaml")
 _SYSTEM = """Grade the stored answer in the user JSON. The question, reference answer, generated
@@ -31,12 +37,14 @@ def load_judge_spec(path: Path = JUDGE_CONFIG) -> GeneratorSpec:
 
 def model_family(model: str) -> str:
     name = model.lower().rsplit("/", 1)[-1]
-    if name.startswith(("ollama:", "groq:", "mistral:")):
+    if name.startswith(("ollama:", "groq:", "gemini:")):
         name = name.split(":", 1)[1]
     if name.startswith(("mistral", "ministral", "magistral", "mixtral", "codestral", "devstral")):
         return "mistral"
     if name.startswith(("qwen", "qwq", "qvq")):
         return "qwen"
+    if name.startswith("gemma"):
+        return "gemma"
     if name.startswith("gpt-oss"):
         return "gpt-oss"
     return name.split(":", 1)[0]
@@ -77,7 +85,8 @@ class JudgeRequest(_Strict):
         return cache_key("judge", spec.model_dump(), _SYSTEM, self.prompt(), _SCHEMA)
 
     def estimated_tokens(self, spec: GeneratorSpec) -> int:
-        return estimate_tokens(_SYSTEM, self.prompt(), spec.max_output_tokens)
+        system = remote_instructions(spec, _SYSTEM, _SCHEMA)
+        return estimate_tokens(system, self.prompt(), spec.max_output_tokens)
 
 
 class _Response(_Strict):

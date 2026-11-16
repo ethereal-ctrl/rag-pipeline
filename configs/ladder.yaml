@@ -21,16 +21,16 @@ rungs:
 
 large_model:
   split: test-400
-  provider: mistral
-  reason: Three rungs on the fixed subset keep the comparison bounded. Mistral access and quotas depend on the organization.
+  provider: gemma
+  reason: Three rungs on the fixed subset keep the comparison bounded. Gemma 4 fits the author's Gemini API free-tier project quotas.
   pairs:
     - local: configs/variants/closed-book.yaml
-      config: configs/variants/closed-book-mistral.yaml
+      config: configs/variants/closed-book-gemma.yaml
     - local: configs/variants/hybrid-rerank.yaml
-      config: configs/variants/hybrid-rerank-mistral.yaml
+      config: configs/variants/hybrid-rerank-gemma.yaml
     # Agentic Search is the final direct generation rung. The Router has no shared generator.
     - local: configs/variants/agentic.yaml
-      config: configs/variants/agentic-mistral.yaml
+      config: configs/variants/agentic-gemma.yaml
   alternatives:
     groq:
       - local: configs/variants/closed-book.yaml

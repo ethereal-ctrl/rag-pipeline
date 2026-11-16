@@ -7,11 +7,18 @@ openai/gpt-oss-120b:
   source: https://console.groq.com/docs/rate-limits
   looked_up: "2026-11-16"
 
-mistral-large-4-0:
-  provider: mistral
-  # Free API access and quota values could not be verified. Use the organization limits.
-  requests_per_second: null
-  tokens_per_minute: null
-  tokens_per_month: null
-  source: https://docs.mistral.ai/admin/billing-usage/usage-limits
+gemma-4-31b-it:
+  provider: gemini
+  requests_per_minute: 30
+  tokens_per_minute: 16000
+  requests_per_day: 14400
+  source: Google AI Studio project rate-limit page, read by the author
+  looked_up: "2026-11-16"
+
+gemma-4-26b-a4b-it:
+  provider: gemini
+  requests_per_minute: 30
+  tokens_per_minute: 16000
+  requests_per_day: 14400
+  source: Google AI Studio project rate-limit page, read by the author
   looked_up: "2026-11-16"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, replace
 from functools import cached_property
@@ -24,7 +25,7 @@ from rag_pipeline.judge_model import (
     check_judge_family,
 )
 from rag_pipeline.models import GeneratorSpec
-from rag_pipeline.rate_limit import RateLimits, quota_days, remote_limits
+from rag_pipeline.rate_limit import RateLimits, quota_hours, remote_limits
 from rag_pipeline.variants import VariantConfig
 
 
@@ -146,10 +147,18 @@ class JudgePlan:
     cached: int
     estimated_tokens: int
     cached_tokens: int
-    days: int
-    shared_days: int
+    hours: float
+    shared_hours: float
     tokens_per_day: int | None
     tokens_per_month: int | None
+
+    @property
+    def days(self) -> int:
+        return math.ceil(self.hours / 24)
+
+    @property
+    def shared_days(self) -> int:
+        return math.ceil(self.shared_hours / 24)
 
 
 def plan_judging(
@@ -176,8 +185,8 @@ def plan_judging(
         len(hits),
         tokens,
         cached_tokens,
-        quota_days(limits, calls_left, tokens_left),
-        quota_days(limits, calls_left + shared_calls, tokens_left + shared_tokens),
+        quota_hours(limits, calls_left, tokens_left),
+        quota_hours(limits, calls_left + shared_calls, tokens_left + shared_tokens),
         limits.tokens_per_day,
         limits.tokens_per_month,
     )

@@ -58,9 +58,9 @@ def test_committed_ladder_and_bad_two_group_step():
     assert len(ladder.rungs) == 9 and len(ladder.large_model) == 3
     assert ladder.rungs[-1].exception
     assert [item.config.name for item in ladder.for_split("test-400")] == [
-        "closed-book-mistral",
-        "hybrid-rerank-mistral",
-        "agentic-mistral",
+        "closed-book-gemma",
+        "hybrid-rerank-gemma",
+        "agentic-gemma",
     ]
     assert [item.config.name for item in ladder.for_split("test-400", "groq")] == [
         "closed-book-groq",
@@ -201,7 +201,7 @@ def test_report_pairs_steps_marks_pending_and_writes_deterministic_svg(tmp_path:
         rung(name) for name in ("first", "second", "pending", "remote")
     )
     ladder = Ladder(
-        (first, second, pending), (LargeModelPair(second, remote),), large_model_provider="mistral"
+        (first, second, pending), (LargeModelPair(second, remote),), large_model_provider="gemma"
     )
     store = RunStore(tmp_path / "runs")
     baseline = evaluate(scripted(first, QUERIES, "No", seconds=1), QUERIES, "test", store)
@@ -228,7 +228,7 @@ def test_report_pairs_steps_marks_pending_and_writes_deterministic_svg(tmp_path:
     assert "| pending | pending |" in text
     assert "Accuracy +1.000 [+1.000, +1.000]*" in text
     assert all(value.run_id in text for value in (baseline, candidate, large, dev))
-    assert "Shared n" in text and "Dev majority" in text and "Mistral run" in text
+    assert "Shared n" in text and "Dev majority" in text and "Gemma run" in text
     assert "Hits@4" in text and "Evidence Recall@10" in text
     write_report(right)
     charts = sorted(left.glob("*.svg"))

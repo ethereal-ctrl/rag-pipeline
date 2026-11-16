@@ -1,5 +1,5 @@
 # Closed-Book uses the shared index declaration for ladder comparisons.
-name: closed-book-mistral
+name: closed-book-gemma
 index:
   collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
   embedder:
@@ -10,6 +10,8 @@ retrieval:
   mode: none
 generation:
   generator:
-    provider: mistral
-    model: mistral-large-4-0
+    provider: gemini
+    model: gemma-4-31b-it
+    supports_system: true
+    structured_output: prompt
     max_output_tokens: 512

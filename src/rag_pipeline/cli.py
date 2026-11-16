@@ -439,6 +439,7 @@ def _print_remote_plan(
     typer.echo(f"{label}  {plan.calls}")
     typer.echo(f"Already cached             {plan.cached}")
     typer.echo(f"Remote calls needed       {plan.calls - plan.cached}")
+    typer.echo(f"Estimated quota hours      {plan.hours:.3f}")
     typer.echo(f"Estimated quota days       {plan.days}")
 
 
@@ -552,6 +553,8 @@ def judge_command(
             typer.echo(f"Estimated tokens before cache  {plan.estimated_tokens}")
             typer.echo(f"Estimated cached tokens      {plan.cached_tokens}")
             typer.echo(f"Estimated tokens needed      {plan.estimated_tokens - plan.cached_tokens}")
+            typer.echo(f"Estimated Judge quota hours {plan.hours:.3f}")
+            typer.echo(f"Estimated shared quota hours {plan.shared_hours:.3f}")
             typer.echo(f"Estimated Judge quota days  {plan.days}")
             typer.echo(f"Estimated shared quota days  {plan.shared_days}")
             if plan.tokens_per_day is not None:
@@ -663,7 +666,7 @@ def _ladder_gaps(
 def ladder_status_command(
     split: HeldOutSplit = "test",
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
-    provider: Literal["groq", "mistral"] | None = None,
+    provider: Literal["groq", "gemma"] | None = None,
 ) -> None:
     """Show saved runs and check collections required by pending rungs."""
     try:
@@ -706,6 +709,7 @@ def _print_ladder_estimate(
     count = len(_split_ids(split))
     estimates = estimate_ladder(rungs, split, store, count)
     total = 0.0
+    quota_hours = 0.0
     pending = unknown = quota_days = 0
     queries: list[BenchmarkQuery] | None = None
     for estimate in estimates:
@@ -730,16 +734,18 @@ def _print_ladder_estimate(
                 queries = _split_queries(split)
             plan = _remote_plan(status.rung.config, queries, qdrant_url, False, False)
             quota_days += plan.days
+            quota_hours += plan.hours
             upper = " upper bound" if plan.upper_bound else ""
             typer.echo(
                 f"  {status.rung.config.generation.generator.provider.title()}  "
                 f"{plan.calls - plan.cached} calls after cache, "
-                f"{plan.days} quota day(s){upper}"
+                f"{plan.hours:.3f} quota hours, {plan.days} quota day(s){upper}"
             )
     typer.echo(f"Estimated wall time  {total:.1f} s across {pending - unknown} rung(s)")
     if unknown:
         typer.echo(f"Rungs without a Dev estimate  {unknown}")
     if split == "test-400":
+        typer.echo(f"Sum of per-rung remote quota hour estimates  {quota_hours:.3f}")
         typer.echo(f"Sum of per-rung remote quota day estimates  {quota_days}")
 
 
@@ -749,7 +755,7 @@ def ladder_run_command(
     split: HeldOutSplit = "test",
     dry_run: bool = False,
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
-    provider: Literal["groq", "mistral"] | None = None,
+    provider: Literal["groq", "gemma"] | None = None,
 ) -> None:
     """Run unfinished rungs in order using the normal held-out score guard."""
     try:
@@ -787,7 +793,7 @@ def ladder_run_command(
 def ladder_report_command(
     split: HeldOutSplit = "test",
     output: Path = LADDER_REPORT_DIR,
-    provider: Literal["groq", "mistral"] | None = None,
+    provider: Literal["groq", "gemma"] | None = None,
 ) -> None:
     """Render Markdown and SVGs from saved evaluations."""
     try:

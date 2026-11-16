@@ -18,8 +18,7 @@ from rag_pipeline.evaluation import (
     compare_runs,
 )
 from rag_pipeline.judge_evaluation import with_judge_metrics, write_text
-from rag_pipeline.ladder import HeldOutSplit, Ladder, LadderRung, ladder_status
-from rag_pipeline.rate_limit import RemoteProvider
+from rag_pipeline.ladder import HeldOutSplit, Ladder, LadderProvider, LadderRung, ladder_status
 from rag_pipeline.report import metric_cell, metric_number
 from rag_pipeline.variants import ABSTENTION_TEXT, VariantConfig
 
@@ -217,7 +216,7 @@ def write_ladder_report(
     dev_ids: tuple[str, ...],
     test_ids: tuple[str, ...],
     subset_ids: tuple[str, ...],
-    provider: RemoteProvider | None = None,
+    provider: LadderProvider | None = None,
 ) -> Path:
     from rag_pipeline.ladder_charts import write_charts
 

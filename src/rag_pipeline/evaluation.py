@@ -345,6 +345,7 @@ def aggregate(records: list[QueryRecord]) -> dict[str, float]:
     if costs and len(costs) == len(records):
         metrics["cost_per_question"] = _mean(costs)
     if records and all(r.trace for r in records):
+        metrics["malformed_responses"] = sum(stage.malformed for r in records for stage in r.trace)
         metrics["output_tokens_per_question"] = sum(
             stage.output_tokens for r in records for stage in r.trace
         ) / len(records)

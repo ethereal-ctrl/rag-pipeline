@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import time
@@ -37,25 +38,35 @@ def configured_ollama_url() -> str:
 class GeneratorSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Literal["ollama", "groq", "mistral"]
+    provider: Literal["ollama", "groq", "gemini"]
     model: str
     temperature: float = 0.0
     max_output_tokens: PositiveInt = 256
     seed: int = 0
     context_size: PositiveInt = 8192
     reasoning_effort: Literal["low", "medium", "high"] = "low"
+    supports_system: bool = True
+    structured_output: Literal["json_schema", "prompt"] = "json_schema"
 
     @model_validator(mode="after")
     def _validate_provider_options(self) -> Self:
-        if self.provider == "mistral" and "reasoning_effort" in self.model_fields_set:
+        if self.provider == "gemini" and "reasoning_effort" in self.model_fields_set:
             raise ValueError("reasoning_effort is a Groq option in GeneratorSpec")
         return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         payload: dict[str, Any] = handler(self)
-        if self.provider == "mistral":
+        if self.provider == "gemini":
             payload.pop("reasoning_effort", None)
+        # Keep existing Groq and Ollama cache keys and saved configurations compatible.
+        if self.supports_system and "supports_system" not in self.model_fields_set:
+            payload.pop("supports_system", None)
+        if (
+            self.structured_output == "json_schema"
+            and "structured_output" not in self.model_fields_set
+        ):
+            payload.pop("structured_output", None)
         return payload
 
     @property
@@ -258,7 +269,6 @@ class _RemoteChat:
     path: str
     key_variable: str
     max_tokens: str
-    seed: str
 
 
 _REMOTE_CHATS = {
@@ -267,16 +277,48 @@ _REMOTE_CHATS = {
         "/openai/v1/chat/completions",
         "GROQ_API_KEY",
         "max_completion_tokens",
-        "seed",
     ),
-    "mistral": _RemoteChat(
-        "https://api.mistral.ai",
-        "/v1/chat/completions",
-        "MISTRAL_API_KEY",
+    # Gemini's OpenAI-compatible endpoint: https://ai.google.dev/gemini-api/docs/openai
+    "gemini": _RemoteChat(
+        "https://generativelanguage.googleapis.com",
+        "/v1beta/openai/chat/completions",
+        "GEMINI_API_KEY",
         "max_tokens",
-        "random_seed",
     ),
 }
+
+
+def _first_json_object(text: str) -> str:
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    quoted = escaped = False
+    for i in range(start, len(text)):
+        char = text[i]
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return text
+
+
+def remote_instructions(spec: GeneratorSpec, system: str, schema: dict[str, Any] | None) -> str:
+    if schema is not None and spec.structured_output == "prompt":
+        schema_text = json.dumps(schema, separators=(",", ":"))
+        system += f"\n\nReturn only JSON matching this schema:\n{schema_text}"
+    return system
 
 
 def remote_key_variable(provider: RemoteProvider) -> str:
@@ -313,8 +355,6 @@ class RemoteChatGenerator:
             if limiter is not None
             else RateLimiter(CACHE_FILE, remote_limits(provider, spec.model))
         )
-        # Keep Groq's existing rows. Mistral limits apply across the organization.
-        self._quota_key = spec.model if provider == "groq" else "mistral"
         self._http = httpx.Client(
             base_url=self._chat.base_url,
             headers={"Authorization": f"Bearer {key}"},
@@ -332,20 +372,27 @@ class RemoteChatGenerator:
     def complete(
         self, system: str, prompt: str, *, schema: dict[str, Any] | None = None
     ) -> Completion:
+        system = remote_instructions(self._spec, system, schema)
+        if not self._spec.supports_system:
+            prompt = f"Instructions:\n{system}\n\n{prompt}"
+            system = ""
+        messages = [{"role": "user", "content": prompt}]
+        if system:
+            messages.insert(0, {"role": "system", "content": system})
         payload: dict[str, Any] = {
             "model": self._spec.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": messages,
             "temperature": self._spec.temperature,
             self._chat.max_tokens: self._spec.max_output_tokens,
-            self._chat.seed: self._spec.seed,
         }
         if self._spec.provider == "groq":
-            payload.update(reasoning_effort=self._spec.reasoning_effort, include_reasoning=False)
-        if schema is not None:
-            # Mistral chat schema format: https://docs.mistral.ai/api/endpoint/chat#chat-completion
+            payload.update(
+                reasoning_effort=self._spec.reasoning_effort,
+                include_reasoning=False,
+                seed=self._spec.seed,
+            )
+        prompted_json = schema is not None and self._spec.structured_output == "prompt"
+        if schema is not None and not prompted_json:
             payload["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {"name": "rag_response", "strict": True, "schema": schema},
@@ -353,7 +400,7 @@ class RemoteChatGenerator:
         tokens = estimate_tokens(system, prompt, self._spec.max_output_tokens)
         backoff = 1.0
         while True:
-            request = self._limiter.reserve(self._quota_key, tokens)
+            request = self._limiter.reserve(self._spec.model, tokens)
             started = time.perf_counter()
             response = self._http.post(self._chat.path, json=payload)
             seconds = time.perf_counter() - started
@@ -369,8 +416,9 @@ class RemoteChatGenerator:
                 ]
                 if isinstance(content, list):
                     content = "".join(chunk["text"] for chunk in content if chunk["type"] == "text")
+                text = (content or "").strip()
                 return Completion(
-                    (content or "").strip(),
+                    _first_json_object(text) if prompted_json else text,
                     usage["prompt_tokens"],
                     usage["completion_tokens"],
                     seconds,
@@ -520,13 +568,13 @@ class LocalModels:
         ollama_transport: httpx.BaseTransport | None = None,
         groq_transport: httpx.BaseTransport | None = None,
         groq_limiter: RateLimiter | None = None,
-        mistral_transport: httpx.BaseTransport | None = None,
-        mistral_limiter: RateLimiter | None = None,
+        gemini_transport: httpx.BaseTransport | None = None,
+        gemini_limiter: RateLimiter | None = None,
     ) -> None:
         self._ollama_url = configured_ollama_url() if ollama_url is None else ollama_url
         self._ollama_transport = ollama_transport
-        self._remote_transports = {"groq": groq_transport, "mistral": mistral_transport}
-        self._remote_limiters = {"groq": groq_limiter, "mistral": mistral_limiter}
+        self._remote_transports = {"groq": groq_transport, "gemini": gemini_transport}
+        self._remote_limiters = {"groq": groq_limiter, "gemini": gemini_limiter}
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
         self._embedders: dict[EmbedderSpec, Embedder] = {}
 

@@ -100,47 +100,42 @@ Evaluations cache completions, query embeddings and Reranker scores in
 model-call durations. Retrieval still queries the current index, so index timing
 can vary between runs. Pass `--no-cache` to bypass the response cache.
 
-The large-model comparison and Judge default to the pinned Mistral Large 4 API
-model `mistral-large-4-0`. The former Experiment free tier was reported to require
-phone verification. Mistral says it may use Free-mode request data, including
-inputs and outputs, for training, with a data setting to opt out.
-[Model documentation](https://docs.mistral.ai/models/mistral-large-4-0) ·
-[Former Experiment help article (archive link)](https://web.archive.org/web/20260601000000/https://help.mistral.ai/en/articles/455206-how-can-i-try-the-api-for-free-with-the-experiment-plan) ·
-[Mistral data policy](https://help.mistral.ai/en/articles/347617-do-you-use-my-user-data-to-train-your-artificial-intelligence-models)
+The large-model comparison and Judge default to Gemma 4 31B
+(`gemma-4-31b-it`) on the Gemini API. In Google AI Studio, open **API keys**
+and create a key against a **Free Tier** project. Put the key in the worktree's
+`.env` as `GEMINI_API_KEY`. The author's project showed 30 requests per minute,
+16,000 tokens per minute, and 14,400 requests per day on 2026-11-16. Check your
+project's current limits and regional availability before running.
+[AI Studio API keys](https://ai.google.dev/gemini-api/docs/api-key) ·
+[Project rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) ·
+[Available regions](https://ai.google.dev/gemini-api/docs/available-regions)
 
-As of 2026-11-16, Mistral's public documentation lists Free mode without API access.
-Check your Studio organization for existing no-cost API access before using this
-path. If it has access, create a key in Studio and place it in `.env` as
-`MISTRAL_API_KEY`. Copy the verified organization limits into
-`MISTRAL_REQUESTS_PER_SECOND`, `MISTRAL_TOKENS_PER_MINUTE`, and
-`MISTRAL_TOKENS_PER_MONTH`. Also set `MISTRAL_REQUESTS_PER_MONTH` if your organization
-has a monthly request cap. See `.env.example` for the variable names. For a no-cost
-alternative, use a Groq Free Plan key in `.env` as `GROQ_API_KEY`.
-[Mistral API key setup](https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key) ·
-[Mistral plan and quota documentation](https://docs.mistral.ai/admin/billing-usage/usage-limits)
+Google may use free-tier prompts and responses to improve its products. Its terms
+provide regional exceptions for the EEA, the UK, and Switzerland. Remote
+benchmarking sends only public benchmark questions and Corpus text, along with
+answers generated from those inputs for judging. The demo API defaults to the
+local `hybrid-rerank-cited` variant. Arbitrary user questions stay on the machine
+unless the demo is explicitly configured to use a remote variant.
+[Gemini API data terms](https://ai.google.dev/gemini-api/terms)
+
+Set `GROQ_API_KEY` in the same file to use the Groq Free Plan alternative.
 
 Start with one Smoke Set query, then use the fixed `test-400` subset. The score-once
 rule applies across `test` and `test-400` for each Pipeline Variant. The dry run
 uses configured quotas and needs no key or model calls.
 
 ```bash
-uv run --env-file .env rag eval configs/variants/closed-book-mistral.yaml --split test-400 --dry-run
-uv run --env-file .env rag eval configs/variants/closed-book-mistral.yaml --split smoke --limit 1
+uv run --env-file .env rag eval configs/variants/closed-book-gemma.yaml --split test-400 --dry-run
+uv run --env-file .env rag eval configs/variants/closed-book-gemma.yaml --split smoke --limit 1
 uv run --env-file .env rag eval configs/variants/closed-book-groq.yaml --split smoke --limit 1
 ```
 
-The limiter persists requests and estimated token reservations in SQLite and reconciles
-them with the provider's reported usage. It uses rolling minute and 24-hour windows
-for Groq and rolling second, minute, and 31-day windows for Mistral. The 31-day
-window is a conservative local policy. Mistral generation and judging share that budget
-when they use the same cache database. The dry run estimates quota days at a fresh
-allowance. For retrieval variants, it estimates prompt length from the configured
-number of Chunks. Its cache count includes known prompts for the current index version.
-
-Remote benchmark workloads use public benchmark questions and Corpus text, including
-answers generated from those inputs for judging. The demo API defaults to the local
-`hybrid-rerank-cited` variant. Arbitrary user questions stay on the machine unless
-the demo is explicitly configured to use a remote variant.
+The limiter persists requests and estimated token reservations in SQLite and
+reconciles them with reported usage. Both providers use rolling minute and 24-hour
+windows. Gemma generation and judging share the same model quota when they use the
+same cache database. Dry runs estimate hours and whole quota days at a fresh allowance.
+For retrieval variants, the estimate uses the configured number of Chunks and known
+cache hits for the current index version.
 
 ## Chunk Context
 
@@ -253,15 +248,15 @@ Its latency and embedding token totals include the `route` stage.
 The [fixed Judge sample](data/judge-300.json) contains 300 queries stratified by query
 type within `test-400`. Judge completed Test Split runs to compare the same questions
 across local and remote variants. The Judge reads saved answers and grades ambiguous
-correctness and Citation support. The default `configs/judge.yaml` uses Mistral
-Large 4. The Judge must be from a different family than every generator used for
-the run. Select `configs/judge-groq.yaml` to use Groq `openai/gpt-oss-120b` for Mistral runs.
+correctness and Citation support. The default `configs/judge.yaml` uses Gemma
+4 31B. The Judge must be from a different family than every generator used for
+the run. Select `configs/judge-groq.yaml` to use Groq `openai/gpt-oss-120b` for Gemma runs.
 
 ```bash
 uv run --env-file .env rag judge RUN_ID --dry-run
 uv run --env-file .env rag judge RUN_ID --dry-run --shared-tokens 800000 --shared-calls 400
 uv run --env-file .env rag judge RUN_ID
-uv run --env-file .env rag judge MISTRAL_RUN_ID --judge-config configs/judge-groq.yaml
+uv run --env-file .env rag judge GEMMA_RUN_ID --judge-config configs/judge-groq.yaml
 uv run --no-env-file rag table RUN_ID --metrics judge_accuracy,judge_flipped,citation_support_rate
 ```
 
@@ -365,7 +360,7 @@ uv run --no-env-file rag ladder report --split test --output docs/report/ladder
 ```
 
 The large-model comparison uses saved local answers on the same queries as the selected
-remote provider. Mistral is selected by default. Use `--provider groq` with
+remote provider. Gemma is selected by default. Use `--provider groq` with
 `ladder status`, `ladder run`, and `ladder report` to select the Groq comparison.
 Agentic Search is the deepest rung with a direct generator to swap. Estimate its
 quota separately since it can call the remote generator multiple times per question.
