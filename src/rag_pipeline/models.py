@@ -6,13 +6,13 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from functools import cached_property
+from functools import cached_property, partial
 from typing import Any, Literal, Protocol, runtime_checkable
 
 import httpx
-from pydantic import BaseModel, ConfigDict, PositiveInt
+from pydantic import BaseModel, ConfigDict, PositiveInt, TypeAdapter
 
-from rag_pipeline.cache import CACHE_FILE
+from rag_pipeline.cache import CACHE_FILE, ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.rate_limit import RateLimiter, groq_limits
 
 
@@ -108,6 +108,27 @@ def model_version(model: Generator | Embedder | Reranker) -> str | None:
     get_version = getattr(model, "cache_version", None) or getattr(model, "version", None)
     version = get_version() if callable(get_version) else None
     return version if isinstance(version, str) else None
+
+
+_QUERY_EMBEDDING = TypeAdapter(tuple[list[float], int | None])
+
+
+def query_embedding(
+    embedder: Embedder, spec: EmbedderSpec, query: str, cache: ResponseCache | None
+) -> ModelResponse[tuple[list[float], int | None]]:
+    def embed() -> ModelResponse[tuple[list[float], int | None]]:
+        if isinstance(embedder, EmbedderWithUsage):
+            return measure_call(partial(embedder.embed_query_with_usage, query))
+        response = measure_call(lambda: embedder.embed_query(query))
+        tokens = (
+            embedder.count_query_tokens(query) if isinstance(embedder, QueryTokenCounter) else None
+        )
+        return ModelResponse((response.value, tokens), response.seconds)
+
+    if cache is None:
+        return embed()
+    key = cache_key("embed_query", spec.model_dump(), embedder.name, model_version(embedder), query)
+    return cache.get_or_call(key, _QUERY_EMBEDDING, embed)
 
 
 def _ollama_digest(client: httpx.Client, name: str) -> str | None:

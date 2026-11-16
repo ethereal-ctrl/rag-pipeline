@@ -1,0 +1,8 @@
+variant: configs/variants/router.yaml
+folds: 5
+# Fill in the run IDs from the completed Dev Split evaluations.
+runs:
+  closed-book: null
+  bm25: null
+  hybrid-rerank: null
+  agentic: null

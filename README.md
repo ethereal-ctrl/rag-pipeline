@@ -139,6 +139,46 @@ output allowance before execution, and debits the reported usage afterwards. The
 example uses a separate 8K per-call context limit. A Groq dry run shows the upper
 bound on calls at `max_steps`.
 
+## Router
+
+The [Router variant](configs/variants/router.yaml) orders its candidates from cheapest
+to most expensive. For each Dev question, the training label is the first candidate
+with a stored correct answer. If none answered correctly, the label is the last candidate.
+The classifier uses only the question text, with a Qwen3-Embedding 0.6B query embedding
+and features for word count, digit count, years and comparison words.
+
+1. Evaluate each candidate on the full Dev Split with its configured index and models.
+
+   ```bash
+   for variant in closed-book bm25 hybrid-rerank agentic; do
+     uv run --no-env-file rag eval "configs/variants/${variant}.yaml" --split dev || break
+   done
+   ```
+
+2. Put the four run IDs in [the training config](configs/router/router.yaml), then train.
+
+   ```bash
+   uv run --no-env-file rag router train configs/router/router.yaml
+   ```
+
+   The reports in `runs/router/` compare held-out routed answers with always using the
+   most expensive candidate and with a cheapest-correct oracle. The Router tries
+   candidates in order and takes the first whose cumulative probability clears the threshold.
+   Within each outer Dev fold, an inner cross-validation chooses the threshold with the
+   lowest mean notional cost among thresholds whose accuracy reaches the lower end of the
+   always-most-expensive candidate's 95% bootstrap interval. If pricing is incomplete,
+   it minimizes mean latency. The deployment threshold uses out-of-fold predictions across Dev.
+
+3. Commit the trained JSON artifact at `configs/router/trained.json` and evaluate the
+   Router once on the Test Split.
+
+   ```bash
+   uv run --no-env-file rag eval configs/variants/router.yaml --split test
+   ```
+
+The evaluation records each chosen variant and reports `routed_share[<variant>]`.
+Its latency and embedding token totals include the `route` stage.
+
 ## Development
 
 ```bash

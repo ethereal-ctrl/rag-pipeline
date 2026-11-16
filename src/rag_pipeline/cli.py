@@ -39,6 +39,7 @@ from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.models import EmbedderSpec, GeneratorSpec, LocalModels
 from rag_pipeline.report import metric_label, metric_number, results_table
+from rag_pipeline.router_training import RouterTrainingConfig, train_router
 from rag_pipeline.splits import (
     DEFAULT_SEED,
     DEFAULT_SIZES,
@@ -49,7 +50,13 @@ from rag_pipeline.splits import (
     make_splits,
 )
 from rag_pipeline.tracing import cli_tracer
-from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant, plan_remote_run
+from rag_pipeline.variants import (
+    PipelineVariant,
+    VariantConfig,
+    build_variant,
+    plan_remote_run,
+    router_candidates,
+)
 
 RAW_DIR = Path("data/raw")
 SPLITS_FILE = Path("data/splits.json")
@@ -60,6 +67,8 @@ GATE_FILE = Path("configs/gate/gate.yaml")
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 data_app = typer.Typer(no_args_is_help=True)
 app.add_typer(data_app, name="data", help="Fetch the pinned dataset and build splits.")
+router_app = typer.Typer(no_args_is_help=True)
+app.add_typer(router_app, name="router", help="Train the Router from saved Dev Split runs.")
 
 QdrantUrl = Annotated[str, typer.Option(envvar="QDRANT_URL")]
 
@@ -203,19 +212,28 @@ def eval_command(
     config = VariantConfig.from_yaml(variant_file)
     try:
         if dry_run:
-            remote = config.generation.generator.provider == "groq" and not retrieval_only
+            candidates = (config,) if config.router is None else router_candidates(config.router)
+            remote = not retrieval_only and any(
+                candidate.generation.generator.provider == "groq" for candidate in candidates
+            )
             queries = _split_queries(split)[:limit] if remote else []
             _print_remote_plan(config, queries, qdrant_url, retrieval_only, no_cache)
             return
         queries = _split_queries(split)[:limit]
         tracer = ctx.with_resource(cli_tracer())
         models = LocalModels()
+        router_embedder = None
+        if config.router is not None:
+            assert config.index is not None and config.index.embedder is not None
+            router_embedder = models.embedder_for(config.index.embedder)
         variant = build_variant(
             config,
-            index=_index_for(config, models, qdrant_url),
+            index=_index_for(config, models, qdrant_url) if config.router is None else None,
             models=models,
             tracer=tracer,
             cache=None if no_cache else ResponseCache(),
+            router_embedder=router_embedder,
+            index_for=lambda candidate: _index_for(candidate, models, qdrant_url),
         )
         result = evaluate(
             variant,
@@ -246,7 +264,11 @@ def _print_remote_plan(
     retrieval_only: bool,
     no_cache: bool,
 ) -> None:
-    remote = config.generation.generator.provider == "groq" and not retrieval_only
+    remote = (
+        config.router is None
+        and config.generation.generator.provider == "groq"
+        and not retrieval_only
+    )
     cache = ResponseCache() if remote and not no_cache and CACHE_FILE.exists() else None
     version = None
     if cache is not None and config.uses_retrieval and config.index is not None:
@@ -260,11 +282,10 @@ def _print_remote_plan(
     plan = plan_remote_run(
         config, queries, cache, retrieval_only=retrieval_only, index_version=version
     )
-    label = (
-        "Remote calls before cache (upper bound at max_steps)"
-        if plan.upper_bound
-        else ("Remote calls before cache")
-    )
+    label = "Remote calls before cache"
+    if plan.upper_bound:
+        bound = "across Router candidates" if config.router is not None else "at max_steps"
+        label += f" (upper bound {bound})"
     typer.echo(f"{label}  {plan.calls}")
     typer.echo(f"Already cached             {plan.cached}")
     typer.echo(f"Remote calls needed       {plan.calls - plan.cached}")
@@ -286,6 +307,37 @@ def _print_metrics(metrics: dict[str, float], intervals: dict[str, tuple[float, 
         low, high = intervals.get(name, (float("nan"), float("nan")))
         estimate, lower, upper = (metric_number(name, number) for number in (value, low, high))
         typer.echo(f"  {metric_label(name):<34} {estimate}  [{lower}, {upper}]")
+
+
+@router_app.command("train")
+def router_train(router_config: Path) -> None:
+    """Fit the Router and write its JSON artifact and Dev cross-validation report."""
+    try:
+        settings = RouterTrainingConfig.from_yaml(router_config)
+        variant = VariantConfig.from_yaml(settings.variant)
+        if variant.router is None or variant.index is None or variant.index.embedder is None:
+            raise ValueError(f"{settings.variant} needs a Router variant with an index embedder")
+        embedder = LocalModels().embedder_for(variant.index.embedder)
+        result = train_router(settings, RunStore(RUNS_DIR), embedder, cache=ResponseCache())
+        paths = result.save(RUNS_DIR / "router")
+    except (OSError, ValueError) as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+
+    report = result.report
+    typer.echo(
+        f"{report.queries} Dev queries, {report.folds} folds, "
+        f"classifier accuracy {report.classifier_accuracy:.3f}, threshold {report.threshold:.2f}"
+    )
+    for name, metrics in report.candidates.items():
+        cost = metrics.get("cost_per_question")
+        notional = "unavailable" if cost is None else f"${cost.value:.6g}"
+        typer.echo(
+            f"  {name:<20} {report.label_distribution[name]} labels, "
+            f"{metrics['latency_mean'].value:.3f} s mean latency, {notional} notional per question"
+        )
+    for path in paths:
+        typer.echo(f"Wrote {path}")
 
 
 @app.command("compare")

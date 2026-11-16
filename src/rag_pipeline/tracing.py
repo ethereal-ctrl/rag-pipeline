@@ -86,6 +86,7 @@ class StageUsage:
     seconds: float | None = None
     timing_adjustment: float = 0.0
     cache_hit: bool = False
+    chosen_variant: str | None = None
 
     def set_input_tokens(self, count: TokenCount) -> None:
         self.input_tokens = count
@@ -158,4 +159,6 @@ class AnswerTrace:
                 if input_tokens is not None:
                     span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
                 span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
+            if usage.chosen_variant is not None:
+                span.set_attribute("rag.chosen_variant", usage.chosen_variant)
             set_chunk_ids(span, usage.chunks)
