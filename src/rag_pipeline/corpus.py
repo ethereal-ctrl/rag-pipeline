@@ -55,6 +55,15 @@ def _short_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
 
+def article_hash(article: Article) -> str:
+    """Content hash over every field that ends up in a Chunk, for change detection."""
+    payload = json.dumps(
+        [article.title, article.body, article.source, article.published_at, article.category],
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def article_id_for(url: str) -> str:
     return "a_" + _short_hash(url)
 

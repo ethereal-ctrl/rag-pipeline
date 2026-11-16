@@ -24,8 +24,8 @@ from rag_pipeline.evaluation import (
     export_records,
 )
 from rag_pipeline.gate import GateConfig, GateReport, check_minimums, retrieval_gate
-from rag_pipeline.index import ChunkIndex
-from rag_pipeline.ingest import ingest
+from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
+from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.models import EmbedderSpec, LocalModels
 from rag_pipeline.splits import DEFAULT_SEED, DEFAULT_SIZES, SPLIT_NAMES, Splits, make_splits
 from rag_pipeline.variants import PipelineVariant, VariantConfig, build_variant
@@ -58,25 +58,45 @@ def data_splits(force: bool = False) -> None:
     typer.echo(f"Wrote {SPLITS_FILE}.")
 
 
+def _print_ingest(report: IngestReport) -> None:
+    typer.echo(f"Index version {report.index_version}")
+    typer.echo(
+        f"  {report.articles} Articles: {len(report.added)} added, {len(report.changed)} changed, "
+        f"{len(report.unchanged)} unchanged, {len(report.deleted)} deleted; "
+        f"{report.chunks_written} Chunks written."
+    )
+
+
 @app.command("ingest")
 def ingest_command(
-    collection: str = "chunks-sent-w200-o1",
     max_words: int = 200,
     overlap_sentences: int = 1,
-    embedder: Annotated[
-        str | None, typer.Option(help="Ollama embedding model for dense vectors.")
+    embedder: Annotated[str | None, typer.Option(help="Embedding model for dense vectors.")] = None,
+    embedder_provider: Annotated[
+        str, typer.Option(help="ollama or sentence-transformers.")
+    ] = "ollama",
+    collection: Annotated[
+        str | None, typer.Option(help="Override the name derived from settings and embedder.")
     ] = None,
     qdrant_url: QdrantUrl = "http://localhost:6333",
 ) -> None:
-    """Chunk and index the Corpus (BM25 always; dense vectors with --embedder)."""
+    """Chunk and index the Corpus incrementally (BM25 always; dense vectors with --embedder)."""
+    settings = ChunkingSettings(max_words, overlap_sentences)
     dense = (
-        LocalModels().embedder_for(EmbedderSpec(provider="ollama", model=embedder))
+        LocalModels().embedder_for(
+            EmbedderSpec.model_validate({"provider": embedder_provider, "model": embedder})
+        )
         if embedder
         else None
     )
-    index = ChunkIndex(QdrantClient(url=qdrant_url), collection, dense)
-    report = ingest(load_articles(RAW_DIR), index, ChunkingSettings(max_words, overlap_sentences))
-    typer.echo(f"{report.articles} Articles -> {report.chunks_written} Chunks in {collection}.")
+    name = collection or index_collection(settings, embedder)
+    index = ChunkIndex(QdrantClient(url=qdrant_url), name, dense)
+    try:
+        report = ingest(load_articles(RAW_DIR), index, settings)
+    except IndexMismatch as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(code=1) from error
+    _print_ingest(report)
 
 
 @app.command("eval")
@@ -192,9 +212,8 @@ def gate_command(
             by_collection[config.index.collection] = config
     for config in by_collection.values():
         index = _index_for(config, models, qdrant_url)
-        if index is not None and index.count() == 0:
-            report = ingest(load_articles(RAW_DIR), index, ChunkingSettings())
-            typer.echo(f"Built {index.collection}: {report.chunks_written} Chunks.")
+        if index is not None:  # incremental: a no-op when the Corpus is unchanged
+            _print_ingest(ingest(load_articles(RAW_DIR), index, ChunkingSettings()))
     for config in configs:
         # Every variant on a collection queries it with the embedder it was built with.
         built = by_collection[config.index.collection] if config.index else config

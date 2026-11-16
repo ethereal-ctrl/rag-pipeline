@@ -11,9 +11,14 @@ uv sync
 docker compose up -d          # Qdrant
 ollama pull qwen3.5:4b        # local generator
 uv run rag data fetch         # pinned MultiHop-RAG files, checksum-verified
-uv run rag ingest             # chunk + index the Corpus
+uv run rag ingest             # chunk + index the Corpus (incremental)
 uv run rag eval configs/variants/bm25.yaml --split smoke
 ```
+
+Ingestion is incremental: Articles are compared by content hash, so unchanged ones are
+skipped and changed or deleted ones lose their old Chunks. Each chunking + embedder
+combination gets its own collection (e.g. `chunks-sent-w200-o1-bge-m3`), so index versions
+coexist; the index version adds the Corpus hash and is stored with every run.
 
 Every metric comes with a bootstrap 95% confidence interval. Runs are stored under `runs/`
 with their config, split, model version and commit, and resume where they stopped if

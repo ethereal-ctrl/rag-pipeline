@@ -26,6 +26,7 @@ class Chunk:
     article: Article
     position: int
     text: str
+    chunking: str = ""  # label of the settings that produced it
 
 
 def _sentences(text: str) -> list[str]:
@@ -49,6 +50,12 @@ def chunk_article(article: Article, settings: ChunkingSettings) -> list[Chunk]:
     if current:
         groups.append(current)
     return [
-        Chunk(id=f"{article.id}#{n:03d}", article=article, position=n, text=" ".join(group))
+        Chunk(
+            id=f"{article.id}#{n:03d}",
+            article=article,
+            position=n,
+            text=" ".join(group),
+            chunking=settings.label,
+        )
         for n, group in enumerate(groups)
     ]

@@ -35,6 +35,8 @@ class Evaluable(Protocol):
 
     def answer(self, question: str) -> Answer: ...
 
+    def index_version(self) -> str | None: ...
+
 
 _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 
@@ -381,9 +383,16 @@ class RunStore:
         )
 
 
-def _fingerprint(config: VariantConfig, split: str, queries: list[BenchmarkQuery]) -> str:
+def _fingerprint(
+    config: VariantConfig, index_version: str | None, split: str, queries: list[BenchmarkQuery]
+) -> str:
     payload = json.dumps(
-        {"variant": config.model_dump(), "split": split, "queries": [q.id for q in queries]},
+        {
+            "variant": config.model_dump(),
+            "index_version": index_version,
+            "split": split,
+            "queries": [q.id for q in queries],
+        },
         sort_keys=True,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -413,7 +422,8 @@ def evaluate(
     config = variant.config
     if split == "test":
         _guard_test_split(store, config, allow_rescore)
-    fingerprint = _fingerprint(config, split, queries)
+    index_version = variant.index_version()
+    fingerprint = _fingerprint(config, index_version, split, queries)
     run_id = store.find_incomplete(fingerprint)
     if run_id is None:
         started = datetime.now(UTC)
@@ -425,6 +435,7 @@ def evaluate(
             {
                 "variant": config.model_dump(),
                 "split": split,
+                "index_version": index_version,
                 "fingerprint": fingerprint,
                 "generator": generator.name,
                 "generator_version": version() if callable(version) else generator.name,

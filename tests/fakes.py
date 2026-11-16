@@ -88,6 +88,9 @@ class ScriptedVariant:
         self._crash_after = crash_after
         self.asked: list[str] = []
 
+    def index_version(self) -> str | None:
+        return None if self.config.index is None else f"{self.config.index.collection}@fixed"
+
     def answer(self, question: str) -> Answer:
         if self._crash_after is not None and len(self.asked) >= self._crash_after:
             raise RuntimeError("simulated crash")
