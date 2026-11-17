@@ -148,6 +148,34 @@ cache hits for the current index version.
 Remote calls retry transient server errors, timeouts, and rate-limit responses
 with backoff. If retries run out, rerun the same evaluation command to resume.
 
+### Parallel remote runs
+
+Start with `--workers 8` for Gemma. The default is one worker, and the maximum
+is the provider's configured requests per minute. Local Ollama answer runs use
+one worker to avoid GPU contention. The ladder applies the option to remote rungs.
+LightRAG uses the same option for graph extraction and keeps embedding concurrency
+at one.
+
+Run the matching local rung first with the response cache enabled. When the remote
+rung uses the same index and inputs, it reuses cached embeddings and Reranker scores
+without calling those models again. Uncached local work is serialized per model
+within the process. Local stage timings exclude time waiting for that lock, and
+cache hits retain the recorded model-call duration. Latency percentiles still
+describe individual questions. For elapsed throughput, use the run's `wall_seconds`
+and `workers` metadata. An interrupted run can resume with a different worker count.
+
+Dry runs estimate elapsed time from uncached calls, worker count, and configured
+quota windows. `--call-latency` overrides the default of 35 seconds per call, based
+on the Gemma Smoke Set measurements. This estimate assumes fresh quota and excludes
+local work and retries.
+
+```bash
+uv run --no-env-file rag eval configs/variants/hybrid-rerank-gemma.yaml --split test-400 --dry-run --workers 8 --call-latency 35
+uv run --env-file .env rag ladder run --split test-400 --workers 8
+uv run --env-file .env rag judge LOCAL_RUN_ID --workers 8
+uv run --env-file .env --locked --extra graphrag rag graphrag build configs/graphrag.yaml --workers 8
+```
+
 ## Chunk Context
 
 Build and evaluate the contextual Hybrid + Reranker variant after the model bake-off.

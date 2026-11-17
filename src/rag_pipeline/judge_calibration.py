@@ -12,13 +12,12 @@ from typing import Literal, Self
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from rag_pipeline.cache import cache_key
-from rag_pipeline.evaluation import RunStore, bootstrap_metric_intervals
+from rag_pipeline.evaluation import RunStore, bootstrap_metric_intervals, write_text
 from rag_pipeline.judge_evaluation import (
     CitedChunkLookup,
     generator_models,
     judge_cases,
     load_answer_run,
-    write_text,
 )
 from rag_pipeline.judge_model import Judge, JudgeRequest, JudgeVerdict, check_judge_family
 from rag_pipeline.splits import DEFAULT_SEED

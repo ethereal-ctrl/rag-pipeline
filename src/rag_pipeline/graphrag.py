@@ -32,9 +32,14 @@ from pydantic import (
 from rag_pipeline.cache import ModelResponse, ResponseCache, cache_key, measure_call
 from rag_pipeline.corpus import DATASET_REVISION, Article, article_hash
 from rag_pipeline.cost import load_prices, notional_cost
-from rag_pipeline.evaluation import EvaluationScope, MetricDelta, RunResult, compare_runs
+from rag_pipeline.evaluation import (
+    EvaluationScope,
+    MetricDelta,
+    RunResult,
+    compare_runs,
+    write_text,
+)
 from rag_pipeline.index import RetrievedChunk, corpus_hash
-from rag_pipeline.judge_evaluation import write_text
 from rag_pipeline.models import (
     Completion,
     DocumentEmbedderWithUsage,
@@ -48,7 +53,7 @@ from rag_pipeline.models import (
     model_version,
     query_embedding,
 )
-from rag_pipeline.rate_limit import quota_hours, remote_limits
+from rag_pipeline.rate_limit import quota_hours, quota_wait_seconds, remote_limits
 from rag_pipeline.tracing import AnswerTrace, span_trace_id
 from rag_pipeline.variants import (
     ABSTENTION_TEXT,
@@ -128,6 +133,7 @@ class BuildEstimate:
     llm_calls: int
     estimated_tokens: int
     quota_hours: float | None
+    quota_wait_seconds: float = 0
 
     @property
     def quota_days(self) -> int | None:
@@ -159,6 +165,7 @@ def estimate_build(config: GraphConfig, articles: list[Article]) -> BuildEstimat
         calls,
         tokens,
         quota_hours(limits, calls, tokens) if limits else None,
+        quota_wait_seconds(limits, calls, tokens) if limits else 0,
     )
 
 
@@ -351,7 +358,7 @@ class _LightRagBackend:
         return context
 
 
-def load_light_rag() -> GraphFactory:
+def load_light_rag(*, workers: int = 1) -> GraphFactory:
     """Load the optional package only when opening a real graph."""
     try:
         package = import_module("lightrag")
@@ -401,9 +408,9 @@ def load_light_rag() -> GraphFactory:
             enable_llm_cache=False,
             # Keep LightRAG's extraction checkpoints so it can recover interrupted merges.
             enable_llm_cache_for_entity_extract=True,
-            llm_model_max_async=1,
+            llm_model_max_async=workers,
             embedding_func_max_async=1,
-            max_parallel_insert=1,
+            max_parallel_insert=workers,
             vlm_process_enable=False,
         )
         return _LightRagBackend(rag, config, query_param)

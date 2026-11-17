@@ -68,6 +68,21 @@ def groq_limits(model: str) -> _PublishedLimits:
     return remote_limits("groq", model)
 
 
+def validate_workers(workers: int, provider: RemoteProvider | None, model: str) -> None:
+    if workers < 1:
+        raise ValueError("--workers must be at least 1.")
+    if workers == 1:
+        return
+    if provider is None:
+        raise ValueError(
+            "--workers above 1 is only supported for remote generators. "
+            "Use one worker for local Ollama to avoid GPU contention and distorted latency."
+        )
+    cap = remote_limits(provider, model).requests_per_minute
+    if cap is not None and workers > cap:
+        raise ValueError(f"--workers cannot exceed {cap} for {model} ({cap} requests/minute).")
+
+
 def quota_hours(limits: RateLimits, calls: int, tokens: int) -> float:
     """Estimate hours of allowance for an uncached workload at sustained throughput."""
     return max(
@@ -76,6 +91,18 @@ def quota_hours(limits: RateLimits, calls: int, tokens: int) -> float:
             / 3600
             * max(calls / (request_limit or math.inf), tokens / (token_limit or math.inf))
             for seconds, request_limit, token_limit in limits.windows()
+        ),
+        default=0.0,
+    )
+
+
+def quota_wait_seconds(limits: RateLimits, calls: int, tokens: int) -> float:
+    """Estimate quota wait from a fresh allowance, including the initial burst."""
+    return max(
+        (
+            seconds
+            * max(math.ceil(max(calls / (requests or math.inf), tokens / (cap or math.inf))) - 1, 0)
+            for seconds, requests, cap in limits.windows()
         ),
         default=0.0,
     )

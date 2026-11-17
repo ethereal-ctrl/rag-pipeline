@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC
 from email.utils import parsedate_to_datetime
 from functools import cached_property, partial
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Protocol, Self, runtime_checkable
 
 import httpx
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _LOGGER = logging.getLogger(__name__)
+_LOCAL_MODEL_LOCKS: dict[tuple[str, str], Lock] = {}
+_LOCAL_MODEL_LOCKS_GUARD = Lock()
+
+
+def local_model_lock(provider: str, model: str) -> Lock:
+    with _LOCAL_MODEL_LOCKS_GUARD:
+        return _LOCAL_MODEL_LOCKS.setdefault((provider, model), Lock())
 
 
 def configured_ollama_url() -> str:
@@ -199,10 +207,13 @@ def query_embedding(
         )
         return ModelResponse((response.value, tokens), response.seconds)
 
-    if cache is None:
-        return embed()
-    key = cache_key("embed_query", spec.model_dump(), embedder.name, model_version(embedder), query)
-    return cache.get_or_call(key, _QUERY_EMBEDDING, embed)
+    with local_model_lock(spec.provider, spec.model):
+        if cache is None:
+            return embed()
+        key = cache_key(
+            "embed_query", spec.model_dump(), embedder.name, model_version(embedder), query
+        )
+        return cache.get_or_call(key, _QUERY_EMBEDDING, embed)
 
 
 def _ollama_digest(client: httpx.Client, name: str) -> str | None:

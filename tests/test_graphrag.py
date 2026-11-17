@@ -3,10 +3,11 @@ from dataclasses import replace
 from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
+from threading import Barrier
 
 import httpx
 import pytest
-from conftest import FTX, FTX_QUERY, PIXEL_QUERY
+from conftest import FTX, FTX_QUERY, PIXEL, PIXEL_QUERY
 from fakes import ScriptedVariant
 from opentelemetry.trace import NoOpTracer
 from test_groq import FakeClock
@@ -318,6 +319,7 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
             return "".join(map(chr, tokens))
 
     responses: list[str] = []
+    concurrent_extraction = Barrier(2)
 
     def ollama(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/api/tags":
@@ -355,6 +357,7 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
     def gemini(request: httpx.Request) -> httpx.Response:
         data = json.loads(request.content)
         assert data["model"] == config.extraction.model
+        concurrent_extraction.wait(timeout=5)
         text = (
             "entity<|#|>SAM BANKMAN-FRIED<|#|>Person<|#|>The former FTX chief stood trial."
             "\n<|COMPLETE|>"
@@ -380,10 +383,10 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
         ),
     )
     graphs = tmp_path / "graphs"
-    factory = graphrag.load_light_rag()
+    factory = graphrag.load_light_rag(workers=2)
     report = build_graph(
         config,
-        [FTX],
+        [FTX, PIXEL],
         graphs,
         tmp_path / "reports",
         models,
@@ -391,7 +394,7 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
         NoOpTracer(),
         factory,
     )
-    assert report.complete and report.processed == 1 and report.llm_calls == 1
+    assert report.complete and report.processed == 2 and report.llm_calls == 2
     with graph_session(
         config,
         graphs / report.build_id,
@@ -399,7 +402,7 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
         models,
         cache,
         NoOpTracer(),
-        factory,
+        graphrag.load_light_rag(),
     ) as session:
         variant = GraphVariant(config, report.build_id, session)
         run = evaluate(variant, [FTX_QUERY], "dev", RunStore(tmp_path / "runs"))

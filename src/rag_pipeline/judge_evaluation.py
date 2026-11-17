@@ -8,14 +8,19 @@ import re
 from dataclasses import asdict, dataclass, replace
 from functools import cached_property
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from pydantic import TypeAdapter
 
 from rag_pipeline.cache import ResponseCache
 from rag_pipeline.chunking import ChunkingSettings, chunk_article
 from rag_pipeline.corpus import NULL_QUERY_TYPE, Article, article_hash, load_articles
-from rag_pipeline.evaluation import QueryRecord, RunResult, RunStore, bootstrap_metric_intervals
+from rag_pipeline.evaluation import (
+    QueryRecord,
+    RunResult,
+    RunStore,
+    bootstrap_metric_intervals,
+    write_text,
+)
 from rag_pipeline.index import corpus_hash
 from rag_pipeline.judge_model import (
     CitedStatement,
@@ -25,7 +30,14 @@ from rag_pipeline.judge_model import (
     check_judge_family,
 )
 from rag_pipeline.models import GeneratorSpec
-from rag_pipeline.rate_limit import RateLimits, quota_hours, remote_limits
+from rag_pipeline.parallel import completed_work
+from rag_pipeline.rate_limit import (
+    RateLimits,
+    quota_hours,
+    quota_wait_seconds,
+    remote_limits,
+    validate_workers,
+)
 from rag_pipeline.variants import VariantConfig
 
 
@@ -151,6 +163,7 @@ class JudgePlan:
     shared_hours: float
     tokens_per_day: int | None
     tokens_per_month: int | None
+    quota_wait_seconds: float = 0
 
     @property
     def days(self) -> int:
@@ -189,6 +202,7 @@ def plan_judging(
         quota_hours(limits, calls_left + shared_calls, tokens_left + shared_tokens),
         limits.tokens_per_day,
         limits.tokens_per_month,
+        quota_wait_seconds(limits, calls_left, tokens_left),
     )
 
 
@@ -230,22 +244,6 @@ def _metrics(rows: list[JudgedRecord]) -> dict[str, float]:
     return metrics
 
 
-def write_text(path: Path, content: str) -> None:
-    """Replace generated output atomically, including when a previous run was interrupted."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    destination = None
-    try:
-        with NamedTemporaryFile(
-            dir=path.parent, mode="w", encoding="utf-8", delete=False
-        ) as temporary:
-            destination = Path(temporary.name)
-            temporary.write(content)
-        destination.replace(path)
-    finally:
-        if destination is not None:
-            destination.unlink(missing_ok=True)
-
-
 def judge_run(
     store: RunStore,
     run_id: str,
@@ -253,24 +251,27 @@ def judge_run(
     judge: Judge,
     *,
     chunks: CitedChunkLookup | None = None,
+    workers: int = 1,
 ) -> JudgeReport:
+    validate_workers(workers, judge.spec.remote_provider, judge.spec.model)
     run = load_answer_run(store, run_id)
     check_judge_family(judge.spec, generator_models(run), run_id)
-    rows: list[JudgedRecord] = []
     lookup = chunks if chunks is not None else CitedChunkLookup(Path("data/raw"))
-    for case in judge_cases(run, sample, lookup):
+    cases = judge_cases(run, sample, lookup)
+
+    def grade(case: JudgeCase) -> JudgedRecord:
         verdict = JudgeVerdict(None) if case.request is None else judge.judge(case.request)
-        rows.append(
-            JudgedRecord(
-                case.record.query_id,
-                case.record.correct is True,
-                case.request is not None,
-                verdict.correct,
-                verdict.supported,
-                verdict.malformed,
-            )
+        return JudgedRecord(
+            case.record.query_id,
+            case.record.correct is True,
+            case.request is not None,
+            verdict.correct,
+            verdict.supported,
+            verdict.malformed,
         )
 
+    graded = {row.query_id: row for row in completed_work(cases, grade, workers)}
+    rows = [graded[case.record.query_id] for case in cases]
     report = JudgeReport(
         model=judge.spec.model,
         sampled=len(rows),

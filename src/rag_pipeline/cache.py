@@ -10,6 +10,8 @@ from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
+from weakref import WeakValueDictionary
 
 from pydantic import TypeAdapter
 
@@ -37,6 +39,8 @@ def measure_call[T](call: Callable[[], T]) -> ModelResponse[T]:
 class ResponseCache:
     def __init__(self, path: Path = CACHE_FILE) -> None:
         self.path = path
+        self._key_locks: WeakValueDictionary[str, Lock] = WeakValueDictionary()
+        self._lock_guard = Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
         with closing(sqlite3.connect(path)) as db, db:
             db.execute(
@@ -75,6 +79,14 @@ class ResponseCache:
             )
 
     def get_or_call[T](
+        self, key: str, adapter: TypeAdapter[T], call: Callable[[], ModelResponse[T]]
+    ) -> ModelResponse[T]:
+        with self._lock_guard:
+            lock = self._key_locks.setdefault(key, Lock())
+        with lock:
+            return self._get_or_call(key, adapter, call)
+
+    def _get_or_call[T](
         self, key: str, adapter: TypeAdapter[T], call: Callable[[], ModelResponse[T]]
     ) -> ModelResponse[T]:
         with closing(sqlite3.connect(self.path)) as db:
