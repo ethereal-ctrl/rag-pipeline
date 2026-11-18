@@ -1,0 +1,18 @@
+# Closed-Book uses the shared index declaration for ladder comparisons.
+name: closed-book-gemma-nvidia
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: nvidia
+    model: google/gemma-4-31b-it
+    supports_system: true
+    structured_output: prompt
+    thinking: "off"
+    max_output_tokens: 512

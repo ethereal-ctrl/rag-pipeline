@@ -50,6 +50,7 @@ from rag_pipeline.models import (
     StructuredGenerator,
     estimate_tokens,
     generation_key,
+    generator_base_url,
     model_version,
     query_embedding,
 )
@@ -485,6 +486,8 @@ class BuildReport(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
     notional_cost_usd: float | None = 0.0
+    provider: str | None = None
+    base_url: str | None = None
 
     @classmethod
     def load(cls, folder: Path, build_id: str) -> BuildReport | None:
@@ -515,6 +518,8 @@ def build_graph(
         marker = directory / BUILD_COMPLETE
         if report.complete and marker.is_file():
             return report
+        report.provider = config.extraction.provider
+        report.base_url = generator_base_url(config.extraction.provider)
         report.complete = False
         trace = AnswerTrace(tracer if tracer is not None else NoOpTracer(), "graphrag")
         started = time.perf_counter()

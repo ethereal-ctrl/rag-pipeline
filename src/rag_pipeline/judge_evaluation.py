@@ -29,7 +29,7 @@ from rag_pipeline.judge_model import (
     JudgeVerdict,
     check_judge_family,
 )
-from rag_pipeline.models import GeneratorSpec
+from rag_pipeline.models import GeneratorSpec, generator_base_url
 from rag_pipeline.parallel import completed_work
 from rag_pipeline.rate_limit import (
     RateLimits,
@@ -226,6 +226,7 @@ class JudgeReport:
     metrics: dict[str, float]
     intervals: dict[str, tuple[float, float]]
     provider: str = "groq"
+    base_url: str | None = None
 
 
 def _metrics(rows: list[JudgedRecord]) -> dict[str, float]:
@@ -281,6 +282,7 @@ def judge_run(
         metrics=_metrics(rows),
         intervals=bootstrap_metric_intervals(rows, _metrics),
         provider=judge.spec.provider,
+        base_url=generator_base_url(judge.spec.provider),
     )
     run_dir = store.root / run_id
     write_text(run_dir / "judge.jsonl", "".join(json.dumps(asdict(row)) + "\n" for row in rows))

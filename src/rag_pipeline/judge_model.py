@@ -38,7 +38,7 @@ def load_judge_spec(path: Path = JUDGE_CONFIG) -> GeneratorSpec:
 
 def model_family(model: str) -> str:
     name = model.lower().rsplit("/", 1)[-1]
-    if name.startswith(("ollama:", "groq:", "gemini:")):
+    if name.startswith(("ollama:", "groq:", "gemini:", "nvidia:")):
         name = name.split(":", 1)[1]
     if name.startswith(("mistral", "ministral", "magistral", "mixtral", "codestral", "devstral")):
         return "mistral"
@@ -46,6 +46,8 @@ def model_family(model: str) -> str:
         return "qwen"
     if name.startswith("gemma"):
         return "gemma"
+    if name.startswith("kimi"):
+        return "kimi"
     if name.startswith("gpt-oss"):
         return "gpt-oss"
     return name.split(":", 1)[0]
@@ -83,7 +85,10 @@ class JudgeRequest(_Strict):
         return self.model_dump_json().replace("<", "\\u003c").replace(">", "\\u003e")
 
     def cache_key(self, spec: GeneratorSpec) -> str:
-        namespace = "judge-gemini-v2" if spec.provider == "gemini" else "judge"
+        namespace = {
+            "gemini": "judge-gemini-v2",
+            "nvidia": "judge-nvidia-v1",
+        }.get(spec.provider, "judge")
         return cache_key(namespace, spec.model_dump(), _SYSTEM, self.prompt(), _SCHEMA)
 
     def estimated_tokens(self, spec: GeneratorSpec) -> int:

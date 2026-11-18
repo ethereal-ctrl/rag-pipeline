@@ -300,14 +300,25 @@ def test_missing_extra_keeps_core_cli_available(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.skipif(find_spec("lightrag") is None, reason="Requires the optional graphrag extra")
+@pytest.mark.parametrize(
+    ("config_path", "key", "base_url"),
+    [
+        (CONFIG, "GEMINI_API_KEY", "https://generativelanguage.googleapis.com"),
+        (
+            Path("configs/graphrag-nvidia.yaml"),
+            "NVIDIA_API_KEY",
+            "https://integrate.api.nvidia.com/v1",
+        ),
+    ],
+)
 def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_path: Path, key: str, base_url: str
 ):
-    config = GraphConfig.from_yaml(CONFIG).model_copy(
+    config = GraphConfig.from_yaml(config_path).model_copy(
         update={"embedding_dimensions": 2, "gleanings": 0}
     )
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("GEMINI_API_KEY", "fixture")
+    monkeypatch.setenv(key, "fixture")
     package = import_module("lightrag.lightrag")
     utils = import_module("lightrag.utils")
 
@@ -354,9 +365,10 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
             json={"message": {"content": text}, "prompt_eval_count": 10, "eval_count": 5},
         )
 
-    def gemini(request: httpx.Request) -> httpx.Response:
+    def extract(request: httpx.Request) -> httpx.Response:
         data = json.loads(request.content)
         assert data["model"] == config.extraction.model
+        assert str(request.url).startswith(base_url + "/")
         concurrent_extraction.wait(timeout=5)
         text = (
             "entity<|#|>SAM BANKMAN-FRIED<|#|>Person<|#|>The former FTX chief stood trial."
@@ -375,12 +387,17 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
 
     monkeypatch.setattr(package, "TiktokenTokenizer", tokenizer)
     cache = ResponseCache(tmp_path / "cache.sqlite3")
+    limiter = RateLimiter(
+        cache.path,
+        remote_limits(config.extraction.provider, config.extraction.model),
+        clock=FakeClock(),
+    )
     models = LocalModels(
         ollama_transport=httpx.MockTransport(ollama),
-        gemini_transport=httpx.MockTransport(gemini),
-        gemini_limiter=RateLimiter(
-            cache.path, remote_limits("gemini", config.extraction.model), clock=FakeClock()
-        ),
+        gemini_transport=httpx.MockTransport(extract),
+        gemini_limiter=limiter,
+        nvidia_transport=httpx.MockTransport(extract),
+        nvidia_limiter=limiter,
     )
     graphs = tmp_path / "graphs"
     factory = graphrag.load_light_rag(workers=2)
@@ -395,6 +412,7 @@ def test_pinned_lightrag_builds_and_retrieves_with_mock_models(
         factory,
     )
     assert report.complete and report.processed == 2 and report.llm_calls == 2
+    assert report.provider == config.extraction.provider and report.base_url == base_url
     with graph_session(
         config,
         graphs / report.build_id,

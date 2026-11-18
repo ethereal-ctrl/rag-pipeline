@@ -23,7 +23,7 @@ from rag_pipeline.citations import Citation, RemovedStatement
 from rag_pipeline.corpus import NULL_QUERY_TYPE, BenchmarkQuery
 from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
-from rag_pipeline.models import Generator
+from rag_pipeline.models import Generator, generator_base_url
 from rag_pipeline.parallel import completed_work
 from rag_pipeline.splits import TEST_SPLITS
 from rag_pipeline.tracing import StageTrace
@@ -674,6 +674,7 @@ def evaluate(
     Split); it is refused on the Test Split, which is scored once with the whole pipeline.
     """
     config = variant.config
+    provider = config.run_provider(retrieval_only=retrieval_only)
     config.validate_workers(workers, retrieval_only=retrieval_only)
     scope = variant.evaluation_scope() if isinstance(variant, _ScopedEvaluation) else None
     if scope is not None:
@@ -708,6 +709,8 @@ def evaluate(
                 "fingerprint": fingerprint,
                 "generator": generator_name,
                 "generator_version": version() if callable(version) else generator_name,
+                "provider": provider,
+                "base_url": generator_base_url(provider),
                 "commit": _git_commit(),
                 "started_at": started.isoformat(),
                 "rescored": allow_rescore and split in TEST_SPLITS,
@@ -719,6 +722,8 @@ def evaluate(
             },
         )
     meta = store.load_meta(run_id)
+    meta.setdefault("provider", provider)
+    meta.setdefault("base_url", generator_base_url(provider))
     wall_start = time.perf_counter()
     done = {r.query_id: r for r in store.records_so_far(run_id, repair=True)}
     remaining: dict[str, BenchmarkQuery] = {}

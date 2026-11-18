@@ -59,3 +59,9 @@ gemma-4-31b-it:
   usd_per_million_output_tokens: 0.34
   source: https://openrouter.ai/google/gemma-4-31b-it
   looked_up: "2026-11-16"
+google/gemma-4-31b-it:
+  reference_model: OpenRouter Google Gemma 4 31B
+  usd_per_million_input_tokens: 0.09
+  usd_per_million_output_tokens: 0.34
+  source: https://openrouter.ai/google/gemma-4-31b-it
+  looked_up: "2026-11-16"

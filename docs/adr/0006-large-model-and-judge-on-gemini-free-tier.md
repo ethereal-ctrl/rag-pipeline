@@ -20,3 +20,15 @@ Use Gemma 4 31B (`gemma-4-31b-it`) through the Gemini API free tier for the thre
 - Google may use free-tier prompts and outputs to improve products, with regional exceptions described in its terms. Check regional availability and project-level access before running. Google's availability list includes Germany and other EU countries. The runtime uses the Gemini API key. [Gemini API data terms](https://ai.google.dev/gemini-api/terms) · [Available regions](https://ai.google.dev/gemini-api/docs/available-regions)
 - The consumer Gemini subscription is outside the runtime under ADR 0001. Remote benchmark requests use public benchmark inputs and their generated answers. The demo defaults to local models.
 - Use the Groq Judge for Gemma runs and the Gemma Judge for Qwen and GPT-OSS runs. The Judge checks generator families before grading.
+
+## NVIDIA NIM addendum
+
+Recurring Gemini 503s and the project's 16,000-token-per-minute quota motivated
+adding NVIDIA NIM as a third provider. NVIDIA serves the same Gemma model family
+with its own deployment settings and quota. The author's live probe measured
+a 1.4-second median over 16 Gemma RAG calls with four workers. Each run uses one
+remote provider, records its endpoint, and caches responses under that provider.
+Provider comparisons use separate runs. NVIDIA also offers Kimi K3.1 Pro as a
+different-family Judge for Gemma, Qwen, and GPT-OSS runs, subject to account access.
+[NVIDIA Gemma API](https://docs.api.nvidia.com/nim/reference/google-gemma-4-31b-it) ·
+[NVIDIA Kimi API](https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3_1-pro-infer)

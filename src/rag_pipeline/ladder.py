@@ -16,7 +16,7 @@ from rag_pipeline.evaluation import Evaluable, RunResult, RunStore, StoredRun, e
 from rag_pipeline.variants import VariantConfig
 
 type HeldOutSplit = Literal["test", "test-400"]
-type LadderProvider = Literal["groq", "gemma"]
+type LadderProvider = Literal["groq", "gemma", "nvidia"]
 
 
 class _Definition(BaseModel):

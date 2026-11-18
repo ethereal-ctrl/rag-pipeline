@@ -39,3 +39,10 @@ large_model:
         config: configs/variants/hybrid-rerank-groq.yaml
       - local: configs/variants/agentic.yaml
         config: configs/variants/agentic-groq.yaml
+    nvidia:
+      - local: configs/variants/closed-book.yaml
+        config: configs/variants/closed-book-gemma-nvidia.yaml
+      - local: configs/variants/hybrid-rerank.yaml
+        config: configs/variants/hybrid-rerank-gemma-nvidia.yaml
+      - local: configs/variants/agentic.yaml
+        config: configs/variants/agentic-gemma-nvidia.yaml
