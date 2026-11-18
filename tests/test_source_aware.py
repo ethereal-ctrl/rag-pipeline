@@ -120,5 +120,15 @@ def test_default_settings_keep_existing_run_configs_unchanged():
     assert "source_aware" not in config["retrieval"]
     assert "prompt" not in config["generation"]
     changed = _config(SourceAwareConfig(), "decisive").run_config()
-    assert changed["retrieval"]["source_aware"] == {"per_source": 10}
+    assert changed["retrieval"]["source_aware"] == {"per_source": 10, "lift": 1}
     assert changed["generation"]["prompt"] == "decisive"
+
+
+def test_lift_keeps_several_chunks_of_one_named_source_up_front():
+    index = _index()
+    models = FakeModels(GroundedFakeGenerator({}))
+    question = "Does The Verge agree with TechCrunch on the FTX trial?"
+    config = _config(SourceAwareConfig(per_source=5, lift=2))
+    chunks = build_variant(config, index=index, models=models).retrieve(question)
+    assert [c.source for c in chunks[:3]].count("TechCrunch") == 2
+    assert "The Verge" in {c.source for c in chunks[:3]}

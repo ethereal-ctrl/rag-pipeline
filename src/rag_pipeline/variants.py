@@ -137,6 +137,7 @@ class SourceAwareConfig(_Frozen):
     """Search each publisher named in the question separately and keep its best Chunk."""
 
     per_source: int = 10  # first-stage candidates per named publisher
+    lift: int = 1  # best-ranked Chunks per named publisher moved to the front
 
 
 class RetrievalConfig(_Frozen):
@@ -332,14 +333,14 @@ def named_sources(question: str, sources: frozenset[str]) -> tuple[str, ...]:
 
 
 def _cover_sources(
-    ranked: tuple[RetrievedChunk, ...], sources: tuple[str, ...]
+    ranked: tuple[RetrievedChunk, ...], sources: tuple[str, ...], lift: int = 1
 ) -> tuple[RetrievedChunk, ...]:
-    """Lift the best-ranked Chunk of each named publisher to the front, in rank order."""
+    """Lift the `lift` best-ranked Chunks of each named publisher to the front, in rank order."""
     if not sources:
         return ranked
     lifted: list[RetrievedChunk] = []
     for chunk in ranked:
-        if chunk.source in sources and all(c.source != chunk.source for c in lifted):
+        if chunk.source in sources and sum(c.source == chunk.source for c in lifted) < lift:
             lifted.append(chunk)
     ids = {chunk.chunk_id for chunk in lifted}
     return (*lifted, *(chunk for chunk in ranked if chunk.chunk_id not in ids))
@@ -731,7 +732,9 @@ class PipelineVariant:
                 ) as stage,
             ):
                 retrieved = stage.chunks = self._rerank(question, retrieved, stage)
-        return _cover_sources(retrieved, sources)[: self.config.retrieval.top_k]
+        source_aware = self.config.retrieval.source_aware
+        lift = source_aware.lift if source_aware is not None else 1
+        return _cover_sources(retrieved, sources, lift)[: self.config.retrieval.top_k]
 
     def _named_sources(self, question: str) -> tuple[str, ...]:
         if self.config.retrieval.source_aware is None or self._index is None:
