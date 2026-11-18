@@ -20,6 +20,7 @@ from rag_pipeline.judge_evaluation import (
     load_answer_run,
 )
 from rag_pipeline.judge_model import Judge, JudgeRequest, JudgeVerdict, check_judge_family
+from rag_pipeline.models import generator_base_url
 from rag_pipeline.splits import DEFAULT_SEED
 
 CALIBRATION_SIZE = 200
@@ -190,6 +191,7 @@ class CalibrationReport:
     author_checks: int
     malformed_responses: int
     agreement: dict[str, dict[str, Agreement]]
+    base_url: str | None = None
 
 
 def _agreement_metrics(pairs: list[tuple[bool, bool]]) -> dict[str, float]:
@@ -298,6 +300,7 @@ def calibration_report(folder: Path, report_dir: Path, judge: Judge) -> Calibrat
         len(labels["author"]),
         sum(verdict.malformed for verdict in verdicts.values()),
         agreement,
+        base_url=generator_base_url(judge.spec.provider),
     )
     hash_ = cache_key(sorted(verdicts), sorted(case.case_id for case in cases), labels)
     target = report_dir / f"calibration-{hash_}"

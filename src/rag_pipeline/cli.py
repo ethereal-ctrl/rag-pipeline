@@ -381,6 +381,7 @@ def eval_command(
     config = VariantConfig.from_yaml(variant_file)
     try:
         config.validate_workers(workers, retrieval_only=retrieval_only)
+        config.run_provider(retrieval_only=retrieval_only)
         if dry_run:
             candidates = (config,) if config.router is None else router_candidates(config.router)
             remote = any(
@@ -667,7 +668,19 @@ def judge_calibration_report(judge_config: Path = JUDGE_CONFIG) -> None:
 def compare_command(baseline_run: str, candidate_run: str) -> None:
     """Paired comparison of two runs; '*' marks a significant change (95% interval)."""
     store = RunStore(RUNS_DIR)
-    deltas = compare_runs(store.load(baseline_run), store.load(candidate_run))
+    baseline = store.load(baseline_run)
+    candidate = store.load(candidate_run)
+    deltas = compare_runs(baseline, candidate)
+    baseline_provider = (
+        baseline.meta.get("provider")
+        or baseline.meta["variant"]["generation"]["generator"]["provider"]
+    )
+    candidate_provider = (
+        candidate.meta.get("provider")
+        or candidate.meta["variant"]["generation"]["generator"]["provider"]
+    )
+    if baseline_provider != candidate_provider:
+        typer.echo(f"Providers  baseline {baseline_provider} · candidate {candidate_provider}")
     typer.echo(f"  {'metric':<34} {'base':>6} {'cand':>6} {'delta':>7}  95% interval")
     for d in deltas:
         mark = "*" if d.significant else " "
@@ -727,7 +740,7 @@ def _ladder_gaps(
 def ladder_status_command(
     split: HeldOutSplit = "test",
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
-    provider: Literal["groq", "gemma"] | None = None,
+    provider: Literal["groq", "gemma", "nvidia"] | None = None,
 ) -> None:
     """Show saved runs and check collections required by pending rungs."""
     try:
@@ -832,7 +845,7 @@ def ladder_run_command(
     split: HeldOutSplit = "test",
     dry_run: bool = False,
     qdrant_url: QdrantUrl = DEFAULT_QDRANT_URL,
-    provider: Literal["groq", "gemma"] | None = None,
+    provider: Literal["groq", "gemma", "nvidia"] | None = None,
     workers: Workers = 1,
     call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
@@ -875,7 +888,7 @@ def ladder_run_command(
 def ladder_report_command(
     split: HeldOutSplit = "test",
     output: Path = LADDER_REPORT_DIR,
-    provider: Literal["groq", "gemma"] | None = None,
+    provider: Literal["groq", "gemma", "nvidia"] | None = None,
 ) -> None:
     """Render Markdown and SVGs from saved evaluations."""
     try:

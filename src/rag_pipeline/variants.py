@@ -46,6 +46,7 @@ from rag_pipeline.models import (
     Embedder,
     EmbedderSpec,
     Generator,
+    GeneratorProvider,
     GeneratorSpec,
     ModelProvider,
     RerankerSpec,
@@ -58,7 +59,13 @@ from rag_pipeline.models import (
     query_embedding,
     remote_instructions,
 )
-from rag_pipeline.rate_limit import quota_hours, quota_wait_seconds, remote_limits, validate_workers
+from rag_pipeline.rate_limit import (
+    RemoteProvider,
+    quota_hours,
+    quota_wait_seconds,
+    remote_limits,
+    validate_workers,
+)
 from rag_pipeline.router import RouterArtifact, RouterConfig
 from rag_pipeline.tracing import AnswerTrace, StageTrace, StageUsage, set_chunk_ids, span_trace_id
 
@@ -200,6 +207,20 @@ class VariantConfig(_Frozen):
         spec = self.generation.generator
         provider = spec.remote_provider if not retrieval_only and self.router is None else None
         validate_workers(workers, provider, spec.model)
+
+    def run_provider(self, *, retrieval_only: bool = False) -> GeneratorProvider:
+        candidates = (self,) if self.router is None else router_candidates(self.router)
+        providers: set[RemoteProvider] = {
+            provider
+            for candidate in candidates
+            for spec in candidate.remote_generators(retrieval_only=retrieval_only)
+            if (provider := spec.remote_provider) is not None
+        }
+        if len(providers) > 1:
+            raise ValueError(
+                f"A run must use one remote provider. Found {', '.join(sorted(providers))}."
+            )
+        return providers.pop() if providers else "ollama"
 
     def run_config(self) -> dict[str, Any]:
         config = self.model_dump(mode="json", exclude={"index": {"chunk_context"}})

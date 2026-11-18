@@ -1,0 +1,6 @@
+provider: nvidia
+model: moonshotai/kimi-k3.1-pro
+supports_system: true
+structured_output: prompt
+thinking: "off"
+max_output_tokens: 512

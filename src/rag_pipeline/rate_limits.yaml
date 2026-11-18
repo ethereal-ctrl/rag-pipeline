@@ -22,3 +22,15 @@ gemma-4-26b-a4b-it:
   requests_per_day: 14400
   source: Google AI Studio project rate-limit page, read by the author
   looked_up: "2026-11-16"
+
+google/gemma-4-31b-it:
+  provider: nvidia
+  requests_per_minute: 40
+  source: build.nvidia.com free tier, to be confirmed by the author
+  looked_up: "2026-11-18"
+
+moonshotai/kimi-k3.1-pro:
+  provider: nvidia
+  requests_per_minute: 4
+  source: Local pacing policy after the author's live probe returned HTTP 429. Account limit unverified.
+  looked_up: "2026-11-18"

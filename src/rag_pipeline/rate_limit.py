@@ -16,7 +16,7 @@ from pydantic import BaseModel, PositiveInt, TypeAdapter
 MINUTE = 60
 DAY = 86400
 MONTH = 31 * DAY  # Conservative rolling window across calendar months.
-type RemoteProvider = Literal["groq", "gemini"]
+type RemoteProvider = Literal["groq", "gemini", "nvidia"]
 
 
 class Clock(Protocol):

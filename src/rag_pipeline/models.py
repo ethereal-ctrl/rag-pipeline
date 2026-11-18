@@ -49,10 +49,13 @@ def configured_ollama_url() -> str:
     return os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL)
 
 
+type GeneratorProvider = Literal["ollama", "groq", "gemini", "nvidia"]
+
+
 class GeneratorSpec(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    provider: Literal["ollama", "groq", "gemini"]
+    provider: GeneratorProvider
     model: str
     temperature: float = 0.0
     max_output_tokens: PositiveInt = 256
@@ -61,20 +64,22 @@ class GeneratorSpec(BaseModel):
     reasoning_effort: Literal["low", "medium", "high"] = "low"
     supports_system: bool = True
     structured_output: Literal["json_schema", "prompt"] = "json_schema"
-    thinking: Literal["off"] | None = None
+    thinking: Literal["off", "low"] | None = None
 
     @model_validator(mode="after")
     def _validate_provider_options(self) -> Self:
-        if self.provider == "gemini" and "reasoning_effort" in self.model_fields_set:
+        if self.provider in ("gemini", "nvidia") and "reasoning_effort" in self.model_fields_set:
             raise ValueError("reasoning_effort is a Groq option in GeneratorSpec")
-        if self.thinking is not None and self.provider != "gemini":
-            raise ValueError("thinking is a Gemini option in GeneratorSpec")
+        if self.thinking == "off" and self.provider not in ("gemini", "nvidia"):
+            raise ValueError("thinking: off requires Gemini or NVIDIA in GeneratorSpec")
+        if self.thinking == "low" and self.provider != "nvidia":
+            raise ValueError("thinking: low requires NVIDIA in GeneratorSpec")
         return self
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         payload: dict[str, Any] = handler(self)
-        if self.provider == "gemini":
+        if self.provider in ("gemini", "nvidia"):
             payload.pop("reasoning_effort", None)
         if self.thinking is None:
             payload.pop("thinking", None)
@@ -188,7 +193,10 @@ def generation_key(
     spec: GeneratorSpec, name: str, version: str | None, system: str, prompt: str
 ) -> str:
     # Older Gemini cache entries may contain unfiltered thoughts and understated usage.
-    namespace = "generate-gemini-v2" if spec.provider == "gemini" else "generate-v1"
+    namespace = {
+        "gemini": "generate-gemini-v2",
+        "nvidia": "generate-nvidia-v1",
+    }.get(spec.provider, "generate-v1")
     return cache_key(namespace, spec.model_dump(), name, version, system, prompt)
 
 
@@ -324,6 +332,12 @@ _REMOTE_CHATS = {
         "GEMINI_API_KEY",
         "max_tokens",
     ),
+    "nvidia": _RemoteChat(
+        "https://integrate.api.nvidia.com/v1",
+        "/chat/completions",
+        "NVIDIA_API_KEY",
+        "max_tokens",
+    ),
 }
 
 _THOUGHT_BLOCK = re.compile(
@@ -369,10 +383,11 @@ def _remote_completion(
     input_tokens, visible_tokens = usage["prompt_tokens"], usage["completion_tokens"]
     total_output = (usage.get("total_tokens") or 0) - input_tokens
     details: dict[str, Any] = usage.get("completion_tokens_details") or {}
+    detailed_reasoning = details.get("reasoning_tokens") or 0
     google: dict[str, Any] = body.get("usageMetadata") or body.get("usage_metadata") or {}
     # Gemini's total can include thoughts even when completion_tokens only counts the answer.
     reasoning_tokens = max(
-        details.get("reasoning_tokens") or 0,
+        detailed_reasoning,
         usage.get("reasoning_tokens") or 0,
         *(
             fields.get(key) or 0
@@ -384,9 +399,13 @@ def _remote_completion(
     )
     if reasoning_tokens == 0 and (thoughts := "".join(thought_parts)):
         reasoning_tokens = estimate_tokens("", thoughts, 0) - estimate_tokens("", "", 0)
-    # An inclusive Groq completion total can already account for its reasoning detail.
-    inclusive = provider == "groq" and total_output == visible_tokens >= reasoning_tokens
-    output_tokens = visible_tokens if inclusive else visible_tokens + reasoning_tokens
+    # Kimi's completion count includes its reasoning detail, even when total_tokens is absent.
+    inclusive = (provider == "nvidia" and 0 < detailed_reasoning <= visible_tokens) or (
+        provider == "groq" and total_output == visible_tokens >= reasoning_tokens
+    )
+    output_tokens = (
+        max(visible_tokens, total_output) if inclusive else visible_tokens + reasoning_tokens
+    )
     return Completion(
         _first_json_object(text) if prompted_json else text,
         input_tokens,
@@ -444,6 +463,10 @@ def remote_instructions(spec: GeneratorSpec, system: str, schema: dict[str, Any]
 
 def remote_key_variable(provider: RemoteProvider) -> str:
     return _REMOTE_CHATS[provider].key_variable
+
+
+def generator_base_url(provider: GeneratorProvider) -> str:
+    return configured_ollama_url() if provider == "ollama" else _REMOTE_CHATS[provider].base_url
 
 
 def missing_remote_keys(specs: Iterable[GeneratorSpec]) -> tuple[str, ...]:
@@ -513,6 +536,15 @@ class RemoteChatGenerator:
                 include_reasoning=False,
                 seed=self._spec.seed,
             )
+        elif self._provider == "nvidia":
+            payload["stream"] = False
+            # Request switches verified in the author's 2026-11-18 NIM probe.
+            # https://docs.api.nvidia.com/nim/reference/google-gemma-4-31b-it
+            # https://docs.api.nvidia.com/nim/reference/moonshotai-kimi-k3_1-pro-infer
+            if self._spec.thinking == "off":
+                payload["chat_template_kwargs"] = {"thinking": False, "enable_thinking": False}
+            elif self._spec.thinking == "low":
+                payload["reasoning_effort"] = "low"
         elif self._spec.thinking == "off":
             # Gemma 4 maps minimal to off: https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api
             # Chat REST envelope: https://ai.google.dev/gemini-api/docs/openai#extra-body
@@ -732,11 +764,21 @@ class LocalModels:
         groq_limiter: RateLimiter | None = None,
         gemini_transport: httpx.BaseTransport | None = None,
         gemini_limiter: RateLimiter | None = None,
+        nvidia_transport: httpx.BaseTransport | None = None,
+        nvidia_limiter: RateLimiter | None = None,
     ) -> None:
         self._ollama_url = configured_ollama_url() if ollama_url is None else ollama_url
         self._ollama_transport = ollama_transport
-        self._remote_transports = {"groq": groq_transport, "gemini": gemini_transport}
-        self._remote_limiters = {"groq": groq_limiter, "gemini": gemini_limiter}
+        self._remote_transports = {
+            "groq": groq_transport,
+            "gemini": gemini_transport,
+            "nvidia": nvidia_transport,
+        }
+        self._remote_limiters = {
+            "groq": groq_limiter,
+            "gemini": gemini_limiter,
+            "nvidia": nvidia_limiter,
+        }
         self._rerankers: dict[RerankerSpec, SentenceTransformersReranker] = {}
         self._embedders: dict[EmbedderSpec, Embedder] = {}
 
