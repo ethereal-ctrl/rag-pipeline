@@ -111,6 +111,29 @@ class ChunkIndex:
             self._sources = frozenset(names)
         return self._sources
 
+    def article_chunks(self, article_id: str) -> list[RetrievedChunk]:
+        """Every stored Chunk of one Article, in Chunk ID order."""
+        chunks: list[RetrievedChunk] = []
+        offset = None
+        article = models.Filter(
+            must=[
+                models.FieldCondition(key="article_id", match=models.MatchValue(value=article_id))
+            ]
+        )
+        while True:
+            points, offset = self._client.scroll(
+                self.collection,
+                scroll_filter=article,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            chunks += [_to_retrieved(p.payload or {}, 0.0) for p in points]
+            if offset is None:
+                break
+        return sorted(chunks, key=lambda chunk: chunk.chunk_id)
+
     def _ensure_collection(self, dense_size: int | None) -> None:
         if self._client.collection_exists(self.collection):
             return

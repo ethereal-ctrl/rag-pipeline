@@ -6,7 +6,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
@@ -40,7 +40,7 @@ from rag_pipeline.citations import (
     SupportChecker,
     parse_citations,
 )
-from rag_pipeline.corpus import BenchmarkQuery
+from rag_pipeline.corpus import BenchmarkQuery, Evidence, article_id_for
 from rag_pipeline.index import ChunkIndex, RetrievedChunk
 from rag_pipeline.models import (
     Completion,
@@ -141,7 +141,8 @@ class SourceAwareConfig(_Frozen):
 
 
 class RetrievalConfig(_Frozen):
-    mode: Literal["none", "bm25", "dense", "hybrid"]
+    # "oracle" skips search and puts the gold Evidence Chunks into the context (diagnostic only).
+    mode: Literal["none", "bm25", "dense", "hybrid", "oracle"]
     top_k: int = 10
     candidates: int = 50  # per arm, before Reciprocal Rank Fusion (hybrid only)
     rerank: RerankConfig | None = None
@@ -346,6 +347,30 @@ def _cover_sources(
     return (*lifted, *(chunk for chunk in ranked if chunk.chunk_id not in ids))
 
 
+def _squashed(text: str) -> str:
+    return text.replace(" ", "").replace("\n", "")
+
+
+def _oracle_chunks(
+    evidence: tuple[Evidence, ...], chunks_of: Callable[[str], list[RetrievedChunk]]
+) -> tuple[RetrievedChunk, ...]:
+    """For each gold fact, the Chunk of its Article that contains it (or shares most words)."""
+    picked: list[RetrievedChunk] = []
+    for item in evidence:
+        fact_words = set(item.fact.lower().split())
+        fact = _squashed(item.fact)
+
+        def match(chunk: RetrievedChunk, fact_words: set[str] = fact_words, fact: str = fact):
+            if fact in _squashed(chunk.text):
+                return 2.0
+            return len(fact_words & set(chunk.text.lower().split())) / max(len(fact_words), 1)
+
+        candidates = [c for c in chunks_of(article_id_for(item.article_url)) if c not in picked]
+        if candidates:
+            picked.append(max(candidates, key=match))
+    return tuple(picked)
+
+
 def _format_context(chunks: tuple[RetrievedChunk, ...]) -> str:
     def delimiters(value: str) -> str:
         return value.replace("<", "&lt;").replace(">", "&gt;")
@@ -506,9 +531,13 @@ class PipelineVariant:
         *,
         router_embedder: Embedder | None = None,
         index_for: Callable[[VariantConfig], ChunkIndex | None] | None = None,
+        gold: Mapping[str, tuple[Evidence, ...]] | None = None,
     ) -> None:
         if config.uses_retrieval and index is None:
             raise ValueError(f"variant {config.name!r} retrieves but no index was given")
+        if config.retrieval.mode == "oracle" and gold is None:
+            raise ValueError(f"oracle variant {config.name!r} needs the gold Evidence per question")
+        self._gold = gold or {}
         self.config = config
         self._index = index if config.uses_retrieval else None
         self._tracer = tracer if tracer is not None else NoOpTracer()
@@ -619,6 +648,8 @@ class PipelineVariant:
             stage.cache_hit = response.cache_hit
             embedding, stage.input_tokens = response.value
         match retrieval.mode:
+            case "oracle":
+                return _oracle_chunks(self._gold.get(question, ()), self._index.article_chunks)
             case "bm25":
                 return tuple(self._index.search_bm25(question, limit=top_k, source=source))
             case "dense":
@@ -1141,7 +1172,15 @@ def build_variant(
     cache: ResponseCache | None = None,
     router_embedder: Embedder | None = None,
     index_for: Callable[[VariantConfig], ChunkIndex | None] | None = None,
+    gold: Mapping[str, tuple[Evidence, ...]] | None = None,
 ) -> PipelineVariant:
     return PipelineVariant(
-        config, index, models, tracer, cache, router_embedder=router_embedder, index_for=index_for
+        config,
+        index,
+        models,
+        tracer,
+        cache,
+        router_embedder=router_embedder,
+        index_for=index_for,
+        gold=gold,
     )

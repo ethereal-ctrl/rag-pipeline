@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from rag_pipeline.corpus import (
     DATASET_LICENSE,
     Article,
     BenchmarkQuery,
+    Evidence,
     fetch_dataset,
     load_articles,
     load_queries,
@@ -395,8 +397,13 @@ def eval_command(
             return
         queries = _split_queries(split)[:limit]
         tracer = ctx.with_resource(cli_tracer())
+        gold = (
+            {query.question: query.evidence for query in queries}
+            if config.retrieval.mode == "oracle"
+            else None
+        )
         variant = _evaluation_variant(
-            config, LocalModels(), qdrant_url, tracer, None if no_cache else ResponseCache()
+            config, LocalModels(), qdrant_url, tracer, None if no_cache else ResponseCache(), gold
         )
         result = evaluate(
             variant,
@@ -508,6 +515,7 @@ def _evaluation_variant(
     qdrant_url: str,
     tracer: Tracer | None,
     cache: ResponseCache | None,
+    gold: Mapping[str, tuple[Evidence, ...]] | None = None,
 ) -> PipelineVariant:
     router_embedder = None
     if config.router is not None:
@@ -521,6 +529,7 @@ def _evaluation_variant(
         cache=cache,
         router_embedder=router_embedder,
         index_for=lambda candidate: _index_for(candidate, models, qdrant_url),
+        gold=gold,
     )
 
 
