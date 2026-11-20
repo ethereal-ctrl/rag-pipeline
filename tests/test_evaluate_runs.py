@@ -70,6 +70,26 @@ def test_the_test_subset_shares_the_test_split_score_once_guard(tmp_path: Path, 
             evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, split, store)
 
 
+def test_the_untouched_600_can_be_scored_once_after_the_400_subset(tmp_path: Path):
+    store = RunStore(tmp_path)
+    evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, "test-400", store)
+
+    final = evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, "test-600", store)
+
+    assert final.meta["split"] == "test-600"
+    for split in ("test-600", "test"):
+        with pytest.raises(TestSplitAlreadyScored):
+            evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, split, store)
+
+
+def test_a_full_test_split_score_blocks_the_untouched_600(tmp_path: Path):
+    store = RunStore(tmp_path)
+    evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, "test", store)
+
+    with pytest.raises(TestSplitAlreadyScored):
+        evaluate(ScriptedVariant("hybrid", SCRIPT), QUERIES, "test-600", store)
+
+
 def test_test_subset_rejects_retrieval_only_evaluation(tmp_path: Path):
     with pytest.raises(ValueError, match="Test Split"):
         evaluate(

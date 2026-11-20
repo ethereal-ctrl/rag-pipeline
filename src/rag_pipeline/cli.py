@@ -100,6 +100,7 @@ from rag_pipeline.splits import (
     load_judge_sample,
     load_test_subset,
     make_splits,
+    untouched_test_ids,
 )
 from rag_pipeline.tracing import cli_tracer
 from rag_pipeline.variants import (
@@ -373,7 +374,7 @@ def eval_command(
     call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
-    splits = (*SPLIT_NAMES, "test-400")
+    splits = (*SPLIT_NAMES, "test-400", "test-600")
     if split not in splits:
         raise typer.BadParameter(f"split must be one of {splits}")
     if split in TEST_SPLITS and limit is not None:
@@ -423,7 +424,11 @@ def eval_command(
 
 def _split_ids(split: str) -> tuple[str, ...]:
     splits = Splits.load(SPLITS_FILE)
-    return load_test_subset(TEST_SUBSET_FILE, splits) if split == "test-400" else splits.ids(split)
+    if split == "test-400":
+        return load_test_subset(TEST_SUBSET_FILE, splits)
+    if split == "test-600":
+        return untouched_test_ids(splits, load_test_subset(TEST_SUBSET_FILE, splits))
+    return splits.ids(split)
 
 
 def _split_queries(split: str) -> list[BenchmarkQuery]:
