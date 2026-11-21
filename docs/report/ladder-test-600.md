@@ -94,6 +94,14 @@ routing. Chance inflates this bound, because with more candidates some are right
 | 4B chosen and Gemma chosen | 0.770 | 0.858 (+0.088) |
 | All 9 Dev answer runs | 0.776 | 0.912 (+0.136) |
 
+A trained Router (logistic regression on the question embedding, 5-fold cross-validation on
+Dev) does not reach this headroom. It learns to always pick the local 4B model, so it matches
+the 4B model's 0.770. Its threshold rule only accepts routing that stays above the weaker
+candidate's interval and then minimises cost. From the question alone it cannot tell which
+model will be right, and only 23 of the 115 "Gemma only" questions are recognised. The Router
+was therefore not scored on test-600, where it would reproduce the 4B row. Details:
+[`router-4b-gemma.md`](router-4b-gemma.md).
+
 ## Reproduce
 
 ```bash
