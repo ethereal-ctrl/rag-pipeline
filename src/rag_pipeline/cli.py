@@ -65,6 +65,7 @@ from rag_pipeline.graphrag import (
     lock_graph,
     paired_comparison,
 )
+from rag_pipeline.honesty import always_yes, with_honesty_metrics
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.judge_calibration import calibration_report, export_calibration
@@ -1037,14 +1038,25 @@ def graphrag_compare(graphrag_run: str, ladder_run: str) -> None:
 def table_command(
     run_ids: list[str],
     metrics: Annotated[str, typer.Option(help="Comma-separated metric names, in column order.")] = (
-        "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,"
-        "generator_context_tokens_per_question,latency_p50,latency_p95,cost_per_question"
+        "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,coverage,selective_accuracy,"
+        "score(wrong=-2),generator_context_tokens_per_question,latency_p50,latency_p95,"
+        "cost_per_question"
     ),
     output: Annotated[Path | None, typer.Option(help="Also write the table here.")] = None,
+    always_yes_row: Annotated[
+        bool,
+        typer.Option(
+            "--always-yes", help="Add the trivial baseline that answers Yes on the first run."
+        ),
+    ] = False,
 ) -> None:
     """Markdown table of runs with 95% intervals, for the report."""
     store = RunStore(RUNS_DIR)
-    runs = [with_judge_metrics(store.load(run_id), store) for run_id in run_ids]
+    runs = [
+        with_honesty_metrics(with_judge_metrics(store.load(run_id), store)) for run_id in run_ids
+    ]
+    if always_yes_row and runs:
+        runs.append(always_yes(runs[0]))
     table = results_table(runs, metrics.split(","))
     typer.echo(table)
     if output:
