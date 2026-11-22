@@ -346,7 +346,7 @@ _THOUGHT_BLOCK = re.compile(
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _MAX_ATTEMPTS = 6
 _RETRY_SECONDS = 300.0
-_REQUEST_TIMEOUT = 60.0
+_REQUEST_TIMEOUT = float(os.environ.get("RAG_REMOTE_TIMEOUT", "60"))
 
 
 def _content_parts(content: str | list[dict[str, Any]] | None) -> tuple[str, str]:
