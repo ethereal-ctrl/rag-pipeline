@@ -600,12 +600,16 @@ def judge_command(
     judge_config: Path = JUDGE_CONFIG,
     workers: Workers = 1,
     call_latency: CallLatency = DEFAULT_CALL_LATENCY,
+    all_records: Annotated[
+        bool,
+        typer.Option(help="Grade every stored answer instead of the fixed test-400 sample."),
+    ] = False,
 ) -> None:
     """Grade the fixed Judge sample in a completed run."""
     store = RunStore(RUNS_DIR)
     lookup = CitedChunkLookup(RAW_DIR)
     try:
-        sample = _judge_sample()
+        sample = None if all_records else _judge_sample()
         spec = load_judge_spec(judge_config)
         validate_workers(workers, spec.remote_provider, spec.model)
         if dry_run:

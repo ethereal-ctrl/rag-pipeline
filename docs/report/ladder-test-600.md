@@ -84,6 +84,21 @@ too often on answerable ones, though. The three Dev-chosen levers cut False Abst
 (−0.063 for Gemma, significant). Gemma wins on the penalised score (0.558 vs 0.418). Which
 model is "better" depends on what a wrong answer costs.
 
+## Judge check of the substring match
+
+Kimi K3.1 Pro re-grades the correctness of every stored answer of the chosen variants
+(`rag judge run RUN_ID --all-records`). On correctness it agrees with independent labels at
+κ 0.889 ([`judge-calibration.md`](judge-calibration.md)). On support it is not reliable, so
+it is used here for correctness only.
+
+| Variant | Substring accuracy | Judge accuracy | Verdicts that differ |
+|---|---:|---:|---:|
+| 4B chosen (source-aware retrieval) | 0.775 | 0.792 [0.758, 0.822] | 0.074 |
+| Gemma chosen | 0.712 | pending | |
+
+The Judge credits a few correct answers that do not contain the reference verbatim. The
+intervals overlap, so the substring match is not what drives the reported scores.
+
 ## Router headroom (Dev Split)
 
 An oracle router that picks, per query, a variant that got it right gives an upper bound on
