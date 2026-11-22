@@ -94,10 +94,11 @@ it is used here for correctness only.
 | Variant | Substring accuracy | Judge accuracy | Verdicts that differ |
 |---|---:|---:|---:|
 | 4B chosen (source-aware retrieval) | 0.775 | 0.792 [0.758, 0.822] | 0.074 |
-| Gemma chosen | 0.712 | pending | |
+| Gemma chosen | 0.712 | 0.735 [0.700, 0.768] | 0.081 |
 
-The Judge credits a few correct answers that do not contain the reference verbatim. The
-intervals overlap, so the substring match is not what drives the reported scores.
+The Judge credits a few correct answers that do not contain the reference verbatim
+(+0.017 for the 4B model, +0.023 for Gemma). The ranking stays the same, with the local 4B
+model ahead. The substring match is therefore not what drives the reported scores.
 
 ## Router headroom (Dev Split)
 
