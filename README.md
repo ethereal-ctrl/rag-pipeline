@@ -22,14 +22,18 @@ See `GLOSSARY.md` for the vocabulary and `docs/adr/` for the design decisions.
 
 - Retrieval makes the model honest. Closed-Book invents an answer for 98.6% of the
   unanswerable questions, and with retrieval it abstains on 85–96% of them.
-- BM25 beats dense retrieval on news (−0.052, significant). A one-line lever, lifting the
-  articles of outlets named in the question, beats an agent loop (+0.053 at +2 s per question
-  vs +0.027 at +32 s).
+- BM25 beats dense retrieval on news (−0.052, significant). A simple retrieval lever, lifting
+  the articles of outlets named in the question, beats an agent loop (+0.053 at +2 s per
+  question vs +0.027 at +32 s).
 - Citations with a support check cost 0.070 accuracy through more False Abstentions. The
   answers they do give are more often right.
 - The Oracle run shows 8 points of headroom in retrieval. The rest is the 4B generator's limit.
 - Gemma 4 31B (NVIDIA NIM) reaches 0.712 with the same levers. It never answers an
   unanswerable question, but it abstains far more on answerable ones.
+- An LLM Judge (Kimi K3.1 Pro), calibrated against independent labels (κ 0.889 on
+  correctness), re-grades the chosen variants at 0.792 (4B) and 0.735 (Gemma). The ranking
+  does not change, so the substring match does not drive the results
+  ([calibration](docs/report/judge-calibration.md)).
 
 Full tables, paired comparisons and the honest metrics (Coverage, Selective Accuracy, score
 with wrong = −2) are in [docs/report/ladder-test-600.md](docs/report/ladder-test-600.md).
