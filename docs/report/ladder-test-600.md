@@ -76,7 +76,11 @@ Full table with intervals: [`ladder-test-600-table.md`](ladder-test-600-table.md
 | Hybrid + Reranker | 0.578 | 1.000 | 0.416 | 0.893 | 0.468 |
 | + sources, 10 chunks, decisive prompt (chosen) | 0.712 | 1.000 | 0.240 | 0.886 | 0.558 |
 | Oracle retrieval | 0.823 | 1.000 | 0.102 | 0.891 | 0.650 |
-| Agentic Search | pending | | | | |
+| Agentic Search | not completed (57 of 600 queries) | | | | |
+
+Gemma Agentic Search was stopped after 57 of 600 queries. NVIDIA NIM's free tier did not
+answer Gemma requests within 60 s from 20 to 23 November, and 57 queries are too few to
+report. Partial results are not used.
 
 Gemma never answers a Null Query, and its answers are right 89% of the time. It abstains far
 too often on answerable ones, though. The three Dev-chosen levers cut False Abstention from
