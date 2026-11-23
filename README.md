@@ -25,35 +25,34 @@ Split. The final numbers come from 600 Test Split questions that were never look
 ## Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Offline["Offline: indexing"]
-        A[(609 news articles)] --> B[Sentence chunker<br/>200 words, 1 overlap]
-        B --> C[BM25 sparse vectors]
-        B --> D[Qwen3-Embedding 0.6B<br/>dense vectors]
+flowchart TB
+    subgraph Offline["1 · Indexing (offline)"]
+        direction LR
+        A[(609 news<br/>articles)] --> B[Sentence chunks<br/>200 words]
+        B --> C[BM25<br/>sparse vectors]
+        B --> D[Qwen3-Embedding<br/>0.6B dense vectors]
         C --> Q[(Qdrant)]
         D --> Q
     end
 
-    subgraph Online["Online: answering a question"]
-        U([Question]) --> S{Outlets named<br/>in the question?}
-        S --> H[Hybrid search<br/>BM25 + dense, RRF fusion]
-        S -- yes --> P[Search each named outlet<br/>separately]
-        H --> R[bge-reranker-v2-m3<br/>rerank top 30]
+    subgraph Online["2 · Answering a question"]
+        direction LR
+        U([Question]) --> H[Hybrid search<br/>BM25 + dense, RRF]
+        U --> P[Extra search per<br/>outlet named in<br/>the question]
+        H --> R[Reranker<br/>bge-reranker-v2-m3]
         P --> R
-        R --> L[Lift best Chunk per<br/>named outlet to the front]
-        L --> G[Generator<br/>Qwen3.5 4B via Ollama]
-        G --> O([Answer with Citations<br/>or Abstention])
+        R --> L[Lift best Chunk<br/>per named outlet]
+        L --> G[Generator<br/>Qwen3.5 4B, Ollama]
+        G --> O([Answer + Citations<br/>or Abstention])
     end
 
-    Q -.-> H
-    Q -.-> P
-
-    subgraph Eval["Evaluation"]
-        O --> M[Metrics + bootstrap CIs<br/>rag table / rag compare]
-        O --> J[Calibrated LLM Judge<br/>Kimi K3.1 Pro]
+    subgraph Eval["3 · Evaluation and observability"]
+        direction LR
+        M[Metrics with<br/>bootstrap CIs] ~~~ J[Calibrated Judge<br/>Kimi K3.1 Pro] ~~~ T[Traces in<br/>Phoenix]
     end
 
-    G -. traces .-> T[Phoenix<br/>OpenTelemetry]
+    Offline --> Online
+    Online --> Eval
 ```
 
 The core is plain Python with no orchestration framework (ADR 0004), so every step above is
