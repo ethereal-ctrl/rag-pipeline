@@ -248,7 +248,7 @@ def _metrics(rows: list[JudgedRecord]) -> dict[str, float]:
 def judge_run(
     store: RunStore,
     run_id: str,
-    sample: tuple[str, ...],
+    sample: tuple[str, ...] | None,
     judge: Judge,
     *,
     chunks: CitedChunkLookup | None = None,

@@ -1,0 +1,6 @@
+variant: configs/variants/router-4b-gemma.yaml
+folds: 5
+# Dev Split runs of the two chosen variants: local Qwen3.5 4B first (cheaper), then Gemma 4 31B.
+runs:
+  hybrid-rerank-sources: 20261119T020309625032-hybrid-rerank-sources-dev
+  hybrid-rerank-gemma-nvidia-sources-ctx10-decisive: 20261119T004758456378-hybrid-rerank-gemma-nvidia-sources-ctx10-decisive-dev

@@ -293,6 +293,7 @@ def test_parallel_queries_serialize_local_embedding_and_reranking(tmp_path: Path
             on_input_tokens: Callable[[TokenCount], None] | None = None,
             embedding: list[float] | None = None,
             dense_query: str | None = None,
+            source: str | None = None,
         ) -> list[RetrievedChunk]:
             assert embedding == [1.0]
             return [RetrievedChunk("c", "a", "fixture", "news", "2023", "fixture evidence", 1.0)]

@@ -89,6 +89,50 @@ class ChunkIndex:
         self._client = client
         self.collection = collection
         self._embedder = embedder
+        self._sources: frozenset[str] | None = None
+
+    def sources(self) -> frozenset[str]:
+        """Distinct publisher names in the collection, read once and kept."""
+        if self._sources is None:
+            names: set[str] = set()
+            offset = None
+            while True:
+                points, offset = self._client.scroll(
+                    self.collection,
+                    limit=1024,
+                    offset=offset,
+                    with_payload=["source"],
+                    with_vectors=False,
+                )
+                names.update(str((p.payload or {}).get("source", "")) for p in points)
+                if offset is None:
+                    break
+            names.discard("")
+            self._sources = frozenset(names)
+        return self._sources
+
+    def article_chunks(self, article_id: str) -> list[RetrievedChunk]:
+        """Every stored Chunk of one Article, in Chunk ID order."""
+        chunks: list[RetrievedChunk] = []
+        offset = None
+        article = models.Filter(
+            must=[
+                models.FieldCondition(key="article_id", match=models.MatchValue(value=article_id))
+            ]
+        )
+        while True:
+            points, offset = self._client.scroll(
+                self.collection,
+                scroll_filter=article,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            chunks += [_to_retrieved(p.payload or {}, 0.0) for p in points]
+            if offset is None:
+                break
+        return sorted(chunks, key=lambda chunk: chunk.chunk_id)
 
     def _ensure_collection(self, dense_size: int | None) -> None:
         if self._client.collection_exists(self.collection):
@@ -281,11 +325,14 @@ class ChunkIndex:
             return 0
         return self._client.count(self.collection, exact=True).count
 
-    def search_bm25(self, query: str, limit: int) -> list[RetrievedChunk]:
+    def search_bm25(
+        self, query: str, limit: int, *, source: str | None = None
+    ) -> list[RetrievedChunk]:
         response = self._client.query_points(
             self.collection,
             query=bm25.query_vector(query),
             using=BM25_VECTOR,
+            query_filter=_source_filter(source),
             limit=limit,
             with_payload=True,
         )
@@ -326,13 +373,17 @@ class ChunkIndex:
         on_input_tokens: Callable[[TokenCount], None] | None = None,
         embedding: list[float] | None = None,
         dense_query: str | None = None,
+        source: str | None = None,
     ) -> list[RetrievedChunk]:
         """BM25 and dense candidates fused with Reciprocal Rank Fusion inside one Qdrant query."""
         response = self._client.query_points(
             self.collection,
             prefetch=[
                 models.Prefetch(
-                    query=bm25.query_vector(query), using=BM25_VECTOR, limit=candidates
+                    query=bm25.query_vector(query),
+                    using=BM25_VECTOR,
+                    filter=_source_filter(source),
+                    limit=candidates,
                 ),
                 models.Prefetch(
                     query=embedding
@@ -341,6 +392,7 @@ class ChunkIndex:
                         dense_query if dense_query is not None else query, on_input_tokens
                     ),
                     using=DENSE_VECTOR,
+                    filter=_source_filter(source),
                     limit=candidates,
                 ),
             ],
@@ -357,6 +409,7 @@ class ChunkIndex:
         *,
         on_input_tokens: Callable[[TokenCount], None] | None = None,
         embedding: list[float] | None = None,
+        source: str | None = None,
     ) -> list[RetrievedChunk]:
         response = self._client.query_points(
             self.collection,
@@ -364,10 +417,19 @@ class ChunkIndex:
             if embedding is not None
             else self._query_embedding(query, on_input_tokens),
             using=DENSE_VECTOR,
+            query_filter=_source_filter(source),
             limit=limit,
             with_payload=True,
         )
         return [_to_retrieved(p.payload or {}, p.score) for p in response.points]
+
+
+def _source_filter(source: str | None) -> models.Filter | None:
+    if source is None:
+        return None
+    return models.Filter(
+        must=[models.FieldCondition(key="source", match=models.MatchValue(value=source))]
+    )
 
 
 def _to_retrieved(payload: dict[str, Any], score: float) -> RetrievedChunk:

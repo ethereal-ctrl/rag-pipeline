@@ -1,0 +1,12 @@
+# Diagnostic ceiling: gold Evidence Chunks instead of search, generator as in hybrid-rerank-sources.
+name: oracle
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+retrieval:
+  mode: oracle
+  top_k: 10
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+  context_chunks: 5

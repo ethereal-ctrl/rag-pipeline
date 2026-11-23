@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from rag_pipeline.corpus import (
     DATASET_LICENSE,
     Article,
     BenchmarkQuery,
+    Evidence,
     fetch_dataset,
     load_articles,
     load_queries,
@@ -63,6 +65,7 @@ from rag_pipeline.graphrag import (
     lock_graph,
     paired_comparison,
 )
+from rag_pipeline.honesty import always_yes, with_honesty_metrics
 from rag_pipeline.index import ChunkIndex, IndexMismatch, index_collection
 from rag_pipeline.ingest import IngestReport, ingest
 from rag_pipeline.judge_calibration import calibration_report, export_calibration
@@ -98,6 +101,7 @@ from rag_pipeline.splits import (
     load_judge_sample,
     load_test_subset,
     make_splits,
+    untouched_test_ids,
 )
 from rag_pipeline.tracing import cli_tracer
 from rag_pipeline.variants import (
@@ -371,7 +375,7 @@ def eval_command(
     call_latency: CallLatency = DEFAULT_CALL_LATENCY,
 ) -> None:
     """Evaluate a Pipeline Variant on a split and store the run (resumes if interrupted)."""
-    splits = (*SPLIT_NAMES, "test-400")
+    splits = (*SPLIT_NAMES, "test-400", "test-600")
     if split not in splits:
         raise typer.BadParameter(f"split must be one of {splits}")
     if split in TEST_SPLITS and limit is not None:
@@ -395,8 +399,13 @@ def eval_command(
             return
         queries = _split_queries(split)[:limit]
         tracer = ctx.with_resource(cli_tracer())
+        gold = (
+            {query.question: query.evidence for query in queries}
+            if config.retrieval.mode == "oracle"
+            else None
+        )
         variant = _evaluation_variant(
-            config, LocalModels(), qdrant_url, tracer, None if no_cache else ResponseCache()
+            config, LocalModels(), qdrant_url, tracer, None if no_cache else ResponseCache(), gold
         )
         result = evaluate(
             variant,
@@ -416,7 +425,11 @@ def eval_command(
 
 def _split_ids(split: str) -> tuple[str, ...]:
     splits = Splits.load(SPLITS_FILE)
-    return load_test_subset(TEST_SUBSET_FILE, splits) if split == "test-400" else splits.ids(split)
+    if split == "test-400":
+        return load_test_subset(TEST_SUBSET_FILE, splits)
+    if split == "test-600":
+        return untouched_test_ids(splits, load_test_subset(TEST_SUBSET_FILE, splits))
+    return splits.ids(split)
 
 
 def _split_queries(split: str) -> list[BenchmarkQuery]:
@@ -508,6 +521,7 @@ def _evaluation_variant(
     qdrant_url: str,
     tracer: Tracer | None,
     cache: ResponseCache | None,
+    gold: Mapping[str, tuple[Evidence, ...]] | None = None,
 ) -> PipelineVariant:
     router_embedder = None
     if config.router is not None:
@@ -521,6 +535,7 @@ def _evaluation_variant(
         cache=cache,
         router_embedder=router_embedder,
         index_for=lambda candidate: _index_for(candidate, models, qdrant_url),
+        gold=gold,
     )
 
 
@@ -585,12 +600,16 @@ def judge_command(
     judge_config: Path = JUDGE_CONFIG,
     workers: Workers = 1,
     call_latency: CallLatency = DEFAULT_CALL_LATENCY,
+    all_records: Annotated[
+        bool,
+        typer.Option(help="Grade every stored answer instead of the fixed test-400 sample."),
+    ] = False,
 ) -> None:
     """Grade the fixed Judge sample in a completed run."""
     store = RunStore(RUNS_DIR)
     lookup = CitedChunkLookup(RAW_DIR)
     try:
-        sample = _judge_sample()
+        sample = None if all_records else _judge_sample()
         spec = load_judge_spec(judge_config)
         validate_workers(workers, spec.remote_provider, spec.model)
         if dry_run:
@@ -1023,14 +1042,25 @@ def graphrag_compare(graphrag_run: str, ladder_run: str) -> None:
 def table_command(
     run_ids: list[str],
     metrics: Annotated[str, typer.Option(help="Comma-separated metric names, in column order.")] = (
-        "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,"
-        "generator_context_tokens_per_question,latency_p50,latency_p95,cost_per_question"
+        "hits@4,hits@10,mrr@10,evidence_recall@10,accuracy,coverage,selective_accuracy,"
+        "score(wrong=-2),generator_context_tokens_per_question,latency_p50,latency_p95,"
+        "cost_per_question"
     ),
     output: Annotated[Path | None, typer.Option(help="Also write the table here.")] = None,
+    always_yes_row: Annotated[
+        bool,
+        typer.Option(
+            "--always-yes", help="Add the trivial baseline that answers Yes on the first run."
+        ),
+    ] = False,
 ) -> None:
     """Markdown table of runs with 95% intervals, for the report."""
     store = RunStore(RUNS_DIR)
-    runs = [with_judge_metrics(store.load(run_id), store) for run_id in run_ids]
+    runs = [
+        with_honesty_metrics(with_judge_metrics(store.load(run_id), store)) for run_id in run_ids
+    ]
+    if always_yes_row and runs:
+        runs.append(always_yes(runs[0]))
     table = results_table(runs, metrics.split(","))
     typer.echo(table)
     if output:

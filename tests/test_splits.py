@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from rag_pipeline.corpus import BenchmarkQuery
-from rag_pipeline.splits import SplitSizes, make_splits
+from rag_pipeline.splits import SplitSizes, make_splits, untouched_test_ids
 
 
 def _queries(per_type: dict[str, int]) -> list[BenchmarkQuery]:
@@ -57,3 +57,13 @@ def test_splits_round_trip_through_their_file(tmp_path: Path):
     splits.save(path)
 
     assert type(splits).load(path) == splits
+
+
+def test_the_untouched_test_ids_are_the_test_split_minus_its_subset():
+    splits = make_splits(QUERIES, SIZES, seed=7)
+    subset = splits.test[:15]
+
+    untouched = untouched_test_ids(splits, subset)
+
+    assert untouched == splits.test[15:]
+    assert set(untouched).isdisjoint(subset)

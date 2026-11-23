@@ -1,0 +1,18 @@
+name: router-4b-gemma
+index:
+  collection: chunks-sent-w200-o1-qwen3-embedding-0.6b
+  embedder:
+    provider: ollama
+    model: qwen3-embedding:0.6b
+    query_prefix: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: "
+retrieval:
+  mode: none
+generation:
+  generator:
+    provider: ollama
+    model: qwen3.5:4b
+router:
+  artifact: configs/router/trained-4b-gemma.json
+  candidates:
+    - configs/improve/hybrid-rerank-sources.yaml
+    - configs/improve/hybrid-rerank-gemma-nvidia-sources-ctx10-decisive.yaml

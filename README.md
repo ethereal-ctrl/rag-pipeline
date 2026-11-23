@@ -1,8 +1,42 @@
 # RAG Pipeline: a measured Ablation Ladder on MultiHop-RAG
 
-Work in progress. The goal: measure, with confidence intervals, which advanced retrieval
-techniques actually pay off on multi-hop questions, running fully locally.
+Which retrieval techniques actually pay off on multi-hop questions? This project measures
+each rung of a RAG pipeline with 95% confidence intervals on MultiHop-RAG. It runs locally on
+an M4 with 16 GB and costs 0 € (ADR 0001). Variants were chosen on the Dev Split, and the final
+scores come from 600 Test Split queries that no decision has seen (ADR 0005, ADR 0008).
 See `GLOSSARY.md` for the vocabulary and `docs/adr/` for the design decisions.
+
+## Results (test-600, Qwen3.5 4B local)
+
+| Rung | Accuracy [95% CI] | Null Queries abstained |
+|---|---:|---:|
+| Always "Yes" baseline | 0.325 [0.287, 0.363] | 0.000 |
+| Closed-Book | 0.445 [0.403, 0.483] | 0.014 |
+| BM25 | 0.665 [0.628, 0.703] | 0.930 |
+| Dense | 0.613 [0.573, 0.650] | 0.901 |
+| Hybrid (RRF) | 0.685 [0.648, 0.720] | 0.859 |
+| + Reranker | 0.722 [0.688, 0.760] | 0.887 |
+| Agentic Search | 0.747 [0.710, 0.783] | 0.958 |
+| **+ source-aware retrieval (chosen)** | **0.775 [0.742, 0.807]** | 0.845 |
+| Oracle retrieval (gold Evidence) | 0.855 [0.827, 0.883] | 0.972 |
+
+- Retrieval makes the model honest. Closed-Book invents an answer for 98.6% of the
+  unanswerable questions, and with retrieval it abstains on 85–96% of them.
+- BM25 beats dense retrieval on news (−0.052, significant). A simple retrieval lever, lifting
+  the articles of outlets named in the question, beats an agent loop (+0.053 at +2 s per
+  question vs +0.027 at +32 s).
+- Citations with a support check cost 0.070 accuracy through more False Abstentions. The
+  answers they do give are more often right.
+- The Oracle run shows 8 points of headroom in retrieval. The rest is the 4B generator's limit.
+- Gemma 4 31B (NVIDIA NIM) reaches 0.712 with the same levers. It never answers an
+  unanswerable question, but it abstains far more on answerable ones.
+- An LLM Judge (Kimi K3.1 Pro), calibrated against independent labels (κ 0.889 on
+  correctness), re-grades the chosen variants at 0.792 (4B) and 0.735 (Gemma). The ranking
+  does not change, so the substring match does not drive the results
+  ([calibration](docs/report/judge-calibration.md)).
+
+Full tables, paired comparisons and the honest metrics (Coverage, Selective Accuracy, score
+with wrong = −2) are in [docs/report/ladder-test-600.md](docs/report/ladder-test-600.md).
 
 ## Run it yourself
 

@@ -1,0 +1,5 @@
+# Final scores on the 600 untouched Test Split queries
+
+The published results come from the 600 Test Split queries outside the 400-query subset (`test-600`), not from `test-400`. Error analysis on `test-400` runs led to source-aware retrieval, the larger context and the decisive prompt. Its scores therefore reflect decisions made after seeing them. Those were then chosen on the Dev Split. `test-600` has not been looked at, and its query types keep the Test Split's stratification (201 comparison, 191 inference, 137 temporal and 71 Null Queries).
+
+This refines ADR 0005. Each Pipeline Variant is still scored once per set of questions. `test-400` and `test-600` are disjoint, so a variant scored on `test-400` may be scored once more on `test-600`. A score on either blocks the full `test` split, and a score on `test` blocks both. `test-400` runs remain in the repository as development history and are reported as such. The cost is a second Test Split run per variant and a smaller final set, about ±4 points at 95 % instead of ±3.

@@ -25,7 +25,7 @@ from rag_pipeline.cost import load_prices, notional_cost
 from rag_pipeline.index import RetrievedChunk
 from rag_pipeline.models import Generator, generator_base_url
 from rag_pipeline.parallel import completed_work
-from rag_pipeline.splits import TEST_SPLITS
+from rag_pipeline.splits import OVERLAPPING_TEST_SPLITS, TEST_SPLITS
 from rag_pipeline.tracing import StageTrace
 from rag_pipeline.variants import Answer, VariantConfig
 
@@ -646,10 +646,13 @@ def _fingerprint(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _guard_test_split(store: RunStore, config: VariantConfig, allow_rescore: bool) -> None:
+def _guard_test_split(
+    store: RunStore, config: VariantConfig, split: str, allow_rescore: bool
+) -> None:
     if allow_rescore:
         return
-    for meta in (meta for split in TEST_SPLITS for meta in store.completed(split)):
+    overlapping = OVERLAPPING_TEST_SPLITS[split]
+    for meta in (meta for other in overlapping for meta in store.completed(other)):
         if meta["variant"]["name"] == config.name:
             raise TestSplitAlreadyScored(
                 f"Pipeline Variant {config.name!r} was already scored on the Test Split "
@@ -686,7 +689,7 @@ def evaluate(
     if retrieval_only and split in TEST_SPLITS:
         raise ValueError("retrieval-only runs are not allowed on the Test Split (ADR 0005)")
     if split in TEST_SPLITS:
-        _guard_test_split(store, config, allow_rescore)
+        _guard_test_split(store, config, split, allow_rescore)
     index_version = variant.index_version()
     cache_enabled = getattr(variant, "cache_enabled", False) is True
     fingerprint = _fingerprint(

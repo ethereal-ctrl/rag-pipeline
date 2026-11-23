@@ -39,7 +39,7 @@ The fixed subset of Benchmark Queries used for all tuning and debugging.
 _Avoid_: Train set, validation set
 
 **Test Split**:
-The fixed, held-out subset of Benchmark Queries that each Pipeline Variant is scored on once, for the published results.
+The fixed, held-out subset of Benchmark Queries that each Pipeline Variant is scored on once, for the published results. The published results use its 600 queries outside the 400-query subset that error analysis has seen (ADR 0008).
 _Avoid_: Eval set, holdout
 
 **Smoke Set**:

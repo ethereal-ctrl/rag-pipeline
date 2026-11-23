@@ -11,7 +11,13 @@ from pathlib import Path
 from rag_pipeline.corpus import BenchmarkQuery
 
 SPLIT_NAMES = ("dev", "smoke", "test", "reserve")
-TEST_SPLITS = ("test", "test-400")
+TEST_SPLITS = ("test", "test-400", "test-600")
+# Test Splits that share questions; a variant scored on one may not be scored on another (ADR 0008).
+OVERLAPPING_TEST_SPLITS = {
+    "test": ("test", "test-400", "test-600"),
+    "test-400": ("test", "test-400"),
+    "test-600": ("test", "test-600"),
+}
 TEST_SUBSET_SIZE = 400
 JUDGE_SAMPLE_SIZE = 300
 
@@ -95,6 +101,12 @@ def load_test_subset(path: Path, splits: Splits) -> tuple[str, ...]:
     ):
         raise ValueError("invalid committed 400-query Test Split subset")
     return ids
+
+
+def untouched_test_ids(splits: Splits, test_subset: tuple[str, ...]) -> tuple[str, ...]:
+    """The Test Split without the 400-query subset that error analysis has seen (ADR 0008)."""
+    seen = set(test_subset)
+    return tuple(id_ for id_ in splits.test if id_ not in seen)
 
 
 def load_judge_sample(path: Path, test_subset: tuple[str, ...]) -> tuple[str, ...]:
